@@ -1,7 +1,7 @@
-# Build the Routeplane CE container image and publish it to GHCR.
+# Build the Routeplane CE container image, publish it to GHCR, and sign it
+# (cosign keyless via GitHub OIDC) with an attached SPDX SBOM.
 # Runs on a version tag (release) and on manual dispatch (validation).
-# TODO(launch): SHA-pin the third-party actions to digests, add multi-arch
-# (linux/arm64), and add cosign keyless signing + SBOM attestation.
+# TODO(launch): SHA-pin the third-party actions to digests; add multi-arch (arm64).
 name: image
 
 on:
@@ -12,6 +12,8 @@ on:
 permissions:
   contents: read
   packages: write
+  id-token: write # cosign keyless (Fulcio/Rekor)
+  attestations: write
 
 jobs:
   build-push:
@@ -80,3 +82,26 @@ jobs:
           echo "--- container logs (tail) ---"; docker logs --tail=20 rp-smoke || true
           docker rm -f rp-smoke >/dev/null 2>&1 || true
           [ -n "$ok" ] || { echo "::error::gateway did not answer /healthz"; exit 1; }
+
+      # Supply-chain trust: sign the pushed image (keyless — the signature's
+      # identity is this workflow, verifiable with `cosign verify`) and attach an
+      # SPDX SBOM as a signed attestation. See the README "Verify what you run".
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the image (keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/routeplane-core/routeplane-ce@${DIGEST}"
+
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ghcr.io/routeplane-core/routeplane-ce@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Attest the SBOM to the image (keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign attest --yes --type spdxjson --predicate sbom.spdx.json "ghcr.io/routeplane-core/routeplane-ce@${DIGEST}"

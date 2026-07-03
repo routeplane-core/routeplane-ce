@@ -1,6 +1,8 @@
 name: identity-guard
 
 on:
+  # Fork PRs cannot read the secret this gate needs, so the job below skips them
+  # (their code is re-scanned when a maintainer merges to main, which runs this).
   pull_request:
   push:
     branches: [main]
@@ -11,6 +13,10 @@ permissions:
 jobs:
   identity-guard:
     name: Identity content gate
+    # Skip PRs originating from forks (no secret access by design).
+    if: >-
+      github.event_name == 'push' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - name: Check out full history
