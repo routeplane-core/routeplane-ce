@@ -1,0 +1,38 @@
+# cargo-about configuration — generates THIRD_PARTY_NOTICES.md (the license
+# attribution document shipped in the Community Edition image, ADR-088 Phase 1 /
+# PRD-047). cargo-deny (deny.toml) is the blocking POLICY gate; cargo-about is
+# the notices GENERATOR — the `accepted` list below must mirror deny.toml's
+# `[licenses].allow` exactly so the two never disagree.
+#
+# Regenerate against the CE dependency graph (what the ce image actually links):
+#   cargo about generate --manifest-path crates/routeplane/Cargo.toml \
+#     --no-default-features -o THIRD_PARTY_NOTICES.md about.hbs
+accepted = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "MPL-2.0",             # file-level copyleft; acceptable for libraries (e.g. webpki-roots lineage)
+  "CC0-1.0",
+  "OpenSSL",             # ring/openssl-sys lineage
+  "CDLA-Permissive-2.0", # Mozilla CA root-cert bundle DATA (webpki-root-certs); permissive notice-style data license
+]
+
+# Routeplane's own workspace crates are unpublished (`publish = false`) and carry
+# no `license` field on purpose — same posture as deny.toml's `private.ignore`.
+# The notices document covers third-party dependencies only.
+private = { ignore = true }
+
+# Notices are generated for what SHIPS: exclude dev-only and build-only
+# dependency edges from the attribution graph.
+ignore-dev-dependencies = true
+ignore-build-dependencies = true
+
+# ring ships a multi-license bundle the SPDX scanner can't resolve on its own —
+# cargo-about's built-in workaround mirrors deny.toml's [[licenses.clarify]].
+workarounds = ["ring"]

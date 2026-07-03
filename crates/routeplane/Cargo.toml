@@ -1,0 +1,93 @@
+[package]
+name = "routeplane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# The gateway binary (Data Plane): Axum server, auth/guardrails middleware,
+# routing + fallback, usage analytics. Depends on the shared types and the
+# adapter layer.
+[dependencies]
+routeplane-types = { path = "../types" }
+routeplane-adapters = { path = "../adapters" }
+routeplane-residency = { path = "../residency" }
+routeplane-router = { path = "../router" }
+routeplane-entitlements = { path = "../entitlements" }
+# Unleash-backed FeatureProvider (ADR-029 G3): composes the per-context
+# `!released` holdback set into auth-time CapabilitySet resolution. Env-gated on
+# UNLEASH_API_URL — absent ⇒ AuthState.unleash = None ⇒ byte-identical.
+routeplane-flags = { path = "../flags" }
+routeplane-guardrails = { path = "../guardrails" }
+routeplane-limits = { path = "../limits" }
+routeplane-policy = { path = "../policy" }
+# Rung-0 exact-match response cache (G2.5 / PRD-007 / ADR-022).
+routeplane-cache = { path = "../cache" }
+# The ledger's closed-vocabulary TYPES (Outcome/UsageTotals/Security* etc.) as
+# a dependency leaf (PRD-047 / ADR-088 CE enabler). Handler modules import the
+# vocab via `crate::ledger_sink`'s re-exports of THIS crate. ALWAYS present —
+# the vocabulary is not the moat.
+routeplane-ledger-vocab = { path = "../ledger-vocab" }
+# Prompt registry + renderer (PRD-010 / G3.5).
+routeplane-prompts = { path = "../prompts" }
+# RTK tool_result token-compression (ADR-085). Gated per-request on
+# Feature::TokenCompression, applied AFTER residency-classify + PII-masking — off
+# ⇒ byte-identical hot path.
+routeplane-rtk = { path = "../rtk" }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dotenvy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+regex = { workspace = true }
+lazy_static = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+subtle = { workspace = true }
+arc-swap = { workspace = true }
+uuid = { workspace = true }
+# Guardrails v2 webhook client (G2.6): resolve→validate→pin HTTPS POSTs.
+reqwest = { workspace = true }
+base64 = { workspace = true }
+async-trait = { workspace = true }
+url = { workspace = true }
+# Zero-copy cached-response bodies (one serialization feeds both the wire
+# response and the write-behind cache insert).
+bytes = { workspace = true }
+# OpenTelemetry trace/span ID generation (OTLP export skeleton, PRD-009).
+sha2 = { workspace = true }
+
+[features]
+# Community Edition (PRD-047 / ADR-088 Phase 1). This IS the CE source tree: the
+# moat crates are absent from the workspace entirely, and `src/ce_stubs.rs`
+# supplies the inert slot types the shared wiring compiles against. The default
+# build is CE. The `enterprise` feature is retained but DEFINED-EMPTY so the
+# surviving `#[cfg(feature = "enterprise")]` attributes in shared files stay a
+# recognized cfg under `deny(warnings)`; it is inert and never enabled here.
+default = []
+enterprise = []
+# Opt-in distributed (Redis) rate limiting (ADR-056 Mode D). OFF by default so
+# the standard build is $0-idle and byte-identical to Mode L; forwards to the
+# limits crate's own gated module. Even with the feature ON, Mode D is only
+# ACTIVE when ROUTEPLANE_REDIS_URL is configured at startup. Orthogonal to
+# `enterprise` (a CE build may enable it).
+redis-limits = ["routeplane-limits/redis-limits"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+wiremock = { workspace = true }
+# Black-box acceptance suite (`tests/acceptance.rs`, ADR-049 / PRD-037): a real
+# HTTP client + the canonical wire types, to assert the *deployed* contract over
+# the wire. No-ops unless ACCEPTANCE_BASE_URL is set, so `cargo test --all` stays
+# green in the commit stage.
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+
+# Opt in to the workspace lint policy (deny warnings) — see root Cargo.toml.
+[lints]
+workspace = true

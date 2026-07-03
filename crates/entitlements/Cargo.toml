@@ -1,0 +1,23 @@
+[package]
+name = "routeplane-entitlements"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# The entitlement seam (ADR-012 §3/§4, branching-and-devex §6/§7): customer
+# variation — tiers, custom-customer features, dark-launch — is a `CapabilitySet`
+# computed once at auth, never a branch or a fork. Resolution is in-process and
+# allocation-light (it rides in request extensions on the hot path); the
+# OpenFeature-shaped `FeatureProvider` trait keeps call sites vendor-neutral and
+# the decision reversible without pulling an external flag server onto the
+# sub-10ms hot path. No network, no always-on infra.
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+# Opt in to the workspace lint policy (deny warnings) — see root Cargo.toml.
+[lints]
+workspace = true

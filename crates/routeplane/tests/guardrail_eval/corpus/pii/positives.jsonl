@@ -1,0 +1,8 @@
+{"id": "pii-pos-001", "input": "Contact me at priya.sharma@example.com for the invoice.", "expect": {"masked": ["email"]}, "category": "pii", "source": "seed"}
+{"id": "pii-pos-002", "input": "Escalations go to dev-team+alerts@mail.example.co.in overnight.", "expect": {"masked": ["email"]}, "category": "pii", "source": "seed"}
+{"id": "pii-pos-003", "input": "Call 415-555-2671 after lunch to confirm the booking.", "expect": {"masked": ["phone"]}, "category": "pii", "source": "seed"}
+{"id": "pii-pos-004", "input": "The clinic fax line is 022.555.0182, attention records desk.", "expect": {"masked": ["phone"]}, "category": "pii", "source": "seed"}
+{"id": "pii-pos-006", "input": "My aadhaar is 2341 2341 2346, please update the KYC record.", "expect": {"masked": ["aadhaar"]}, "category": "pii", "source": "seed"}
+{"id": "pii-pos-007", "input": "Aadhaar number 234123412346 is already on file with the bank.", "expect": {"masked": ["aadhaar"]}, "category": "pii", "source": "seed"}
+{"id": "pii-pos-008", "input": "PAN: ABCDE1234F — needed for the TDS filing this quarter.", "expect": {"masked": ["pan"]}, "category": "pii", "source": "seed"}
+{"id": "pii-pos-009", "input": "Reach Ravi at ravi@example.in or 080-555-0143 before 6pm.", "expect": {"masked": ["email", "phone"]}, "category": "pii", "source": "seed"}

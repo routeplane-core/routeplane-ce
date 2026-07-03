@@ -1,0 +1,26 @@
+[package]
+name = "routeplane-ledger-vocab"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# The sovereign-audit ledger's closed-vocabulary TYPES (PRD-001 FR-10/FR-11,
+# R0.3), extracted from routeplane-ledger as a dependency leaf (PRD-047 /
+# ADR-088 CE enabler): the validated newtypes (Label/ExtKey/ExtValue/CodeStr/
+# BoundedText), the decision vocabulary (Outcome/UsageTotals/DecisionDraft) and
+# the security-event vocabulary (SecurityCategory/SecurityOutcome/
+# SecurityEvent). Pure data + validation — NO chain, NO signer, NO Azure, NO
+# I/O. The moat engine stays in routeplane-ledger, which depends on this crate
+# and re-exports every name, so existing consumers see zero diff.
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+proptest = { workspace = true }
+
+# Opt in to the workspace lint policy (deny warnings) — see root Cargo.toml.
+[lints]
+workspace = true

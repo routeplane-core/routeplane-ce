@@ -1,0 +1,14 @@
+{
+  "keys": [
+    {
+      "name": "Default Development Key",
+      "routeplane_key": "rp_dev_REPLACE_ME",
+      "provider_keys": {
+        "openai": "env:OPENAI_API_KEY",
+        "anthropic": "env:ANTHROPIC_API_KEY",
+        "gemini": "env:GEMINI_API_KEY",
+        "azure_openai": "env:AZURE_OPENAI_API_KEY"
+      }
+    }
+  ]
+}

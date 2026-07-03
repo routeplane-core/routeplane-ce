@@ -1,0 +1,5 @@
+# Style stays at rustfmt defaults (devsecops-pipeline.md G1 — "default ok").
+# This file exists only to pin the edition, so bare `rustfmt <file>` (editors,
+# the .claude format-on-edit hook) resolves identically to `cargo fmt`, which
+# reads the edition from Cargo.toml. NO opinionated style knobs.
+edition = "2021"

@@ -1,0 +1,30 @@
+{
+  "model": "mock-model",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a coding agent working in a Rust monorepo. Keep answers precise and minimal."
+    },
+    {
+      "role": "user",
+      "content": "Summarize the failing test output and propose the smallest fix."
+    },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "type": "function",
+          "function": { "name": "bash", "arguments": "{\"command\":\"cargo test\"}" }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "   Compiling routeplane-rtk v0.1.0 (/workspace/routeplane/crates/rtk)\n   Compiling serde_json v1.0.140\n   Compiling rtk-eval v0.1.0 (/workspace/routeplane/benchmarks/rtk-eval)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.42s\n     Running unittests src/main.rs\nrunning 4 tests\ntest tests::percentile_nearest_rank ... ok\ntest tests::text_units_mirror_message_content_semantics ... ok\ntest tests::corpus_is_identity_clean ... ok\ntest tests::corpus_parses_and_has_tool_payloads ... ok\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s"
+    }
+  ],
+  "stream": false
+}

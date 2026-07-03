@@ -1,0 +1,6 @@
+{"id": "pii-neg-001", "input": "Order number 234123412345 shipped today via surface courier.", "expect": {"masked": []}, "category": "pii", "source": "seed"}
+{"id": "pii-neg-002", "input": "The migration completed on 2026-06-10 at 09:30 with zero retries.", "expect": {"masked": []}, "category": "pii", "source": "seed"}
+{"id": "pii-neg-003", "input": "Upgrade to routeplane v1.2.3 and then rerun the smoke suite.", "expect": {"masked": []}, "category": "pii", "source": "seed"}
+{"id": "pii-neg-004", "input": "Tracking id 1234 5678 9012 shows the parcel still in transit.", "expect": {"masked": []}, "category": "pii", "source": "seed"}
+{"id": "pii-neg-005", "input": "Promo code abcde1234f applies a flat 10% discount at checkout.", "expect": {"masked": []}, "category": "pii", "source": "seed"}
+{"id": "pii-neg-006", "input": "The build finished in 84 seconds with 0 errors and 3 warnings.", "expect": {"masked": []}, "category": "pii", "source": "seed"}

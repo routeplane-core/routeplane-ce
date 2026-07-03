@@ -1,0 +1,22 @@
+# Rust build artifacts
+/target/
+benchmarks/target/
+
+# Local environment / secrets (provider API keys live here — never commit)
+.env
+.env.*
+!.env.example
+
+# Virtual-key registry — maps gateway keys to provider keys; environment- and
+# tenant-specific, must never be committed. Use configs/keys.example.json as the
+# template. Backups of the registry are equally secret.
+configs/keys.json
+configs/keys.json.bak
+configs/*.bak
+*.bak
+
+# cargo-about scratch when regenerating THIRD_PARTY_NOTICES.md
+/about-scratch/
+
+# OS / editor junk
+.DS_Store

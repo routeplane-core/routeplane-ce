@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  # CE is the default feature set, but build/test the gateway explicitly with
+  # --no-default-features so the graph never silently pulls an enterprise dep.
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: fmt · clippy · build · test (CE, --no-default-features)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4 # TODO(launch): SHA-pin before public flip
+
+      - name: Install Rust toolchain (pinned by rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable # TODO(launch): SHA-pin + pin the exact version
+        with:
+          components: rustfmt, clippy
+
+      - name: System deps (OpenSSL headers)
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Cache cargo
+        uses: actions/cache@v4 # TODO(launch): SHA-pin before public flip
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (warnings denied)
+        run: cargo clippy -p routeplane --no-default-features --all-targets -- -D warnings
+
+      - name: Build (Community Edition)
+        run: cargo build -p routeplane --no-default-features
+
+      - name: Test (Community Edition)
+        run: cargo test -p routeplane --no-default-features
+
+# The identity/content gate runs as its own required workflow
+# (.github/workflows/identity-guard.yml) on the same pull_request / push events.

@@ -1,0 +1,26 @@
+[package]
+name = "routeplane-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Routing-policy engine (G2.2 / ADR-021): parses the `routing` section of the
+# x-routeplane-config header (or a saved cfg_ reference) into a validated config,
+# evaluates conditional routing, and flattens the selected branch into an ordered
+# set of executable targets (retry policy, per-attempt timeout, weight/cost
+# overrides, param shaping). Pure + lock-free: the proxy parses once per request
+# into an owned plan; saved configs ride an ArcSwap snapshot.
+#
+# Boundary (ADR-021 §1/§5): depends on `routeplane-types` ONLY (it must name
+# request params for conditions + shaping) and on nothing hot-path-relevant.
+# `router` gains no dependency on this crate or on `types`.
+[dependencies]
+routeplane-types = { path = "../types" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+arc-swap = { workspace = true }
+
+# Opt in to the workspace lint policy (deny warnings) — see root Cargo.toml.
+[lints]
+workspace = true

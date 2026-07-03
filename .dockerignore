@@ -1,0 +1,21 @@
+# Build artifacts and VCS metadata — never needed in the image build context.
+# Excluding target/ keeps the context small AND keeps cargo-chef's cook-layer
+# cache stable (a bare `COPY . .` would otherwise invalidate it whenever target/
+# changes). CI builds from a fresh checkout, so this is belt-and-braces there and
+# load-bearing for local `docker build`.
+target
+.git
+
+# Secret material — MUST never enter the build context. The Dockerfile does
+# `COPY . .` (planner + builder) and then `COPY --from=builder .../configs ./configs`
+# into the final runtime image, so an un-ignored `.env`/`configs/keys.json` would
+# bake real provider keys and `rp_` gateway virtual keys into an image layer. These
+# are already gitignored (so CI's clean checkout never had them), but a local
+# `docker build` or the CE `docker compose up --build` quickstart — which tells you
+# to write real keys into `configs/keys.json` first — would otherwise leak them.
+# CE supplies keys.json at runtime via a read-only bind-mount, so excluding it here
+# is a no-op for a working self-host.
+.env
+.env.*
+configs/keys.json
+configs/keys.json.bak

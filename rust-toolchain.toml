@@ -1,0 +1,10 @@
+# Single source of truth for the local toolchain (branching-and-devex.md §10,
+# devsecops-pipeline.md §10.2; bumped 1.86 -> 1.88 per ADR-093). MUST match the
+# Dockerfile base image (rust:1.88-slim-bookworm) and the explicit `toolchain`
+# input ci.yml passes to common-actions/rust-quality — bump all three together.
+# ADR-093 follow-ups now unblocked (each its own reviewed PR): the wiremock
+# =0.6.4 pin, the ort 2.0.0-rc.10 pin, the redis semver-major Dependabot
+# ignore, tower-http 0.7, jsonwebtoken 10, cargo-auditable in the Dockerfile.
+[toolchain]
+channel = "1.88"
+components = ["clippy", "rustfmt"]

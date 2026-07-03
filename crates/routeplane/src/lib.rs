@@ -1,0 +1,27 @@
+pub mod analytics_api;
+pub mod api_error;
+pub mod audio_api;
+pub mod auth;
+pub mod cache_api;
+// CE slot types (PRD-047 / ADR-088): compiled ONLY under --no-default-features.
+#[cfg(not(feature = "enterprise"))]
+pub mod ce_stubs;
+pub mod config;
+pub mod config_overlay;
+pub mod embeddings;
+pub mod feedback_api;
+pub mod finops_api;
+pub mod guardrails;
+pub mod images_api;
+pub mod ledger_sink;
+pub mod logs_api;
+pub mod messages_api;
+pub mod metrics;
+pub mod models_api;
+pub mod observability;
+pub mod otel;
+pub mod prompts_api;
+pub mod proxy;
+pub mod rerank_api;
+pub mod residency_api;
+pub mod status;

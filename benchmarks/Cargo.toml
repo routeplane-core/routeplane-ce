@@ -1,0 +1,36 @@
+# Standalone benchmark workspace — deliberately NOT a member of the product
+# workspace at ../Cargo.toml. Rationale (PRD-051 FR-6 credibility gate):
+#   * bench-only dependencies (tiktoken-rs, axum for the mock upstream) stay out
+#     of the product Cargo.lock and therefore out of the product SBOM;
+#   * the product workspace can build/lock/audit without ever touching this tree;
+#   * `cargo <anything>` run from benchmarks/ builds ONLY the harness (plus the
+#     path-dep `routeplane-rtk`, a leaf crate whose sole dependency is serde_json).
+#
+# Build/run from this directory:
+#   cargo run --release -p rtk-eval        # trace-replay token-savings eval
+#   cargo run --release -p mock-upstream   # OpenAI-compatible perf mock
+# or use the local `justfile` (do not wire these into the repo-root justfile).
+
+[workspace]
+resolver = "2"
+members = ["rtk-eval", "perf/mock-upstream"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Pinned exactly so RESULTS.md can cite the tokenizer version verbatim.
+# If you bump this, update TOKENIZER_CRATE in rtk-eval/src/main.rs to match.
+tiktoken-rs = "=0.12.0"
+# Pins the corpus content in RESULTS.md (sha256 of corpus/traces.jsonl).
+sha2 = "0.10"
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+
+[workspace.lints.rust]
+warnings = "deny"

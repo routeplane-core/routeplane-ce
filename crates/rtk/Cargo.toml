@@ -1,0 +1,26 @@
+[package]
+name = "routeplane-rtk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "RTK token compression — deterministic tool_result block filters for 20-40% input token savings"
+
+[dependencies]
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# ADR-085 perf artifact: a runnable p50/p99 microbench for the hot-path
+# `tool_result` compression. default-features off sheds the plotters/HTML-report
+# chain (and its MSRV-1.86-sensitive transitive tree) — same as crates/ledger.
+# The bench is a RUNNABLE MEASUREMENT, not an asserted gate.
+criterion = { version = "0.8", default-features = false, features = [
+  "cargo_bench_support",
+] }
+
+[[bench]]
+name = "rtk_compress"
+harness = false
+
+[lints]
+workspace = true

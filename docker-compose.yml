@@ -1,0 +1,48 @@
+# Routeplane Community Edition — one-command self-host.
+#
+#   cp .env.example .env               # add your provider API key(s)
+#   cp configs/keys.example.json configs/keys.json   # your gateway virtual key(s)
+#   docker compose up                  # PULLS the prebuilt CE image and serves :8080
+#
+# Building from source instead: `docker compose up --build` compiles the CE
+# stage of the Dockerfile (`--target ce`) locally — a few minutes on first
+# build. Requires Docker Compose >= 2.24 (long-form env_file `required`).
+#
+# Point any OpenAI SDK at http://localhost:8080/v1 with your rp_ key as the
+# Authorization: Bearer token (or the x-routeplane-api-key header). No Azure, no
+# database, no cloud — a single Rust binary. Enterprise features (sovereign
+# residency, MCP agentic security, control-plane governance) are not in CE.
+services:
+  gateway:
+    image: ghcr.io/routeplane-core/routeplane-ce:latest # pin vX.Y.Z in the release-attached copy
+    build:
+      context: .
+      target: ce # build the gateway image from the Dockerfile
+    pull_policy: missing # image:+build: both present ⇒ compose would otherwise BUILD when the
+    # image is absent; `missing` makes plain `up` PULL, while
+    # `docker compose up --build` still forces the from-source path
+    ports:
+      - "8080:8080"
+    env_file:
+      - path: .env
+        required: false # long-form (Compose >= 2.24) — a keyless install (e.g. Ollama-only)
+          # or env-var-driven install must not hard-fail on a missing .env
+    environment:
+      PORT: "8080"
+      # In-process rate-limits + response cache (Mode L) — no Redis needed for a
+      # single-node self-host. (Distributed Mode D needs a redis-limits-featured
+      # build + ROUTEPLANE_REDIS_URL; out of scope for the CE quickstart.)
+      RUST_LOG: "${RUST_LOG:-routeplane=info}"
+    volumes:
+      # Your gateway virtual keys. Copy configs/keys.example.json → configs/keys.json
+      # and edit it; provider secrets are referenced as env:OPENAI_API_KEY (from .env).
+      - ./configs/keys.json:/usr/local/bin/configs/keys.json:ro
+    healthcheck:
+      # GET /healthz over bash's /dev/tcp — the runtime image is debian-slim with
+      # no curl/wget (deliberate: curl's CVE stream would wedge the trivy gate).
+      test: ["CMD", "bash", "-ec", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200 '"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped

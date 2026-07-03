@@ -1,0 +1,28 @@
+{
+  "configs": [
+    {
+      "id": "cfg_resilient_default",
+      "routing": {
+        "strategy": { "mode": "priority" },
+        "targets": [
+          {
+            "provider": "openai",
+            "retry": { "attempts": 2, "on_status": [429, 500, 502, 503, 504] }
+          },
+          { "provider": "anthropic", "params": { "default": { "max_tokens": 1024 } } }
+        ],
+        "timeout_ms": 60000
+      }
+    },
+    {
+      "id": "cfg_cheap",
+      "routing": {
+        "strategy": "cost",
+        "targets": [
+          { "provider": "gemini", "cost": 30 },
+          { "provider": "openai", "cost": 50 }
+        ]
+      }
+    }
+  ]
+}

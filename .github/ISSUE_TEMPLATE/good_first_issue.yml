@@ -1,0 +1,27 @@
+name: Good first issue (maintainers)
+description: Maintainer-authored starter task scoped for a new contributor
+title: "gfi: "
+labels: ["good first issue", "help wanted"]
+body:
+  - type: textarea
+    id: task
+    attributes:
+      label: The task
+      description: What to change, in plain language, with file paths.
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: Definition of done
+      description: What a merged PR looks like — behavior, tests, docs touched.
+    validations:
+      required: true
+  - type: input
+    id: mentor
+    attributes:
+      label: Mentor
+      description: Who to ping with questions.
+      value: "@routeplane-core/maintainers"
+    validations:
+      required: true

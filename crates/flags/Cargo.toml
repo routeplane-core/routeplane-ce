@@ -1,0 +1,39 @@
+[package]
+name = "routeplane-flags"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# ADR-029 G3: the Unleash-backed FeatureProvider — the data-plane bridge from the
+# PURE entitlement seam (`routeplane-entitlements`, no I/O, lock-free) to the
+# self-hosted Unleash flag plane. The SDK + the (follow-up) background poller live
+# HERE so the entitlement crate stays network-free. In-process evaluation: the SDK
+# memoizes the toggle spec and evaluates locally; no per-request network call.
+[dependencies]
+routeplane-entitlements = { path = "../entitlements" }
+# FR-7: bring our OWN HttpClient (over the workspace reqwest 0.13, below) instead
+# of the SDK's bundled reqwest 0.12 — default-features = false drops the SDK's
+# `reqwest-client-rustls` (its second reqwest + the webpki-roots/CDLA surface).
+# Eval is still local after fetch/memoize. MSRV 1.60, under the workspace 1.86 pin.
+unleash-api-client = { version = "0.15.0", default-features = false }
+# The workspace reqwest 0.13 backs our `ReqwestHttpClient` impl of the SDK's
+# HttpClient trait — one reqwest in the tree, the gateway's own TLS posture reused.
+reqwest = { workspace = true }
+# The SDK's HttpClient trait is `#[async_trait]`; our impl needs the same macro.
+async-trait = { workspace = true }
+# String-feature mode still needs a feature-enum type param; enum-map provides the
+# required EnumArray bound on the (unused) placeholder enum.
+enum-map = "2.7"
+serde = { workspace = true }
+# Parse the baked cold-start seed (the Unleash /api/client/features JSON shape,
+# ADR-025 image-seed) into the SDK's `Features` for memoize().
+serde_json = { workspace = true }
+# Background poller (register + poll_for_updates) runs the SDK's async refresh loop
+# off the hot path; tracing logs a transient register/poll failure (eval continues
+# from the seeded snapshot — the scale-to-zero design, ADR-029 D2).
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

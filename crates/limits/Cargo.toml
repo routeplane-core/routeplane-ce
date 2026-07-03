@@ -1,0 +1,60 @@
+[package]
+name = "routeplane-limits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Budgets & rate limits (PRD-008 / ADR-023): lock-free, network-free admission
+# enforcement on the request hot path. Atomic packed (window-epoch, count) slots
+# resolved at auth into pre-built per-(scope) counters; the engine itself does no
+# I/O and takes the clock as a parameter (injectable, deterministic under test).
+# chrono is only used OFF the hot path for calendar-anchored budget period
+# boundaries (daily/monthly reset). arc-swap gives the registry a reader-wait-free
+# hot-swap (same pattern as AuthState), so a future control-plane push can swap
+# the whole counter registry atomically with no lock on the read path.
+[dependencies]
+serde = { workspace = true }
+chrono = { workspace = true }
+arc-swap = { workspace = true }
+# FX rate table (PRD-015): parse the operator-provided rate config
+# (RP_FX_RATES_JSON / RP_FX_RATES_FILE) off the hot path; `tracing` carries the
+# "malformed config → using default table" degrade warning. Both are tiny,
+# already in the workspace, and not on the request hot path (load-time only).
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+# --- Mode D (distributed rate limiting) — OPT-IN, OFF BY DEFAULT (ADR-056) -----
+# Redis is a STANDING COST; the default build must stay $0-idle and behave
+# byte-identically to Mode L. Every Mode-D dependency is therefore gated behind
+# the `redis-limits` feature so the default-feature workspace build pulls NONE of
+# it. `redis` (0.25, tokio-comp) is the workspace-pinned async client; its
+# `ConnectionManager` (cloneable, auto-reconnecting, multiplexed) is the pooling
+# primitive — no separate deadpool needed. `tokio` is required only for the
+# bounded per-check timeout (the hot-path safety valve) and the background
+# token-refresh task. `tracing` carries the fail-open / timeout metrics.
+# `connection-manager` adds the cloneable, auto-reconnecting multiplexed handle
+# (our pooling primitive); `script` enables `Script`/EVALSHA. These features are
+# additive over the workspace-pinned `tokio-comp` and only pulled when this
+# crate's `redis-limits` feature is on, so the default build is untouched.
+redis = { workspace = true, optional = true, features = [
+  "connection-manager",
+  "script",
+] }
+tokio = { workspace = true, optional = true }
+
+[features]
+default = []
+# Compiles the DistributedLimiter (Mode D) + its Redis client. Ship-dark: even
+# with the feature ON, Mode D is only ACTIVE when an endpoint is configured;
+# otherwise the unified entry point stays on the local engine.
+redis-limits = ["dep:redis", "dep:tokio"]
+
+[dev-dependencies]
+# Mode-D unit tests need a tokio runtime; the dependency is harmless in the
+# default build (dev-only) and the Mode-D tests are themselves feature-gated.
+tokio = { workspace = true }
+
+# Opt in to the workspace lint policy (deny warnings) — see root Cargo.toml.
+[lints]
+workspace = true

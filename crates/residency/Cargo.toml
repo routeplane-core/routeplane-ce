@@ -1,0 +1,18 @@
+[package]
+name = "routeplane-residency"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# The sovereign / data-residency engine: classifies regulated personal data and
+# decides whether region-locked routing must be enforced. India (DPDP) is the
+# first profile; the same engine generalizes to GDPR/CCPA/etc.
+[dependencies]
+routeplane-types = { path = "../types" }
+regex = { workspace = true }
+lazy_static = { workspace = true }
+
+# Opt in to the workspace lint policy (deny warnings) — see root Cargo.toml.
+[lints]
+workspace = true

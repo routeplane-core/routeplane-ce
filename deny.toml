@@ -1,0 +1,87 @@
+# cargo-deny configuration for the Routeplane workspace.
+#
+# Posture (ADR-008 / devsecops-pipeline.md §6.1): license/ban/source policy is the
+# BLOCKING gate in the `deps-audit` CI job (via common-actions/cargo-audit-deny,
+# which runs `cargo deny check licenses bans sources`). RustSec ADVISORIES are
+# handled separately by cargo-audit in REPORT mode, so a vulnerability with no
+# fix available reports instead of wedging the build — mirroring the trivy
+# ignore-unfixed stance. This file therefore keeps `advisories` informational;
+# the hard line is licenses.
+#
+# cargo-deny schema v2 (the unprefixed-version warnings are gone in v2).
+
+[graph]
+# Check the host target plus the Linux release target the Dockerfile builds.
+all-features = true
+
+[advisories]
+# Informational only here — cargo-audit owns the advisory gate in report mode.
+# Unmaintained/yanked are downgraded so they never block; real CVEs surface in
+# the cargo-audit section of the PR evidence comment.
+version = 2
+yanked = "warn"
+unmaintained = "workspace"
+
+[licenses]
+# THE BLOCKING POLICY. Allow the permissive licenses the Rust ecosystem uses;
+# anything outside this set fails `deps-audit` and must be reviewed (add here
+# with justification, or replace the dependency). Copyleft (GPL/AGPL) is
+# intentionally absent — a copyleft dep in a proprietary gateway is a license
+# incident we want CI to catch.
+version = 2
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "MPL-2.0",                        # file-level copyleft; acceptable for libraries (e.g. webpki-roots lineage)
+  "CC0-1.0",
+  "OpenSSL",                        # ring/openssl-sys lineage
+  "CDLA-Permissive-2.0",            # Mozilla CA root-cert bundle DATA (webpki-root-certs, from reqwest 0.13's rustls path); permissive notice-style data license, no copyleft
+]
+confidence-threshold = 0.8
+
+# Routeplane's own workspace crates are PROPRIETARY and unpublished — they carry
+# no `license` field on purpose (we don't want to mislabel closed source with an
+# OSS license). `private.ignore` tells cargo-deny not to license-check our own
+# unpublished crates; the license gate still fully applies to every third-party
+# dependency. (publish = false in each crate's Cargo.toml is what marks them
+# private; this is the standard cargo-deny idiom for a closed-source workspace.)
+private = { ignore = true }
+
+# CDLA-Permissive-2.0 (the Mozilla CA root-bundle DATA license) is carried by
+# `webpki-root-certs` via reqwest 0.13's rustls-platform-verifier. (It was once
+# ALSO pulled by `webpki-roots` on the unleash-api-client rustls path; PRD-013
+# FR-7 dropped that second reqwest by implementing the SDK's HttpClient over the
+# workspace reqwest 0.13, so only the reqwest-0.13 path remains.) Allowed on the
+# global list above. No per-crate exception needed.
+
+# Per-crate license clarifications: `ring` ships a multi-license bundle that the
+# SPDX scanner can't always resolve; pin it explicitly rather than weakening the
+# global policy.
+[[licenses.clarify]]
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+# Warn (don't block) on duplicate versions — common and noisy in a large tree;
+# the signal we care about is a BANNED crate or a license violation. Flip
+# `multiple-versions` to "deny" later if dependency bloat becomes a concern.
+multiple-versions = "warn"
+wildcards = "allow"
+# No banned crates today; this is the seam to forbid a specific crate later
+# (e.g. a known-bad transitive dep) without code changes.
+deny = []
+
+[sources]
+# Only crates.io + git deps explicitly allowed. An unexpected source (a random
+# git host pulling code into the build) fails the gate.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

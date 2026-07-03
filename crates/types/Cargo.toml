@@ -1,0 +1,23 @@
+[package]
+name = "routeplane-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Shared domain types (the canonical, provider-agnostic request/response model).
+# Intentionally dependency-light so every other crate can depend on it cheaply.
+[dependencies]
+serde = { workspace = true }
+# Used for the dynamic-value passthrough fields on the OpenAI-compatible wire
+# models (`ImageGenerationRequest.extra` flatten + `ImageGenerationResponse.usage`)
+# so forward-compatible provider fields are not silently dropped. Already a
+# transitive workspace dependency — no new external crate enters the build graph.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+# Opt in to the workspace lint policy (deny warnings) — see root Cargo.toml.
+[lints]
+workspace = true

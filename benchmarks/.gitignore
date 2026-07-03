@@ -1,0 +1,4 @@
+# Local build artifacts (CI and docs use an external CARGO_TARGET_DIR).
+target/
+# Intermediate captured logs used by corpus generation (reproducible).
+rtk-eval/corpus/raw/

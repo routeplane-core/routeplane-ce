@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & help (Q&A)
+    url: https://github.com/routeplane-core/routeplane-ce/discussions/categories/q-a
+    about: Ask how-do-I and configuration questions in Discussions — answers stay searchable.
+  - name: Ideas & feature brainstorming
+    url: https://github.com/routeplane-core/routeplane-ce/discussions/categories/ideas
+    about: Open-ended proposals start here; accepted ideas are promoted to issues.
+  - name: Security vulnerabilities (private)
+    url: https://github.com/routeplane-core/routeplane-ce/security/policy
+    about: Report privately via security@routeplane.ai or GitHub private reporting — never a public issue.

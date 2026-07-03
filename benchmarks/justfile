@@ -1,0 +1,28 @@
+# Benchmark-workspace recipes (standalone — deliberately NOT wired into the
+# repo-root justfile; run from benchmarks/).
+
+# Run the RTK trace-replay eval and regenerate rtk-eval/RESULTS.md.
+eval:
+	cargo run --release -p rtk-eval
+
+# Regenerate the corpus snapshot (see rtk-eval/corpus/README.md — the
+# committed corpus is frozen; regenerate + re-run eval + commit both).
+corpus:
+	python3 rtk-eval/corpus/generate.py
+
+# Start the zero-work OpenAI-compatible mock upstream (port 9100).
+mock:
+	cargo run --release -p mock-upstream
+
+# Perf legs (see perf/README.md; needs `cargo install oha --locked`).
+perf-floor:
+	./perf/run.sh floor
+
+perf-gateway key:
+	./perf/run.sh gateway {{key}}
+
+# The same gates CI conventions expect, scoped to this workspace only.
+check:
+	cargo fmt --check
+	cargo clippy --all-targets
+	cargo test

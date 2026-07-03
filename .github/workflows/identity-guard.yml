@@ -1,0 +1,78 @@
+name: identity-guard
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  identity-guard:
+    name: Identity content gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@v4 # TODO(launch): SHA-pin before public flip
+        with:
+          fetch-depth: 0
+
+      - name: Materialize denylist from secret (fail-closed)
+        env:
+          IDENTITY_DENYLIST_REGEX: ${{ secrets.IDENTITY_DENYLIST_REGEX }}
+        run: |
+          set -euo pipefail
+          if [ -z "${IDENTITY_DENYLIST_REGEX}" ]; then
+            echo "::error::IDENTITY_DENYLIST_REGEX secret is missing or empty." \
+                 "The identity gate is fail-closed: seed the secret from the private" \
+                 "identity-audit doc before merging anything."
+            exit 1
+          fi
+          printf '%s\n' "${IDENTITY_DENYLIST_REGEX}" > .github/identity-denylist.regex
+          # Assert the materialized file has at least one non-blank pattern line.
+          if ! grep -qE '\S' .github/identity-denylist.regex; then
+            echo "::error::Denylist materialized empty after normalization."
+            exit 1
+          fi
+
+      - name: Scan tracked file contents
+        run: |
+          set -euo pipefail
+          # -l only: public logs must never echo the matched string itself.
+          if MATCHES=$(git grep -I -l -i -E \
+               -f .github/identity-denylist.regex \
+               -- . ':(exclude).github/identity-denylist.regex'); then
+            echo "::error::Identity denylist match in tracked files. Reproduce locally" \
+                 "with the private pattern list. Files:"
+            printf '%s\n' "${MATCHES}"
+            exit 1
+          fi
+
+      - name: Scan commit messages and patches on this event
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            RANGE="origin/${{ github.base_ref }}...HEAD"
+            git fetch --no-tags origin "${{ github.base_ref }}"
+          else
+            RANGE="${{ github.event.before }}..${{ github.sha }}"
+          fi
+          # Per-commit quiet scan of author lines, messages, and patch text;
+          # emit only offending SHAs — never the matched content (public logs).
+          BAD=""
+          for sha in $(git rev-list "${RANGE}"); do
+            if git show --format='Author: %an <%ae>%n%B' "${sha}" \
+                 | grep -q -i -E -f .github/identity-denylist.regex; then
+              BAD="${BAD} ${sha}"
+            fi
+          done
+          if [ -n "${BAD}" ]; then
+            echo "::error::Identity denylist match in commit metadata or patch text." \
+                 "Reproduce locally with the private pattern list. Commits:${BAD}"
+            exit 1
+          fi
+
+      - name: Clean up materialized denylist
+        if: always()
+        run: rm -f .github/identity-denylist.regex

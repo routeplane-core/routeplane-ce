@@ -1,0 +1,36 @@
+# Third-party notices
+
+The Routeplane Community Edition binary links the third-party Rust crates
+listed below. Each crate is used under the license shown; the full license
+texts follow. This document is generated with
+[cargo-about](https://github.com/EmbarkStudios/cargo-about) from the Community
+Edition dependency graph (`cargo about generate --manifest-path
+crates/routeplane/Cargo.toml --no-default-features about.hbs`) — do not edit by
+hand.
+
+## License overview
+
+{{#each overview}}
+- {{name}}: {{count}} package(s)
+{{/each}}
+
+## License texts
+
+{{#each licenses}}
+### {{name}}
+
+Used by:
+
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}
+{{/each}}
+
+<details><summary>Full license text</summary>
+
+<pre>
+{{text}}
+</pre>
+
+</details>
+
+{{/each}}

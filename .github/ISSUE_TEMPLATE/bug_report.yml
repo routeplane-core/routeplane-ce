@@ -1,0 +1,100 @@
+name: Bug report
+description: Something is broken in the Routeplane CE gateway
+title: "bug: "
+labels: ["type:bug", "status:needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. A reproducible bug is a fixable bug — the more of this you fill
+        in, the faster it gets fixed. For questions, use
+        [Discussions Q&A](https://github.com/routeplane-core/routeplane-ce/discussions/categories/q-a)
+        instead. For security vulnerabilities, email security@routeplane.ai — do NOT file a
+        public issue.
+  - type: input
+    id: version
+    attributes:
+      label: Gateway version
+      description: >
+        Output of `routeplane --version`, the image tag/digest
+        (e.g. ghcr.io/routeplane-core/routeplane-ce:v0.1.32), or the commit SHA if built from
+        source.
+      placeholder: "v0.1.32 / sha256:..."
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How are you running it?
+      options:
+        - docker compose (the repo's docker-compose.yml)
+        - Docker (manual)
+        - Kubernetes (manual manifests)
+        - Built from source (cargo run / binary)
+        - Other (describe below)
+    validations:
+      required: true
+  - type: input
+    id: providers
+    attributes:
+      label: Provider(s) involved
+      description: >
+        Which provider adapter(s) does this involve (openai, anthropic, gemini, azure_openai,
+        mistral, cohere, bedrock, groq, deepseek, together, fireworks, xai, openrouter,
+        self_hosted/Ollama/vLLM, a named combo)? Write "n/a" if provider-independent.
+      placeholder: "anthropic, self_hosted (Ollama)"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect?
+      description: Include the exact error message or wrong behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: >
+        The smallest request + config that triggers it. A curl command against the gateway is
+        ideal. REDACT all real API keys and any real prompt content you can't share.
+      placeholder: |
+        curl -sS http://localhost:8080/v1/chat/completions \
+          -H "Authorization: Bearer $RP_KEY" \
+          -H "content-type: application/json" \
+          -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant config
+      description: >
+        The relevant parts of configs/keys.json, compose overrides, or env vars — with secrets
+        replaced by env:VAR references or REDACTED.
+      render: json
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >
+        Gateway logs around the failure (RUST_LOG=routeplane=debug gives the most detail).
+        Redact keys and personal data.
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: This is not a security vulnerability (those go to security@routeplane.ai).
+          required: true
+        - label: I redacted all API keys and secrets from this report.
+          required: true

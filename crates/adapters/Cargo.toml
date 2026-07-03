@@ -1,0 +1,28 @@
+[package]
+name = "routeplane-adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Provider adapter layer: the `Provider` trait + one impl per upstream LLM API.
+# Each adapter translates the canonical `routeplane-types` model to/from its
+# provider's native wire format.
+[dependencies]
+routeplane-types = { path = "../types" }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+wiremock = { workspace = true }
+
+# Opt in to the workspace lint policy (deny warnings) — see root Cargo.toml.
+[lints]
+workspace = true

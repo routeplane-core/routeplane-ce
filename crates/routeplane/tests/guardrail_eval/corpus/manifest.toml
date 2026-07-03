@@ -1,0 +1,57 @@
+# Guardrail eval corpus manifest (devsecops-pipeline.md §7.1/§7.2).
+#
+# The corpus is the single source of truth for guardrail efficacy. It is
+# CODEOWNER-gated to the security owner; growing it is itself a PR, so it can
+# only get stricter, never quietly weakened. Lowering any threshold below
+# requires a justification in the PR — CI must never self-lower the bar.
+#
+# Record schema (one JSON object per line in the .jsonl files):
+#   { "id", "input", "expect": { "masked": [...] } | { "flag": bool },
+#     "category", "source" }
+# known_gaps records carry one extra field: "gap" — why today's engine misses
+# the expectation.
+#
+# Status: SEED corpus. The scoring harness (#[test] runner over
+# GuardrailEngine::process_text + ResidencyEngine::classify) and the CI gate
+# are the next §7.2 work item — `just eval` is an honest stub until then.
+# Engine reality today: GuardrailEngine masks email + phone;
+# ResidencyEngine classifies email/phone/aadhaar/pan (Verhoeff-validated
+# Aadhaar, entity-code-validated PAN). Injection detection is future (ADR-002
+# ML classifier) — its records are seeded so the gate is ready for it.
+
+corpus_version = "0.1.0"
+provenance = "hand-written seed records by routeplane-core maintainers; synthetic identifiers only (no real PII; Aadhaar samples are Verhoeff-valid test numbers from crates/residency, PAN samples are structurally valid synthetics)"
+
+# Gate thresholds — devsecops-pipeline.md §7.2, verbatim. recall = mask/block
+# rate on positives (security-critical); precision = 1 - FP rate on negatives
+# (product-quality); regression measured vs the previous green-main baseline.
+
+[thresholds.pii_email_phone]
+recall_floor = 0.98
+precision_floor = 0.95
+max_recall_regression_pp = 0.5
+
+[thresholds.pii_dpdp]
+recall_floor = 0.95
+precision_floor = 0.90
+max_recall_regression_pp = 1.0
+
+[thresholds.injection]
+recall_floor = 0.90
+precision_floor = 0.85
+max_recall_regression_pp = 1.0
+
+# Known gaps — recorded, NOT scored. These are real-world cases today's engine
+# is known to miss; keeping them in positives would make the gate red on day
+# one and normalize a failing baseline. The harness MUST exclude these files
+# from pass/fail (track them as report-only). Closing a gap is a guardrail
+# *behavior* change — its own >=2-review PR per branching-and-devex.md §3 —
+# and that PR moves the record back into the scored positives file.
+#
+# Current gaps: +91-spaced Indian mobile formats (e.g. "+91 98765 43210") are
+# not matched by GuardrailEngine's PHONE_REGEX — a desired future improvement
+# for the India-first / DPDP profile.
+
+[known_gaps]
+files = ["pii/known_gaps.jsonl"]
+scored = false

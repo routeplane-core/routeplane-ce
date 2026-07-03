@@ -1,0 +1,140 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/types",
+  "crates/adapters",
+  "crates/residency",
+  "crates/router",
+  "crates/entitlements",
+  "crates/flags",
+  "crates/guardrails",
+  "crates/limits",
+  "crates/policy",
+  "crates/cache",
+  "crates/rtk",
+  "crates/prompts",
+  "crates/ledger-vocab",
+  "crates/routeplane",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# MSRV — must match rust-toolchain.toml, the Dockerfile (rust:1.88-slim-bookworm)
+# and the explicit toolchain ci.yml passes to rust-quality (ADR-093 bump).
+# Declares the floor so cargo's MSRV-aware resolver can prefer deps that
+# compile on CI's 1.88 instead of selecting newer-toolchain releases (the
+# wiremock 0.6.5 incident).
+rust-version = "1.88"
+# Proprietary, closed-source workspace — these crates must NEVER be published to
+# crates.io. `publish = false` is the truth about them and is what lets
+# cargo-deny treat them as private (deny.toml `[licenses].private.ignore`), so
+# the license gate applies to third-party deps without flagging our own crates.
+publish = false
+
+# Single source of truth for shared dependency versions.
+# Member crates opt in via `<dep> = { workspace = true }`.
+[workspace.dependencies]
+# `multipart` enables the `Multipart` extractor for binary uploads on the
+# /v1/audio/transcriptions route (speech-to-text). It is a small feature on an
+# existing dep — no new crate, no standing cost (frugality invariant).
+axum = { version = "0.8", features = ["multipart"] }
+tokio = { version = "1.0", features = ["full"] }
+# tower 0.5: ConcurrencyLimitLayer (`limit`) + LoadShedLayer (`load-shed`) for
+# the Tower reliability stack (Task #2). `util`/`timeout` for ServiceBuilder use.
+tower = { version = "0.5", features = [
+  "limit",
+  "load-shed",
+  "util",
+  "timeout",
+] }
+tower-http = { version = "0.6", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# `multipart` enables `reqwest::multipart::Form` for the audio-transcription
+# adapters (binary audio upload to OpenAI/Groq /v1/audio/transcriptions). A
+# feature on an existing dep — no new crate, no standing cost.
+reqwest = { version = "0.13", features = ["json", "stream", "query", "multipart"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+redis = { version = "0.25", features = ["tokio-comp"] }
+dotenvy = "0.15"
+async-trait = "0.1"
+futures = "0.3"
+async-stream = "0.3"
+bytes = "1"
+uuid = { version = "1.0", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1.12"
+lazy_static = "1.4"
+# Constant-time secret comparison for virtual-key auth (Task #3c).
+subtle = "2.6"
+# Console end-user password hashing (ADR-065 D3) — argon2id, control plane only.
+argon2 = "0.5"
+# CSPRNG for session ids / CSRF tokens / password salts (ADR-065). control plane.
+getrandom = "0.2"
+# Lock-free, reader-wait-free hot-swap of AuthState / RouterConfig / PolicyRegistry
+# for control-plane hot-reload (Task #7, ADR-021 §3). Also publishes the rung-0
+# exact-cache shard maps (ADR-022 §2): readers never wait on writers.
+arc-swap = "1.7"
+# WHATWG URL parsing for the Guardrails v2 webhook SSRF guard (G2.6). Already in
+# the dependency tree transitively via reqwest — promoting it to a direct dep
+# adds zero new compile/license/standing weight, and hand-rolling URL parsing
+# for a security guard (userinfo tricks, IPv6 literals) would be a footgun.
+url = "2"
+# Control-plane only (crates/control-plane): Entra ID OIDC bearer-token
+# validation against the tenant's JWKS (engineering-design §13, PRD-004 FR-1).
+# default-features off: drops the use_pem feature (pem + simple_asn1 + time) we do not
+# use (keys come from JWK/secret, never PEM) — removes the RUSTSEC-2026-0009-affected
+# `time` crate entirely (its fix needs rustc 1.88; our MSRV gate is 1.86).
+jsonwebtoken = { version = "9", default-features = false }
+# SHA-256 for virtual-key hash-at-rest and the hash-chained admin audit ledger
+# (crates/store; PRD-004 FR-9/10). High-entropy `rp_` keys hash with SHA-256
+# (not bcrypt): there is no low-entropy password to stretch, CP auth is off the
+# DP hot path, and a single deterministic digest keeps the chain reproducible.
+# Also the exact-cache key digest (PRD-007 FR-5, crates/cache).
+sha2 = "0.11"
+# --- Sovereign audit ledger (PRD-001 / ADR-019), `crates/ledger` only ---------
+# NO azure-sdk crates anywhere: the official azure_core/azure_identity line
+# pulls `time` >=0.3.47 (rustc 1.88) while every 1.86-compatible `time` carries
+# RUSTSEC-2026-0009 — unresolvable under the MSRV gate. Managed-identity tokens
+# are fetched over the documented MSI REST endpoints (ACA/App Service
+# IDENTITY_ENDPOINT and VM IMDS) and storage/Key Vault data planes over
+# `reqwest` against pinned stable REST API versions — see crates/ledger/src/
+# azure.rs. Revisit if/when the toolchain moves to >=1.88.
+# base64url for Key Vault `sign` payloads (JWS-shaped digest/signature encoding).
+base64 = "0.22"
+# Pure-Rust RSA for the standalone PRD-002 audit-artifact verifier CLI
+# (`crates/artifact-verify`) ONLY — never linked into the gateway or signer path.
+# It verifies Key-Vault PS256 (RSA-PSS/SHA-256) signatures offline against an
+# exported public key. Pinned to the 0.9 line (MSRV 1.65, well under the 1.86
+# gate); 0.10 is still an -rc. It pulls its OWN `sha2`/`digest` 0.10 (via the
+# `sha2` feature) — deliberately separate from the workspace `sha2 0.11`, which
+# is fine: the verifier only ever sees the precomputed 32-byte digest as opaque
+# bytes at the `SignatureVerifier` boundary, so the two trees never meet.
+# RUSTSEC-2023-0071 (Marvin) is a private-key/decrypt timing channel — this crate
+# only does public-key verification, so it does not apply (advisories are
+# informational per deny.toml regardless).
+rsa = { version = "0.9", features = ["pem", "sha2"] }
+# Test-only: mock-LLM HTTP servers and property-based round-trip testing (Task #4).
+# Pinned: wiremock 0.6.5 uses let-chains (MSRV ~1.88) and breaks the CI Rust 1.86 quality gate;
+# 0.6.4 is the newest release that compiles on 1.86. Re-evaluate if the toolchain is bumped.
+wiremock = "=0.6.4"
+proptest = "1.5"
+
+# Manifest-borne lint policy (single source of truth): local cargo,
+# rust-analyzer, and CI all deny warnings identically (devsecops-pipeline.md
+# §10 — local == CI). CI's `-D warnings` flag in common-actions/rust-quality
+# stays as belt-and-braces. Member crates opt in via `[lints] workspace = true`.
+[workspace.lints.rust]
+warnings = "deny"
+
+# Production binary tuning — frugality: a smaller stripped binary means a
+# smaller image, cheaper ACR storage/pull, and a faster ACA scale-to-zero cold
+# start. Tradeoffs: slower release compile; `strip` removes the symbol table so
+# panic backtraces show addresses only (release already has debug=false, so no
+# debuginfo is lost).
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

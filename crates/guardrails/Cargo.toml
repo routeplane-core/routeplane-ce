@@ -1,0 +1,25 @@
+[package]
+name = "routeplane-guardrails"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Guardrails — Community Edition core (PRD-047 / ADR-088). The CE-safe leaf of
+# the guardrail system: the closed check-outcome VOCABULARY the always-on
+# data-plane path names (Hook/CheckAction/Verdict/CheckOutcome/ConfigSource/
+# ParseError — observability records `CheckOutcome` unconditionally), the
+# deterministic detector library (`detect` — basic PII/secret masking + the pure
+# detector primitives), and the JSON-schema-subset validator (`schema`). The
+# advanced check ENGINE, off-path pipeline, ML detectors, moderation, webhook +
+# vendor packs, and reversible tokenization live in the sibling
+# `routeplane-guardrails-advanced` crate (the ledger→ledger-vocab split), which
+# depends on this crate and re-exports every name here.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+
+# Opt in to the workspace lint policy (deny warnings) — see root Cargo.toml.
+[lints]
+workspace = true
