@@ -294,12 +294,14 @@ artifact.** Every claim below is checkable without taking our word for it.
   you run:
 
   ```bash
-  cosign verify ghcr.io/routeplane-core/routeplane-ce:v0.1.0 \
-    --certificate-identity-regexp '^https://github.com/routeplane-core/routeplane-ce/' \
-    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  cosign verify ghcr.io/routeplane-core/routeplane-ce:latest \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity-regexp \
+      '^https://github\.com/routeplane-core/routeplane-ce/\.github/workflows/image\.yml@refs/'
   ```
 
-  <!-- TODO(launch): after the first release, pin the exact workflow identity string here. -->
+  The identity ties the signature to this repo's `image.yml` workflow — a signature from anything
+  else does not verify.
 
 - **SBOM.** A Syft-generated SPDX SBOM is attached to every
   [GitHub release](https://github.com/routeplane-core/routeplane-ce/releases) and attested on the
