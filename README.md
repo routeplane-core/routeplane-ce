@@ -12,10 +12,7 @@ Lock-free hot path. No database. No telemetry. Apache-2.0.
 [![CI](https://github.com/routeplane-core/routeplane-ce/actions/workflows/ci.yml/badge.svg)](https://github.com/routeplane-core/routeplane-ce/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/routeplane-core/routeplane-ce/blob/main/LICENSE)
 [![Release](https://img.shields.io/github/v/release/routeplane-core/routeplane-ce?include_prereleases)](https://github.com/routeplane-core/routeplane-ce/releases)
-
-<!-- TODO(launch): enable once the GHCR package is public:
 [![GHCR](https://img.shields.io/badge/ghcr.io-routeplane--core%2Frouteplane--ce-blue)](https://ghcr.io/routeplane-core/routeplane-ce)
--->
 
 <!-- TODO(launch): record the 60-second demo GIF — `docker compose up` → point an OpenAI SDK at
 it → a fallback kicking in → RTK savings visible in the request log — and embed it here:
@@ -75,9 +72,9 @@ mutexes, so health bookkeeping never serializes your traffic.
     client` on the base-image pull.
 - **Windows / WSL 2:** enable **Docker Desktop → Settings → Resources → WSL Integration** for your
   distro (then Apply & Restart), or `docker` won't be reachable from your shell.
-- **Building from source** (the fallback until the pre-built image is published): give Docker
-  **~4 GB RAM and ~5 GB disk**; the first build compiles the Rust workspace (~10–15 min). Pulling
-  the published image needs neither.
+- **Building from source** (optional — `docker compose up --build`): give Docker
+  **~4 GB RAM and ~5 GB disk**; the first build compiles the Rust workspace (~10–15 min). The
+  default pull needs neither.
 - **Apple Silicon:** the image is `linux/amd64` for now and runs under Rosetta emulation; a native
   `arm64` image is on the roadmap.
 
@@ -91,9 +88,9 @@ cp .env.example .env && cp configs/keys.example.json configs/keys.json
 docker compose up -d
 ```
 
-> **First run builds from source** (~10–15 min) while the pre-built image is being published;
-> once it lands this becomes an instant image pull. See [Requirements](#requirements) for the
-> build resources Docker needs.
+> **`docker compose up` pulls the pre-built image** — a few seconds, no Rust toolchain. To build
+> from source instead, run `docker compose up --build` (~10–15 min the first time); see
+> [Requirements](#requirements) for the resources that path needs.
 
 Between steps 2 and 3: put at least one provider key in `.env` (e.g. `OPENAI_API_KEY=sk-...`),
 and set your own gateway key in `configs/keys.json` — any string starting with `rp_`. Generate a

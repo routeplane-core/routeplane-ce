@@ -18,9 +18,8 @@ services:
     build:
       context: .
       target: ce # build the gateway image from the Dockerfile
-    pull_policy: build # NOTE: builds from source on first `up` (~10-15 min). Switch to
-    # image is absent; `missing` makes plain `up` PULL, while
-    # `docker compose up --build` still forces the from-source path
+    pull_policy: missing # plain `up` PULLS the published image (fast); run
+    # `docker compose up --build` to build from source instead
     ports:
       - "8080:8080"
     env_file:
