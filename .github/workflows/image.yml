@@ -46,12 +46,35 @@ jobs:
             type=raw,value=ci,enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
           push: true
+          load: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Runtime smoke test: boot the image we just built and confirm the gateway
+      # serves /healthz. Loads keys from the shipped example so it starts cleanly.
+      - name: Smoke test (boot + /healthz)
+        env:
+          IMAGE_REF: ghcr.io/routeplane-core/routeplane-ce@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker run -d --name rp-smoke -p 8080:8080 \
+            -e RP_KEYS_FILE=./configs/keys.example.json -e RUST_LOG=info \
+            "$IMAGE_REF"
+          ok=""
+          for i in $(seq 1 20); do
+            if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/healthz)" = "200" ]; then
+              ok=1; echo "healthz: 200 OK after $((i*3))s"; break
+            fi
+            sleep 3
+          done
+          echo "--- container logs (tail) ---"; docker logs --tail=20 rp-smoke || true
+          docker rm -f rp-smoke >/dev/null 2>&1 || true
+          [ -n "$ok" ] || { echo "::error::gateway did not answer /healthz"; exit 1; }
