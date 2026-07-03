@@ -62,7 +62,9 @@ jobs:
       # serves /healthz. Loads keys from the shipped example so it starts cleanly.
       - name: Smoke test (boot + /healthz)
         env:
-          IMAGE_REF: ghcr.io/routeplane-core/routeplane-ce@${{ steps.build.outputs.digest }}
+          # the :ci tag is loaded into the local daemon by `load: true` above;
+          # run by tag (a registry @digest isn't resolvable in the local daemon).
+          IMAGE_REF: ghcr.io/routeplane-core/routeplane-ce:ci
         run: |
           set -euo pipefail
           docker run -d --name rp-smoke -p 8080:8080 \
