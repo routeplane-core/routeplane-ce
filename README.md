@@ -11,10 +11,10 @@ Lock-free hot path. No database. No telemetry. Apache-2.0.
 
 [![CI](https://github.com/routeplane-core/routeplane-ce/actions/workflows/ci.yml/badge.svg)](https://github.com/routeplane-core/routeplane-ce/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/routeplane-core/routeplane-ce/blob/main/LICENSE)
+[![Release](https://img.shields.io/github/v/release/routeplane-core/routeplane-ce?include_prereleases)](https://github.com/routeplane-core/routeplane-ce/releases)
 
-<!-- TODO(launch): enable once the GHCR package + first release are public:
+<!-- TODO(launch): enable once the GHCR package is public:
 [![GHCR](https://img.shields.io/badge/ghcr.io-routeplane--core%2Frouteplane--ce-blue)](https://ghcr.io/routeplane-core/routeplane-ce)
-[![Release](https://img.shields.io/github/v/release/routeplane-core/routeplane-ce)](https://github.com/routeplane-core/routeplane-ce/releases)
 -->
 
 <!-- TODO(launch): record the 60-second demo GIF — `docker compose up` → point an OpenAI SDK at
