@@ -97,7 +97,9 @@ jobs:
       - name: Generate SBOM (SPDX)
         uses: anchore/sbom-action@v0
         with:
-          image: ghcr.io/routeplane-core/routeplane-ce@${{ steps.build.outputs.digest }}
+          # scan the image loaded locally by `load: true` (by tag) — syft pulling
+          # the registry @digest fails auth in-job; the local scan is equivalent.
+          image: ghcr.io/routeplane-core/routeplane-ce:ci
           format: spdx-json
           output-file: sbom.spdx.json
 
