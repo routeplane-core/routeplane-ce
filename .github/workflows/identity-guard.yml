@@ -56,13 +56,20 @@ jobs:
           fi
 
       - name: Scan commit messages and patches on this event
+        env:
+          # github.* values via env (never interpolated into the script) — avoids
+          # template injection through a crafted ref name.
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            RANGE="origin/${{ github.base_ref }}...HEAD"
-            git fetch --no-tags origin "${{ github.base_ref }}"
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            git fetch --no-tags origin "${BASE_REF}"
+            RANGE="origin/${BASE_REF}...HEAD"
           else
-            RANGE="${{ github.event.before }}..${{ github.sha }}"
+            RANGE="${BEFORE_SHA}..${HEAD_SHA}"
           fi
           # Per-commit quiet scan of author lines, messages, and patch text;
           # emit only offending SHAs — never the matched content (public logs).
