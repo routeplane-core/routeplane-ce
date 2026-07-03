@@ -45,6 +45,8 @@ it → a fallback kicking in → RTK savings visible in the request log — and 
 ## How it works
 
 ```mermaid
+
+> **First run builds from source** (~10–15 min) while the pre-built image is being published. Once it lands, this becomes an instant image pull.
 flowchart LR
     Client["Your app or agent<br/>(OpenAI SDK, Cursor, Claude Code,<br/>Aider, LangChain, ...)"] -->|"base_url + rp_ key"| GW
 
