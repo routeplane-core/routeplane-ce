@@ -45,8 +45,6 @@ it → a fallback kicking in → RTK savings visible in the request log — and 
 ## How it works
 
 ```mermaid
-
-> **First run builds from source** (~10–15 min) while the pre-built image is being published. Once it lands, this becomes an instant image pull.
 flowchart LR
     Client["Your app or agent<br/>(OpenAI SDK, Cursor, Claude Code,<br/>Aider, LangChain, ...)"] -->|"base_url + rp_ key"| GW
 
@@ -92,6 +90,10 @@ git clone https://github.com/routeplane-core/routeplane-ce.git && cd routeplane-
 cp .env.example .env && cp configs/keys.example.json configs/keys.json
 docker compose up -d
 ```
+
+> **First run builds from source** (~10–15 min) while the pre-built image is being published;
+> once it lands this becomes an instant image pull. See [Requirements](#requirements) for the
+> build resources Docker needs.
 
 Between steps 2 and 3: put at least one provider key in `.env` (e.g. `OPENAI_API_KEY=sk-...`),
 and set your own gateway key in `configs/keys.json` — any string starting with `rp_`. Generate a
