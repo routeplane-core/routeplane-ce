@@ -44,7 +44,7 @@ jobs:
             type=semver,pattern={{version}}
             type=ref,event=tag
             type=sha,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest
             type=raw,value=ci,enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Build and push
@@ -59,6 +59,14 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Single-manifest image: no buildkit provenance/SBOM attestations, which
+          # would wrap the tag in an OCI index whose digest differs from the signed
+          # manifest — making `cosign verify <tag>` fail. We attach our own syft
+          # SBOM below. This keeps tag digest == steps.build.outputs.digest == the
+          # digest cosign signs, so verify-by-tag works. Also lets `load: true`
+          # import a plain image for the smoke test.
+          provenance: false
+          sbom: false
 
       # Runtime smoke test: boot the image we just built and confirm the gateway
       # serves /healthz. Loads keys from the shipped example so it starts cleanly.
