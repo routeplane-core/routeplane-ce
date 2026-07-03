@@ -65,10 +65,27 @@ flowchart LR
 The hot path is lock-free end to end: circuit breakers and latency tracking are atomics, not
 mutexes, so health bookkeeping never serializes your traffic.
 
+## Requirements
+
+- **Docker Engine 20.10+** with the **Docker Compose v2 plugin** — invoked as `docker compose`
+  (space), not the legacy `docker-compose`. Check with `docker compose version` (needs ≥ 2.24).
+- **Registry access.** `docker compose up` needs to reach a container registry:
+  - Pulling the pre-built image → `ghcr.io`.
+  - Building from source (below) → Docker Hub (`registry-1.docker.io`) for the base images.
+  - Behind a corporate proxy or VPN? Configure it in **Docker Desktop → Settings → Resources →
+    Proxies**, or you'll see `TLS handshake timeout` / `http: server gave HTTP response to HTTPS
+    client` on the base-image pull.
+- **Windows / WSL 2:** enable **Docker Desktop → Settings → Resources → WSL Integration** for your
+  distro (then Apply & Restart), or `docker` won't be reachable from your shell.
+- **Building from source** (the fallback until the pre-built image is published): give Docker
+  **~4 GB RAM and ~5 GB disk**; the first build compiles the Rust workspace (~10–15 min). Pulling
+  the published image needs neither.
+- **Apple Silicon:** the image is `linux/amd64` for now and runs under Rosetta emulation; a native
+  `arm64` image is on the roadmap.
+
 ## Quickstart
 
-Five minutes, Docker only — the compose file pulls a signed image from GHCR, so there is no Rust
-toolchain and no source build.
+Docker only — no Rust toolchain needed. Three commands to a running gateway:
 
 ```bash
 git clone https://github.com/routeplane-core/routeplane-ce.git && cd routeplane-ce
