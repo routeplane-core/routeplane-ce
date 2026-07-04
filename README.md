@@ -20,10 +20,12 @@ Apache-2.0.
 [![idle RSS](https://img.shields.io/badge/idle_RSS-24.5_MiB-orange)](https://github.com/routeplane-core/routeplane-ce/blob/main/benchmarks/perf/RESULTS.md)
 [![image](https://img.shields.io/badge/image-36_MiB_compressed-blueviolet)](https://github.com/routeplane-core/routeplane-ce/pkgs/container/routeplane-ce)
 
-<!-- TODO(launch): record the 60-second demo GIF — `docker compose up` → point an OpenAI SDK at
-it → a fallback kicking in → RTK savings visible in the request log — and embed it here:
-![60-second demo](https://github.com/routeplane-core/routeplane-ce/raw/main/docs/demo.gif)
--->
+![Demo: docker compose up, a stock OpenAI SDK fronting a local Ollama model, and the same coding-agent request dropping from 3,766 to 501 prompt tokens with RTK on](https://github.com/routeplane-core/routeplane-ce/raw/main/docs/demo.gif)
+
+*A real, unedited terminal session: `docker compose up -d` → a stock OpenAI SDK fronting a
+**local Ollama model** → the same coding-agent request measured by the model server at
+**3,766 prompt tokens without RTK, 501 with it (−87%)**. Reproduce it yourself:
+[docs/demo/](https://github.com/routeplane-core/routeplane-ce/tree/main/docs/demo).*
 
 ---
 
