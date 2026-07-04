@@ -10,7 +10,7 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: read
+  contents: write # attach SBOM/compose/digest assets to the tag's release
   packages: write
   id-token: write # cosign keyless (Fulcio/Rekor)
   attestations: write
@@ -19,6 +19,14 @@ jobs:
   build-push:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # Image scans use syft's "image" cataloger set, which OMITS the Rust
+      # cargo-lock cataloger. Without this, the Cargo.lock shipped into the
+      # image is ignored and the SBOM lists only the Debian base. '+' force-adds
+      # it so the crates are enumerated. Job-level on purpose: the pinned
+      # sbom-action version below is proven to propagate job env to syft;
+      # newer sbom-action releases dropped step-env propagation.
+      SYFT_SELECT_CATALOGERS: "+rust-cargo-lock-cataloger"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -103,20 +111,58 @@ jobs:
         run: cosign sign --yes "ghcr.io/routeplane-core/routeplane-ce@${DIGEST}"
 
       - name: Generate SBOM (SPDX)
-        uses: anchore/sbom-action@v0
-        env:
-          # syft image scans skip the Rust lockfile cataloger by default; without
-          # it the SBOM lists only OS packages (zero pkg:cargo entries). Reads the
-          # Cargo.lock the Dockerfile ships in /usr/local/share/routeplane/.
-          SYFT_SELECT_CATALOGERS: "+rust-cargo-lock-cataloger"
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0 — propagates SYFT_* job env; newer versions don't
         with:
           # scan the image loaded locally by `load: true` (by tag) — syft pulling
           # the registry @digest fails auth in-job; the local scan is equivalent.
           image: ghcr.io/routeplane-core/routeplane-ce:ci
           format: spdx-json
           output-file: sbom.spdx.json
+          # the explicit release-assets step below owns publishing (the action's
+          # auto-attach uses its own naming and needs the release to preexist)
+          upload-release-assets: false
+
+      - name: SBOM sanity gate (crates enumerated)
+        run: |
+          set -euo pipefail
+          CARGO_PKGS=$(python3 -c "import json; d=json.load(open('sbom.spdx.json')); print(sum(1 for p in d.get('packages',[]) for r in p.get('externalRefs',[]) if r.get('referenceLocator','').startswith('pkg:cargo')))")
+          echo "pkg:cargo entries: ${CARGO_PKGS}"
+          if [ "${CARGO_PKGS}" -eq 0 ]; then
+            echo "::error::SBOM is inert — zero pkg:cargo entries (cataloger regression?)"; exit 1
+          fi
 
       - name: Attest the SBOM to the image (keyless)
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign attest --yes --type spdxjson --predicate sbom.spdx.json "ghcr.io/routeplane-core/routeplane-ce@${DIGEST}"
+
+      # Release assets: every tagged release carries the compose file, the SPDX
+      # SBOM, and the exact image digest + verify command ("verify what you run").
+      # The release for the tag must already exist (created at tag time).
+      - name: Attach release assets (tag builds)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cp sbom.spdx.json "routeplane-ce-${TAG}.spdx.json"
+          {
+            echo "image:  ghcr.io/routeplane-core/routeplane-ce:${TAG}"
+            echo "digest: ${DIGEST}"
+            echo
+            echo "Pull by digest (immutable):"
+            echo "  docker pull ghcr.io/routeplane-core/routeplane-ce@${DIGEST}"
+            echo
+            echo "Verify the signature (cosign, keyless — identity is this repo's image.yml workflow):"
+            echo "  cosign verify ghcr.io/routeplane-core/routeplane-ce:${TAG} \\"
+            echo "    --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "    --certificate-identity-regexp \\"
+            echo "      '^https://github\\.com/routeplane-core/routeplane-ce/\\.github/workflows/image\\.yml@refs/'"
+          } > "image-digest-${TAG}.txt"
+          gh release upload "${TAG}" \
+            "routeplane-ce-${TAG}.spdx.json" \
+            "image-digest-${TAG}.txt" \
+            docker-compose.yml \
+            --clobber
