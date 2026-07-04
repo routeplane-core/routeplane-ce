@@ -165,8 +165,14 @@ jobs:
             echo "    --certificate-identity-regexp \\"
             echo "      '^https://github\\.com/routeplane-core/routeplane-ce/\\.github/workflows/image\\.yml@refs/'"
           } > "image-digest-${TAG}.txt"
+          # Release copy of the compose file pins the version tag (the repo copy
+          # tracks :latest for the clone-and-up quickstart).
+          mkdir -p release-assets
+          sed "s|image: ghcr.io/routeplane-core/routeplane-ce:latest.*|image: ghcr.io/routeplane-core/routeplane-ce:${TAG}|" \
+            docker-compose.yml > release-assets/docker-compose.yml
+          grep -q "routeplane-ce:${TAG}" release-assets/docker-compose.yml
           gh release upload "${TAG}" \
             "routeplane-ce-${TAG}.spdx.json" \
             "image-digest-${TAG}.txt" \
-            docker-compose.yml \
+            release-assets/docker-compose.yml \
             --clobber
