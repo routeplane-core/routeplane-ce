@@ -342,7 +342,7 @@ artifact.** Every claim below is checkable without taking our word for it.
   ```
 
   The identity ties the signature to this repo's `image.yml` workflow — a signature from anything
-  else does not verify. Both `:latest` and the immutable version tags (e.g. `:v0.1.0-rc.1`) are
+  else does not verify. Both `:latest` and the immutable version tags (e.g. `:v0.1.0`) are
   signed; for a reproducible pin, verify and run a specific version or a `@sha256:` digest.
 
 - **SBOM.** A Syft-generated SPDX SBOM is attached to every
