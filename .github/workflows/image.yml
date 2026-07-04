@@ -104,6 +104,11 @@ jobs:
 
       - name: Generate SBOM (SPDX)
         uses: anchore/sbom-action@v0
+        env:
+          # syft image scans skip the Rust lockfile cataloger by default; without
+          # it the SBOM lists only OS packages (zero pkg:cargo entries). Reads the
+          # Cargo.lock the Dockerfile ships in /usr/local/share/routeplane/.
+          SYFT_SELECT_CATALOGERS: "+rust-cargo-lock-cataloger"
         with:
           # scan the image loaded locally by `load: true` (by tag) — syft pulling
           # the registry @digest fails auth in-job; the local scan is equivalent.

@@ -46,5 +46,8 @@ FROM runtime-base AS ce
 COPY --from=builder --chown=routeplane:routeplane /usr/src/app/target/release/routeplane .
 COPY --from=builder --chown=routeplane:routeplane /usr/src/app/configs ./configs
 COPY LICENSE THIRD_PARTY_NOTICES.md /usr/local/share/doc/routeplane/
+# Ship Cargo.lock so syft's cargo-lock cataloger can enumerate the Rust crates
+# in the image SBOM (without it the SBOM lists only OS packages).
+COPY --from=builder /usr/src/app/Cargo.lock /usr/local/share/routeplane/Cargo.lock
 USER 1000:1000
 CMD ["./routeplane"]
