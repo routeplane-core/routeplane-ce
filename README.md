@@ -484,7 +484,9 @@ your stack you should be happy with it. Routeplane's different bets: a single Ru
 lock-free hot path instead of a Python service; RTK token compression with a committed,
 reproducible benchmark; no external dependencies (no Redis/DB) for single-node self-hosting; and
 an upgrade path into sovereign-residency and agentic-security governance for regulated
-environments. Try both against your workload — the base-URL swap makes that cheap.
+environments. Try both against your workload — the base-URL swap makes that cheap. The full
+comparison — LiteLLM, Bifrost, TensorZero, and Portkey, including what each does better than
+us — is in [COMPARISON.md](https://github.com/routeplane-core/routeplane-ce/blob/main/COMPARISON.md).
 
 **Can I use local models?**
 Yes — `self_hosted` fronts any OpenAI-compatible server (Ollama, vLLM, LocalAI, LM Studio, TGI)
@@ -526,6 +528,8 @@ enough to scale to zero.
   [SECURITY.md](https://github.com/routeplane-core/routeplane-ce/blob/main/SECURITY.md) /
   `security@routeplane.ai`. Please don't open public issues for vulnerabilities.
 - **Docs:** [docs.routeplane.ai](https://docs.routeplane.ai).
+- **How it compares:** honest comparison vs LiteLLM, Bifrost, TensorZero, Portkey —
+  [COMPARISON.md](https://github.com/routeplane-core/routeplane-ce/blob/main/COMPARISON.md).
 - **Contact:** `maintainers@routeplane.ai`.
 - **No SLA:** CE is maintained best-effort by a small team. We triage honestly and ship fixes,
   but there are no response-time guarantees. If you need an SLA, that is an
