@@ -187,7 +187,7 @@ the dialect directly where they don't.
 | Fireworks AI | `fireworks` | |
 | xAI (Grok) | `xai` | |
 | OpenRouter | `openrouter` | Meta-aggregator: one key, hundreds of models |
-| Self-hosted / local | `self_hosted` | Any OpenAI-compatible server — Ollama, vLLM, LocalAI, LM Studio, TGI. Set `SELF_HOSTED_BASE_URL` (e.g. `http://ollama:11434/v1`) |
+| Self-hosted / local | `self_hosted` | Any OpenAI-compatible server — Ollama, vLLM, LocalAI, LM Studio, TGI. Set `SELF_HOSTED_BASE_URL` to the server root **without** `/v1` (e.g. `http://ollama:11434` — the gateway appends `/v1/chat/completions` itself) |
 
 `self_hosted` is a first-class provider — it participates in fallback chains, combos,
 strategies, and circuit breaking exactly like a hosted provider, so `self_hosted,openai`
@@ -460,7 +460,7 @@ cheaper targets, `latency` prefers the fastest recent EWMA.
 |----------|---------|
 | `PORT` | Listen port (default `8080`) |
 | `RUST_LOG` | Log filter (default `routeplane=info`) |
-| `SELF_HOSTED_BASE_URL` | Base URL of your OpenAI-compatible local server (enables `self_hosted`) |
+| `SELF_HOSTED_BASE_URL` | Root URL of your OpenAI-compatible local server, without `/v1` — e.g. `http://ollama:11434` (enables `self_hosted`) |
 | `RP_KEYS_JSON` / `RP_KEYS_FILE` | Key registry without a bind mount |
 | `RP_ROUTING_POLICIES_FILE` | Combos/routing-config file path |
 
