@@ -1,0 +1,38 @@
+<!doctype html><meta charset="utf-8">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { width:1280px; height:640px; background:#0B1120; overflow:hidden;
+         font-family:'DejaVu Sans',system-ui,-apple-system,sans-serif; color:#E2E8F0;
+         display:flex; flex-direction:column; justify-content:center; padding:0 96px;
+         position:relative; }
+  .glow { position:absolute; right:-220px; top:-220px; width:640px; height:640px; border-radius:50%;
+          background:radial-gradient(circle, rgba(99,102,241,.28) 0%, rgba(168,85,247,.10) 45%, transparent 70%); }
+  .glow2 { position:absolute; left:-260px; bottom:-300px; width:700px; height:700px; border-radius:50%;
+          background:radial-gradient(circle, rgba(14,165,233,.16) 0%, transparent 65%); }
+  .row { display:flex; align-items:center; gap:28px; margin-bottom:26px; }
+  .row img { width:96px; height:96px; }
+  .word { font-size:64px; font-weight:700; letter-spacing:-1px; color:#F8FAFC; }
+  .word span { background:linear-gradient(90deg,#0EA5E9,#6366F1,#A855F7);
+               -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .tag { font-size:32px; line-height:1.35; color:#CBD5E1; max-width:1000px; margin-bottom:32px; }
+  .tag b { color:#F8FAFC; font-weight:600; }
+  .chips { display:flex; gap:16px; flex-wrap:wrap; margin-bottom:36px; }
+  .chip { border:1.5px solid #334155; border-radius:999px; padding:10px 24px;
+          font-size:24px; color:#E2E8F0; background:rgba(30,41,59,.55); }
+  .chip b { color:#7DD3FC; font-weight:600; }
+  .foot { font-size:24px; color:#64748B; letter-spacing:.2px; }
+</style>
+<body>
+  <div class="glow"></div><div class="glow2"></div>
+  <div class="row"><img src="mark.svg"><div class="word">routeplane <span>CE</span></div></div>
+  <div class="tag">The open-source, OpenAI-compatible <b>AI gateway in a single Rust binary</b> —
+    routes 15 providers, compresses coding-agent tool output, verifiable supply chain.</div>
+  <div class="chips">
+    <div class="chip">Apache-2.0</div>
+    <div class="chip"><b>15</b> providers + local</div>
+    <div class="chip"><b>+1.63 ms</b> p99 overhead</div>
+    <div class="chip"><b>−76%</b> agent tool tokens</div>
+    <div class="chip">no telemetry</div>
+  </div>
+  <div class="foot">github.com/routeplane-core/routeplane-ce &nbsp;·&nbsp; cosign-signed &nbsp;·&nbsp; SBOM on every release</div>
+</body>
