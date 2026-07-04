@@ -7,12 +7,18 @@ or tool at it by changing only the base URL and the key, and you get 15 provider
 (hosted and self-hosted), fallback chains with per-provider circuit breakers, response caching,
 rate and spend limits, and RTK token compression — which cut tool-message tokens by ~76% on our
 benchmark suite (measured, committed, reproducible: `cd benchmarks && cargo run --release -p rtk-eval`).
-Lock-free hot path. No database. No telemetry. Apache-2.0.
+Lock-free hot path with **+1.16 ms p50 / +1.63 ms p99 measured gateway overhead**
+([release run, raw output committed](benchmarks/perf/RESULTS.md)). No database. No telemetry.
+Apache-2.0.
 
 [![CI](https://github.com/routeplane-core/routeplane-ce/actions/workflows/ci.yml/badge.svg)](https://github.com/routeplane-core/routeplane-ce/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/routeplane-core/routeplane-ce/blob/main/LICENSE)
 [![Release](https://img.shields.io/github/v/release/routeplane-core/routeplane-ce?include_prereleases)](https://github.com/routeplane-core/routeplane-ce/releases)
 [![GHCR](https://img.shields.io/badge/ghcr.io-routeplane--core%2Frouteplane--ce-blue)](https://ghcr.io/routeplane-core/routeplane-ce)
+[![p99 overhead](https://img.shields.io/badge/p99_overhead-%2B1.63_ms-brightgreen)](https://github.com/routeplane-core/routeplane-ce/blob/main/benchmarks/perf/RESULTS.md)
+[![throughput](https://img.shields.io/badge/throughput-~24k_req%2Fs-blue)](https://github.com/routeplane-core/routeplane-ce/blob/main/benchmarks/perf/RESULTS.md)
+[![idle RSS](https://img.shields.io/badge/idle_RSS-24.5_MiB-orange)](https://github.com/routeplane-core/routeplane-ce/blob/main/benchmarks/perf/RESULTS.md)
+[![image](https://img.shields.io/badge/image-36_MiB_compressed-blueviolet)](https://github.com/routeplane-core/routeplane-ce/pkgs/container/routeplane-ce)
 
 <!-- TODO(launch): record the 60-second demo GIF — `docker compose up` → point an OpenAI SDK at
 it → a fallback kicking in → RTK savings visible in the request log — and embed it here:
@@ -239,6 +245,40 @@ Give a chain (`x-routeplane-provider: openai,anthropic` or a combo) and the gate
 candidates by your chosen strategy, skips providers whose circuit is open, and tries them in
 order — first success wins. On streaming requests, fallback applies until the first chunk
 arrives; after that the gateway is committed to that provider.
+
+## Performance: measured, not promised
+
+Every number below comes from the [committed harness](benchmarks/perf/) run on a dedicated,
+otherwise-idle Azure `Standard_D8s_v5` (a VM anyone can rent), against the exact tree that
+ships as `v0.1.0-rc.1` — with the raw load-generator output
+[committed alongside](benchmarks/perf/results/2026-07-04-azure-d8s-v5/). One command reproduces it.
+
+```mermaid
+%%{init: {"theme": "base", "themeVariables": {"xyChart": {"plotColorPalette": "#0EA5E9"}}}}%%
+xychart-beta
+    title "Latency added by the gateway hop (ms, 32 connections, at saturation)"
+    x-axis ["p50", "p90", "p99"]
+    y-axis "ms added vs zero-work upstream" 0 --> 2
+    bar [1.16, 1.48, 1.63]
+```
+
+| Measured (median of 3 runs) | Value |
+|---|---|
+| Gateway overhead @ 32 connections | **+1.16 ms p50 · +1.48 ms p90 · +1.63 ms p99** |
+| Sustained throughput (100% success) | **~24,000 req/s** on 8 shared vCPUs |
+| Memory | **24.5 MiB** RSS idle → **~90 MiB** at 24k req/s |
+| Ship size | **13.6 MiB** binary · **36 MiB** compressed image |
+
+The honest fine print — stated because most gateway numbers you read omit it: this was measured
+**at the gateway's saturation ceiling**, with the load generator and mock upstream sharing the
+same 8 vCPUs, and **default per-request logging switched on** (it wrote 6.8 GB during the run —
+that cost is included, because it's what ships). Vendor numbers measured below saturation with
+observability off would look flatter; ours is the worst-case read. Full methodology, hardware
+disclosure, saturation analysis, and caveats: [benchmarks/perf/RESULTS.md](benchmarks/perf/RESULTS.md).
+
+```bash
+cd benchmarks/perf && ./run.sh floor && ./run.sh gateway rp_YOUR_KEY   # reproduce it
+```
 
 ## RTK token compression: the numbers
 
