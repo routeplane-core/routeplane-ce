@@ -14,7 +14,7 @@ compiled is the leaf crate under test, `../crates/rtk`).
 | Harness | What it measures | Status |
 |---|---|---|
 | [`rtk-eval/`](rtk-eval/) | Real input-token reduction of RTK tool_result compression over a committed coding-agent trace corpus, with a real tokenizer | **Measured** — see [`rtk-eval/RESULTS.md`](rtk-eval/RESULTS.md) |
-| [`perf/`](perf/) | Gateway added latency/throughput overhead vs a zero-work mock upstream | **Harness ready** — numbers publish with the release run on quiet hardware ([methodology](perf/README.md)) |
+| [`perf/`](perf/) | Gateway added latency/throughput overhead vs a zero-work mock upstream | **Measured** — see [`perf/RESULTS.md`](perf/RESULTS.md) ([methodology](perf/README.md)) |
 
 ## Quick start
 

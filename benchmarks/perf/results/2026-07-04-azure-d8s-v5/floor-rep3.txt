@@ -1,0 +1,100 @@
+== leg: floor  url: http://127.0.0.1:9100/v1/chat/completions  duration: 60s  warmup: 15s ==
+-- warmup (15s, 32 conns, results discarded) --
+-- measure (60s, 32 conns) --
+Summary:
+  Success rate:	100.00%
+  Total:	60001.7665 ms
+  Slowest:	11.7002 ms
+  Fastest:	0.0192 ms
+  Average:	0.1794 ms
+  Requests/sec:	176921.5912
+
+  Total data:	4.44 GiB
+  Size/request:	449 B
+  Size/sec:	75.76 MiB
+
+Response time histogram:
+   0.019 ms [1]        |
+   1.187 ms [10607791] |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+   2.355 ms [7175]     |
+   3.523 ms [252]      |
+   4.692 ms [10]       |
+   5.860 ms [132]      |
+   7.028 ms [18]       |
+   8.196 ms [27]       |
+   9.364 ms [110]      |
+  10.532 ms [40]       |
+  11.700 ms [22]       |
+
+Response time distribution:
+  10.00% in 0.0893 ms
+  25.00% in 0.1108 ms
+  50.00% in 0.1435 ms
+  75.00% in 0.2125 ms
+  90.00% in 0.3055 ms
+  95.00% in 0.3774 ms
+  99.00% in 0.6634 ms
+  99.90% in 1.1213 ms
+  99.99% in 1.7770 ms
+
+
+Details (average, fastest, slowest):
+  DNS+dialup:	0.1898 ms, 0.0419 ms, 0.4594 ms
+  DNS-lookup:	0.0039 ms, 0.0009 ms, 0.0259 ms
+
+Status code distribution:
+  [200] 10615578 responses
+
+Error distribution:
+  [30] aborted due to deadline
+-- warmup (15s, 256 conns, results discarded) --
+-- measure (60s, 256 conns) --
+Summary:
+  Success rate:	100.00%
+  Total:	60004.7811 ms
+  Slowest:	14.5237 ms
+  Fastest:	0.0314 ms
+  Average:	0.9789 ms
+  Requests/sec:	261089.4952
+
+  Total data:	6.55 GiB
+  Size/request:	449 B
+  Size/sec:	111.80 MiB
+
+Response time histogram:
+   0.031 ms [1]        |
+   1.481 ms [13705684] |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+   2.930 ms [1628515]  |■■■
+   4.379 ms [293201]   |
+   5.828 ms [31672]    |
+   7.278 ms [6064]     |
+   8.727 ms [926]      |
+  10.176 ms [280]      |
+  11.625 ms [47]       |
+  13.075 ms [16]       |
+  14.524 ms [4]        |
+
+Response time distribution:
+  10.00% in 0.4800 ms
+  25.00% in 0.6317 ms
+  50.00% in 0.8294 ms
+  75.00% in 1.0897 ms
+  90.00% in 1.6446 ms
+  95.00% in 2.1852 ms
+  99.00% in 3.4569 ms
+  99.90% in 5.0966 ms
+  99.99% in 7.1201 ms
+
+
+Details (average, fastest, slowest):
+  DNS+dialup:	4.1181 ms, 0.3641 ms, 7.1155 ms
+  DNS-lookup:	0.0018 ms, 0.0009 ms, 0.0163 ms
+
+Status code distribution:
+  [200] 15666410 responses
+
+Error distribution:
+  [208] aborted due to deadline
+
+NOTE: run each leg 3x on a quiet machine and report the median run;
+published numbers require the hardware disclosure in README.md.
