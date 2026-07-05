@@ -260,8 +260,16 @@ pub async fn prompt_completions(
     .await
 }
 
-/// The FR-13/FR-14 entitlement gate. Returns `Some(403)` when the prompt registry
+/// The FR-13/FR-14 entitlement gate. Returns `Some` when the prompt registry
 /// is not active for this tenant, distinguishing not-entitled from held-back.
+///
+/// An entitled-but-held-back tenant → 403 `feature_not_released` (an operator
+/// rollout holdback — truthful on both builds). A NOT-ENTITLED tenant on the
+/// **enterprise build** → 403 `feature_not_entitled` (FR-13); on the
+/// **Community Edition** → the uniform 402 `enterprise_only` upsell
+/// (`api_error::enterprise_only`, the same envelope as /v1/finops/* and the
+/// /v1/mcp/* stubs). Keys an operator DID grant `PromptRegistry` (Standard+
+/// tier in `keys.json`) pass the gate exactly as before.
 fn entitlement_gate(ctx: &TenantContext) -> Option<Response> {
     if ctx.capabilities.active(Feature::PromptRegistry) {
         return None;
@@ -280,13 +288,20 @@ fn entitlement_gate(ctx: &TenantContext) -> Option<Response> {
             None,
         )
     } else {
-        openai_error(
-            StatusCode::FORBIDDEN,
-            "invalid_request_error",
-            "feature_not_entitled",
-            "Prompt registry requires the Standard tier or above.",
-            None,
-        )
+        #[cfg(not(feature = "enterprise"))]
+        {
+            crate::api_error::enterprise_only("/v1/prompts")
+        }
+        #[cfg(feature = "enterprise")]
+        {
+            openai_error(
+                StatusCode::FORBIDDEN,
+                "invalid_request_error",
+                "feature_not_entitled",
+                "Prompt registry requires the Standard tier or above.",
+                None,
+            )
+        }
     })
 }
 

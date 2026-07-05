@@ -1,10 +1,10 @@
 use crate::openai::openai_sse_to_chunks;
-use crate::{ChunkStream, Provider, ProviderError};
+use crate::{ChunkStream, Provider, ProviderError, SpeechAudio};
 use async_trait::async_trait;
 use reqwest::Client;
 use routeplane_types::{
     ChatCompletionRequest, ChatCompletionResponse, EmbeddingRequest, EmbeddingResponse,
-    RerankRequest, RerankResponse,
+    RerankRequest, RerankResponse, SpeechRequest,
 };
 use serde_json::json;
 
@@ -199,6 +199,59 @@ impl Provider for SelfHostedProvider {
             .await
             .map_err(|e| crate::client::sanitize_transport_error("self_hosted", e))
     }
+
+    async fn speech(
+        &self,
+        request: SpeechRequest,
+        api_key: String,
+    ) -> Result<SpeechAudio, ProviderError> {
+        if self.base_url.is_empty() {
+            return Err("self-hosted endpoint not configured (set SELF_HOSTED_BASE_URL)".into());
+        }
+        // OpenAI-compatible servers expose `/v1/audio/speech` with the canonical
+        // `{model?, input, voice, ...}` request and BINARY audio out. A FAITHFUL
+        // passthrough: no default model is injected (unlike the first-party
+        // OpenAI adapter) — the upstream validates its own model/endpoint
+        // support and its error surfaces cleanly as a typed ProviderError.
+        // The audio bytes and the api_key are NEVER logged.
+        let requested_format = request.response_format.clone();
+        let url = format!("{}/v1/audio/speech", self.base_url);
+
+        let response = self
+            .client
+            .post(url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| crate::client::sanitize_transport_error("self_hosted", e))?;
+
+        if !response.status().is_success() {
+            return Err(crate::client::error_from_response("self_hosted", response).await);
+        }
+
+        // Prefer the upstream Content-Type; fall back to deriving it from the
+        // requested response_format (default mp3 ⇒ audio/mpeg) — the same
+        // convention as the first-party OpenAI adapter.
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                crate::openai::content_type_for_format(requested_format.as_deref()).to_string()
+            });
+
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| crate::client::sanitize_transport_error("self_hosted", e))?;
+
+        Ok(SpeechAudio {
+            bytes: bytes.to_vec(),
+            content_type,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -336,5 +389,59 @@ mod tests {
             .expect("embeddings passthrough succeeds");
         assert_eq!(out.data.len(), 1);
         assert_eq!(out.model, "nomic-embed-text");
+    }
+
+    #[tokio::test]
+    async fn speech_passthrough_sends_bearer_and_keeps_upstream_content_type() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .and(header("authorization", "Bearer sk-local"))
+            .and(body_partial_json(
+                serde_json::json!({ "model": "kokoro", "input": "hello", "voice": "alloy" }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"FAKE-MP3".to_vec())
+                    .insert_header("content-type", "audio/mpeg"),
+            )
+            .mount(&server)
+            .await;
+
+        let p = SelfHostedProvider::with_base_url(server.uri());
+        let request: routeplane_types::SpeechRequest = serde_json::from_value(serde_json::json!({
+            "model": "kokoro",
+            "input": "hello",
+            "voice": "alloy"
+        }))
+        .unwrap();
+        let out = p
+            .speech(request, "sk-local".into())
+            .await
+            .expect("speech passthrough succeeds");
+        assert_eq!(out.bytes, b"FAKE-MP3");
+        assert_eq!(out.content_type, "audio/mpeg");
+    }
+
+    #[tokio::test]
+    async fn speech_upstream_error_is_typed_not_a_panic() {
+        // Faithful passthrough: the upstream decides whether the model supports
+        // TTS — its 400 surfaces as a typed ProviderError, never a panic.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("model has no audio output"))
+            .mount(&server)
+            .await;
+
+        let p = SelfHostedProvider::with_base_url(server.uri());
+        let request: routeplane_types::SpeechRequest =
+            serde_json::from_value(serde_json::json!({ "input": "hello", "voice": "alloy" }))
+                .unwrap();
+        let err = p
+            .speech(request, "sk-local".into())
+            .await
+            .expect_err("upstream 400 should be an Err");
+        assert_eq!(err.status(), Some(400));
     }
 }

@@ -446,7 +446,9 @@ impl CustomProviderStore {
 }
 
 /// Atomic, restrictive-permission file write: temp file (0600) + fsync + rename.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+/// `pub(crate)`: shared with `console_accounts.rs`, which persists the console
+/// account registry under the identical secret-file posture.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write as _;
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {

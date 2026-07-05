@@ -5,7 +5,7 @@
 //! is an `AppState` (for the observability ring) and a `SharedAuthState` registry
 //! (the key→tenant ownership map the handler resolves the scope from).
 //!
-//! Covers: the entitlement gate (Free → 403 feature_not_entitled; held-back
+//! Covers: the entitlement gate (Free → 402 enterprise_only on CE; held-back
 //! Business → 403 feature_not_released; entitled Business → 200); the 200 envelope
 //! shape (carries tenant_id + window/events_matched); and tenant isolation — a
 //! seeded event on the tenant's own key is counted, and the report never reflects
@@ -89,34 +89,43 @@ async fn record_and_settle(state: &AppState, event: UsageEvent) {
 // --- entitlement gate ---------------------------------------------------------
 
 #[tokio::test]
-async fn free_tenant_gets_403_feature_not_entitled() {
+async fn free_tenant_gets_402_enterprise_only() {
+    // CE contract: a NOT-ENTITLED tenant gets the uniform 402 `enterprise_only`
+    // upsell (the same envelope as /v1/moderations and the /v1/mcp/* stubs),
+    // replacing the old 403 `feature_not_entitled`.
     let resp = usage_export(
         State(build_state()),
         Extension(auth()),
         Extension(ctx(Tier::Free, "t_acme")),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
     assert_eq!(
-        body_json(resp).await["error"]["code"],
-        "feature_not_entitled"
+        resp.headers()
+            .get("x-routeplane-upgrade")
+            .and_then(|v| v.to_str().ok()),
+        Some("https://routeplane.ai")
     );
+    let v = body_json(resp).await;
+    assert_eq!(v["error"]["code"], "enterprise_only");
+    assert!(v["error"]["message"]
+        .as_str()
+        .expect("message")
+        .starts_with("/v1/finops/usage is a Routeplane Enterprise feature"));
 }
 
 #[tokio::test]
-async fn standard_tenant_gets_403_feature_not_entitled() {
-    // Standard baseline does NOT include finops_export (Business+ only).
+async fn standard_tenant_gets_402_enterprise_only() {
+    // Standard baseline does NOT include finops_export (Business+ only) — on
+    // the CE build the not-entitled refusal is the uniform enterprise_only 402.
     let resp = usage_export(
         State(build_state()),
         Extension(auth()),
         Extension(ctx(Tier::Standard, "t_acme")),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        body_json(resp).await["error"]["code"],
-        "feature_not_entitled"
-    );
+    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(body_json(resp).await["error"]["code"], "enterprise_only");
 }
 
 #[tokio::test]

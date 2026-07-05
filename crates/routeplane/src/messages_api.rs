@@ -383,10 +383,23 @@ pub async fn messages(
     }
 
     // Default the provider chain to `anthropic` for this surface (the client is
-    // speaking the Anthropic shape) UNLESS the caller explicitly overrode it. We
-    // inject the synthetic header so the core's existing header-driven provider
-    // resolution is reused verbatim — any provider still works.
-    if !headers.contains_key("x-routeplane-provider") {
+    // speaking the Anthropic shape) UNLESS the caller explicitly overrode it —
+    // OR the model id is registered on a runtime custom provider. In the custom
+    // case we leave the header ABSENT so the core's header-less MODEL routing
+    // resolves it (the same precedence as /v1/chat/completions: a custom
+    // provider never shadows a built-in catalog id). The probe is one lock-free
+    // `ArcSwap::load` + `HashMap` miss when the registry is empty ⇒ the
+    // synthetic-anthropic default is byte-identical. The custom path then rides
+    // the SAME pipeline: this handler's inbound Anthropic→canonical translation,
+    // the core's controls, the OpenAI-compatible `SelfHostedProvider` egress to
+    // the provider's /v1/chat/completions, and the outbound canonical→Anthropic
+    // translation below — usage records under the custom provider's name.
+    let model_routes_to_custom = !crate::models_api::is_builtin_model(&req.model)
+        && state
+            .custom_providers
+            .provider_for_model(&req.model)
+            .is_some();
+    if !headers.contains_key("x-routeplane-provider") && !model_routes_to_custom {
         headers.insert(
             "x-routeplane-provider",
             HeaderValue::from_static("anthropic"),

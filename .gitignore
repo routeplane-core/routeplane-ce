@@ -21,6 +21,12 @@ configs/*.bak
 configs/providers.json
 configs/providers.json.tmp
 
+# Console account registry — written by /v1/console/signup and holds argon2id
+# PASSWORD HASHES (0600); same never-committed posture as providers.json. The
+# `.tmp` is the atomic-write staging file.
+configs/console-accounts.json
+configs/console-accounts.json.tmp
+
 # Console SPA — deps and build output are produced by the build (npm / the
 # console-builder Docker stage), never committed. node_modules is a dev symlink.
 dashboard/node_modules
@@ -31,3 +37,6 @@ dashboard/dist
 
 # OS / editor junk
 .DS_Store
+
+# TypeScript incremental build cache (dashboard)
+dashboard/*.tsbuildinfo

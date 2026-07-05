@@ -109,7 +109,9 @@ fn cache_hit(key: &str, total_tokens: u32, saved_cost_micro_usd: u64) -> UsageEv
 // --- entitlement gate (must MATCH usage_timeseries exactly) -------------------
 
 #[tokio::test]
-async fn free_tenant_gets_403_feature_not_entitled() {
+async fn free_tenant_gets_402_enterprise_only() {
+    // CE contract: not-entitled → the uniform 402 `enterprise_only` upsell
+    // (matching /v1/finops/usage and the Enterprise stub routes).
     let resp = cache_savings(
         State(build_state()),
         Extension(auth()),
@@ -117,11 +119,13 @@ async fn free_tenant_gets_403_feature_not_entitled() {
         q(None),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        body_json(resp).await["error"]["code"],
-        "feature_not_entitled"
-    );
+    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    let v = body_json(resp).await;
+    assert_eq!(v["error"]["code"], "enterprise_only");
+    assert!(v["error"]["message"]
+        .as_str()
+        .expect("message")
+        .starts_with("/v1/finops/cache-savings is a Routeplane Enterprise feature"));
 }
 
 #[tokio::test]

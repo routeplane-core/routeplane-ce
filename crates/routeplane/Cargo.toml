@@ -61,6 +61,12 @@ url = { workspace = true }
 bytes = { workspace = true }
 # OpenTelemetry trace/span ID generation (OTLP export skeleton, PRD-009).
 sha2 = { workspace = true }
+# CE Console email+password auth (console_accounts.rs / console_auth.rs):
+# argon2id password hashing, HS256 session JWTs, CSPRNG salts/secrets. All
+# already workspace-declared + vendored (offline-safe).
+argon2 = { workspace = true }
+jsonwebtoken = { workspace = true }
+getrandom = { workspace = true }
 
 [features]
 # Community Edition (PRD-047 / ADR-088 Phase 1). This IS the CE source tree: the

@@ -5,7 +5,7 @@
 //! `Extension<SharedPromptRegistry>`. The only "network" is a localhost wiremock
 //! standing in for OpenAI on the completions path.
 //!
-//! Covers: entitlement gate (Free → 403 feature_not_entitled; held-back
+//! Covers: entitlement gate (Free → 402 enterprise_only on CE; held-back
 //! Enterprise → 403 feature_not_released; cleared → resolves, AC-7); GET stored
 //! version (FR-7); pure render with no upstream (FR-8); render-and-run happy path
 //! (FR-9); render-and-run inherits residency (PII + IN → 422, FR-9/§8.2); tenant
@@ -135,7 +135,9 @@ async fn mount_chat_ok(server: &MockServer) {
 // --- AC-7: entitlement gate ---------------------------------------------------
 
 #[tokio::test]
-async fn free_tenant_gets_403_feature_not_entitled() {
+async fn free_tenant_gets_402_enterprise_only() {
+    // CE contract: not-entitled → the uniform 402 `enterprise_only` upsell
+    // (matching /v1/finops/* and the Enterprise stub routes).
     let prompts = shared_prompts();
     let resp = get_prompt(
         Extension(prompts),
@@ -143,9 +145,13 @@ async fn free_tenant_gets_403_feature_not_entitled() {
         Path("prompt_greeting".to_string()),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
     let v = body_json(resp).await;
-    assert_eq!(v["error"]["code"], "feature_not_entitled");
+    assert_eq!(v["error"]["code"], "enterprise_only");
+    assert!(v["error"]["message"]
+        .as_str()
+        .expect("message")
+        .starts_with("/v1/prompts is a Routeplane Enterprise feature"));
 }
 
 #[tokio::test]

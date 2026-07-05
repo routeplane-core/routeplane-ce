@@ -5,8 +5,8 @@
 //! `AppState` (for the observability ring) and a `SharedAuthState` registry (the
 //! key→tenant ownership map the handler resolves the scope from).
 //!
-//! Covers: the SAME entitlement gate as `usage_export` (Free → 403
-//! feature_not_entitled; held-back Business → 403 feature_not_released; entitled
+//! Covers: the SAME entitlement gate as `usage_export` (Free → 402
+//! enterprise_only on CE; held-back Business → 403 feature_not_released; entitled
 //! Business → 200); the bucketed shape for seeded events; key-ownership scoping (a
 //! caller only sees its own keys' events); an empty ring → 200 with all-zero buckets
 //! (honest); and the honest recent-window `note`.
@@ -105,7 +105,9 @@ fn cost(micro_usd: u64) -> CostBreakdown {
 // --- entitlement gate (must MATCH usage_export exactly) -----------------------
 
 #[tokio::test]
-async fn free_tenant_gets_403_feature_not_entitled() {
+async fn free_tenant_gets_402_enterprise_only() {
+    // CE contract: not-entitled → the uniform 402 `enterprise_only` upsell
+    // (matching /v1/finops/usage and the Enterprise stub routes).
     let resp = usage_timeseries(
         State(build_state()),
         Extension(auth()),
@@ -113,11 +115,13 @@ async fn free_tenant_gets_403_feature_not_entitled() {
         q(None, None),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        body_json(resp).await["error"]["code"],
-        "feature_not_entitled"
-    );
+    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    let v = body_json(resp).await;
+    assert_eq!(v["error"]["code"], "enterprise_only");
+    assert!(v["error"]["message"]
+        .as_str()
+        .expect("message")
+        .starts_with("/v1/finops/timeseries is a Routeplane Enterprise feature"));
 }
 
 #[tokio::test]
