@@ -178,6 +178,140 @@ pub fn validate_and_normalize(cfg: &mut CustomProviderConfig) -> Result<(), (Str
     Ok(())
 }
 
+// --- SSRF guard on the operator-supplied base_url -------------------------------
+//
+// A custom `base_url` is an outbound request the gateway makes on the operator's
+// behalf — an SSRF primitive if it can be pointed at the cloud metadata endpoint
+// (169.254.169.254), the loopback interface, or an internal/private host the
+// gateway can reach but the operator should not. We refuse those at REGISTRATION
+// (fail-closed), resolving hostnames so a name that resolves to a blocked IP is
+// caught too.
+//
+// Self-host nuance: a self-hoster legitimately runs Ollama/vLLM on loopback or a
+// private VPC address. That case is an EXPLICIT opt-in
+// (`RP_CUSTOM_PROVIDER_ALLOW_PRIVATE=on`) which relaxes loopback + RFC1918/ULA —
+// but **link-local / cloud-metadata (169.254.0.0/16, fe80::/10) is ALWAYS
+// refused**: there is no legitimate reason to proxy to it, and it is the primary
+// credential-theft target.
+
+/// Whether the operator has opted into private/loopback custom-provider
+/// endpoints (in-VPC self-host). Link-local/metadata stays blocked regardless.
+#[must_use]
+pub fn custom_provider_allow_private() -> bool {
+    std::env::var("RP_CUSTOM_PROVIDER_ALLOW_PRIVATE")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "on" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn ipv6_is_link_local(a: &std::net::Ipv6Addr) -> bool {
+    (a.segments()[0] & 0xffc0) == 0xfe80
+}
+fn ipv6_is_unique_local(a: &std::net::Ipv6Addr) -> bool {
+    // fc00::/7 (ULA) — the IPv6 analogue of RFC1918.
+    (a.segments()[0] & 0xfe00) == 0xfc00
+}
+
+/// Classify a resolved IP. `Some(reason)` ⇒ refuse. Link-local/metadata is
+/// refused even when `allow_private` is set; loopback + private are refused only
+/// when it is not.
+fn ip_is_blocked(ip: std::net::IpAddr, allow_private: bool) -> Option<&'static str> {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            if v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast() {
+                return Some("non-routable address");
+            }
+            // 169.254.0.0/16 — includes the cloud metadata endpoint 169.254.169.254.
+            if v4.is_link_local() {
+                return Some("link-local/metadata address");
+            }
+            if !allow_private && (v4.is_loopback() || v4.is_private()) {
+                return Some("private/loopback address");
+            }
+            None
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_unspecified() || v6.is_multicast() {
+                return Some("non-routable address");
+            }
+            if ipv6_is_link_local(&v6) {
+                return Some("link-local address");
+            }
+            // An IPv4-mapped v6 address (::ffff:a.b.c.d) must be classified by its
+            // embedded v4 — otherwise ::ffff:169.254.169.254 would slip through.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ip_is_blocked(IpAddr::V4(v4), allow_private);
+            }
+            if !allow_private && (v6.is_loopback() || ipv6_is_unique_local(&v6)) {
+                return Some("private/loopback address");
+            }
+            None
+        }
+    }
+}
+
+/// Fail-closed SSRF check for a normalized `base_url`. Resolves the host (IP
+/// literal ⇒ checked directly; hostname ⇒ every resolved address checked) and
+/// refuses link-local/metadata always, loopback/private unless opted in.
+/// `Err((param, message))` matches the validator's error shape.
+pub fn ssrf_check(base_url: &str, allow_private: bool) -> Result<(), (String, String)> {
+    use std::net::{IpAddr, ToSocketAddrs};
+    let parsed = url::Url::parse(base_url).map_err(|_| {
+        (
+            "base_url".to_string(),
+            "base_url must be a valid URL".to_string(),
+        )
+    })?;
+    let host = parsed.host_str().ok_or_else(|| {
+        (
+            "base_url".to_string(),
+            "base_url must include a host".to_string(),
+        )
+    })?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+
+    let refuse = |reason: &str| {
+        (
+            "base_url".to_string(),
+            format!(
+                "base_url host is a {reason} — refused (SSRF guard). \
+                 Set RP_CUSTOM_PROVIDER_ALLOW_PRIVATE=on to allow loopback/private \
+                 endpoints for in-VPC servers (link-local/metadata stays blocked)."
+            ),
+        )
+    };
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if let Some(reason) = ip_is_blocked(ip, allow_private) {
+            return Err(refuse(reason));
+        }
+        return Ok(());
+    }
+
+    // Resolve and check every address the host maps to (a name resolving to a
+    // blocked IP is refused). A host that does NOT resolve is DEFERRED, not
+    // refused: it is not a reachable SSRF target now, and the actual dispatch
+    // would fail anyway — blocking it here would only break legitimate
+    // internal-DNS setups. (Registration-time resolution cannot defeat
+    // DNS-rebinding regardless; that is a documented limitation.)
+    match (host, port).to_socket_addrs() {
+        Ok(addrs) => {
+            for sa in addrs {
+                if let Some(reason) = ip_is_blocked(sa.ip(), allow_private) {
+                    return Err(refuse(reason));
+                }
+            }
+            Ok(())
+        }
+        Err(_) => Ok(()),
+    }
+}
+
 /// One live registry entry: the authored config + its adapter, built ONCE per
 /// snapshot (never per request) so the hot path only ever clones an `Arc`.
 pub struct CustomProviderEntry {
@@ -508,6 +642,80 @@ mod tests {
             "rp_custom_providers_{tag}_{}_{seq}.json",
             std::process::id()
         ))
+    }
+
+    // --- SSRF guard: adversarial coverage (the metadata endpoint, loopback,
+    //     private ranges, IPv4-mapped v6, and the opt-in) ---------------------
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().expect("test ip literal")
+    }
+
+    #[test]
+    fn ssrf_metadata_endpoint_is_always_blocked_even_with_opt_in() {
+        // The single most important case: the cloud metadata IP must be refused
+        // whether or not private endpoints are opted in.
+        assert!(ip_is_blocked(ip("169.254.169.254"), false).is_some());
+        assert!(ip_is_blocked(ip("169.254.169.254"), true).is_some());
+        // Whole link-local /16.
+        assert!(ip_is_blocked(ip("169.254.0.1"), true).is_some());
+        // IPv4-mapped IPv6 must classify by the embedded v4 (no bypass).
+        assert!(ip_is_blocked(ip("::ffff:169.254.169.254"), true).is_some());
+        // IPv6 link-local.
+        assert!(ip_is_blocked(ip("fe80::1"), true).is_some());
+    }
+
+    #[test]
+    fn ssrf_loopback_and_private_blocked_by_default_allowed_on_opt_in() {
+        for addr in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "172.16.0.1",
+            "192.168.1.10",
+            "::1",
+            "fc00::1", // IPv6 ULA
+        ] {
+            assert!(
+                ip_is_blocked(ip(addr), false).is_some(),
+                "{addr} must be blocked by default"
+            );
+            assert!(
+                ip_is_blocked(ip(addr), true).is_none(),
+                "{addr} must be allowed under the in-VPC opt-in"
+            );
+        }
+    }
+
+    #[test]
+    fn ssrf_unspecified_and_multicast_always_blocked() {
+        assert!(ip_is_blocked(ip("0.0.0.0"), true).is_some());
+        assert!(ip_is_blocked(ip("::"), true).is_some());
+        assert!(ip_is_blocked(ip("224.0.0.1"), true).is_some());
+        assert!(ip_is_blocked(ip("255.255.255.255"), true).is_some());
+    }
+
+    #[test]
+    fn ssrf_public_addresses_pass() {
+        assert!(ip_is_blocked(ip("1.1.1.1"), false).is_none());
+        assert!(ip_is_blocked(ip("8.8.8.8"), false).is_none());
+        assert!(ip_is_blocked(ip("2606:4700:4700::1111"), false).is_none());
+    }
+
+    #[test]
+    fn ssrf_check_refuses_ip_literal_metadata_and_localhost_name() {
+        // IP-literal base_url straight to metadata.
+        assert!(ssrf_check("http://169.254.169.254", false).is_err());
+        assert!(ssrf_check("http://169.254.169.254:80/v1", true).is_err());
+        // A hostname that resolves to loopback (localhost) is refused by default…
+        assert!(ssrf_check("http://localhost:11434", false).is_err());
+        // …and permitted under the in-VPC opt-in.
+        assert!(ssrf_check("http://localhost:11434", true).is_ok());
+        // A public IP literal passes.
+        assert!(ssrf_check("https://1.1.1.1", false).is_ok());
+        // A host that does not resolve is DEFERRED (allowed at registration —
+        // it is not a reachable SSRF target; dispatch fails on its own).
+        assert!(ssrf_check("http://nonexistent.invalid:8000", false).is_ok());
     }
 
     #[test]

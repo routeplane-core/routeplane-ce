@@ -47,6 +47,7 @@ pub async fn upsert_provider(
     }
     // A custom provider may NEVER shadow a built-in provider name (that would
     // silently reroute existing traffic); `routeplane` is reserved for combos.
+    // Checked BEFORE the SSRF guard: a pure string check, no DNS for a doomed name.
     if state.providers.contains_key(cfg.name.as_str()) || cfg.name == "routeplane" {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -58,6 +59,33 @@ pub async fn upsert_provider(
             "invalid_request_error",
             Some("name"),
         );
+    }
+    // SSRF guard (fail-closed): resolve base_url and refuse link-local/metadata
+    // always, loopback/private unless RP_CUSTOM_PROVIDER_ALLOW_PRIVATE=on. DNS
+    // resolution is blocking, so it runs off the async worker.
+    {
+        let allow_private = crate::custom_providers::custom_provider_allow_private();
+        let ssrf_url = cfg.base_url.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::custom_providers::ssrf_check(&ssrf_url, allow_private)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err((param, msg))) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "provider_ssrf_blocked",
+                    msg,
+                    "invalid_request_error",
+                    Some(&param),
+                );
+            }
+            Err(e) => {
+                tracing::error!("custom provider SSRF check task failed: {e}");
+                return crate::api_error::internal_error();
+            }
+        }
     }
     let name = cfg.name.clone();
     let base_url = cfg.base_url.clone();

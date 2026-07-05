@@ -30,19 +30,55 @@ use crate::console_accounts::{
     hash_password, normalize_email, validate_password, verify_password, CreateError,
 };
 use crate::console_auth::{ConsoleSession, SharedConsoleAuth, SESSION_TTL_SECS};
+use axum::extract::ConnectInfo;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
+use routeplane_limits::auth_failures::AuthFailureTracker;
+use routeplane_limits::now_unix_ms;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Fixed delay applied to EVERY failed login before the generic 401 — blunts
 /// online brute force and (with the dummy-verify below) flattens the
-/// known-vs-unknown-email timing difference. The per-source auth-failure
-/// throttle (R0.2) does not cover this public route, so the delay + argon2's
-/// inherent cost are the CE brute-force posture; per-IP throttling here is a
-/// documented follow-up.
+/// known-vs-unknown-email timing difference. Layered UNDER the per-source
+/// throttle below.
 const LOGIN_FAILURE_DELAY: Duration = Duration::from_millis(300);
+
+/// Per-source-IP throttle for the PUBLIC console credential routes
+/// (`/v1/console/signup` + `/v1/console/login`). Always-on for CE — these are
+/// the only unauthenticated password endpoints, so they need brute-force
+/// protection the keyed auth-failure tracker (which sits behind auth) can't
+/// give. Shares one budget across signup + login so an attacker can't dodge the
+/// login limit by pounding signup. Injected as a request extension.
+pub type SharedConsoleThrottle = Arc<AuthFailureTracker>;
+
+/// The IP a throttle decision is keyed on: the TCP peer address (`ConnectInfo`),
+/// which is NOT client-spoofable (unlike `X-Forwarded-For`). A CE instance
+/// behind a reverse proxy sees the proxy IP — over-throttling (the fail-safe
+/// direction) rather than under-throttling; a proxied deployment should forward
+/// the real peer or terminate closer to the client.
+fn throttle_key(addr: &SocketAddr) -> String {
+    addr.ip().to_string()
+}
+
+/// 429 with `Retry-After` when the source IP is over the credential-route
+/// threshold. The body never reveals account state — pure rate-limit signal.
+fn too_many_attempts(retry_after_secs: u64) -> Response {
+    let mut resp = error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "too_many_attempts",
+        "Too many authentication attempts. Try again later.",
+        "invalid_request_error",
+        None,
+    );
+    if let Ok(v) = axum::http::HeaderValue::from_str(&retry_after_secs.to_string()) {
+        resp.headers_mut().insert("retry-after", v);
+    }
+    resp
+}
 
 /// Signup/login request body. NO `Debug` derive — carries a plaintext password.
 #[derive(serde::Deserialize)]
@@ -110,8 +146,20 @@ fn dummy_hash() -> &'static str {
 /// `POST /v1/console/signup` (PUBLIC) — create an account + auto-login.
 pub async fn signup(
     Extension(bridge): Extension<SharedConsoleAuth>,
+    Extension(throttle): Extension<SharedConsoleThrottle>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     OpenAiJson(req): OpenAiJson<CredentialsRequest>,
 ) -> Response {
+    // Per-IP throttle FIRST (before any argon2 work) — bounds signup-flood
+    // argon2 DoS and shares the login budget. Each attempt counts toward the IP.
+    let source = throttle_key(&peer);
+    let now = now_unix_ms();
+    if let routeplane_limits::auth_failures::AuthThrottle::Throttled { retry_after_secs } =
+        throttle.check(&source, now)
+    {
+        return too_many_attempts(retry_after_secs);
+    }
+    throttle.record_failure(&source, now);
     let email = match normalize_email(&req.email) {
         Ok(e) => e,
         Err(msg) => {
@@ -196,8 +244,19 @@ pub async fn signup(
 /// `POST /v1/console/login` (PUBLIC) — verify, mint a session.
 pub async fn login(
     Extension(bridge): Extension<SharedConsoleAuth>,
+    Extension(throttle): Extension<SharedConsoleThrottle>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     OpenAiJson(req): OpenAiJson<CredentialsRequest>,
 ) -> Response {
+    // Per-IP throttle FIRST — bound online brute force before the (CPU-hard)
+    // argon2 verify runs. Shares the signup budget for this source IP.
+    let source = throttle_key(&peer);
+    let now = now_unix_ms();
+    if let routeplane_limits::auth_failures::AuthThrottle::Throttled { retry_after_secs } =
+        throttle.check(&source, now)
+    {
+        return too_many_attempts(retry_after_secs);
+    }
     // A malformed email cannot match an account; it still walks the full
     // dummy-verify + delay path below so the response is indistinguishable.
     let email = normalize_email(&req.email).unwrap_or_default();
@@ -227,6 +286,10 @@ pub async fn login(
         // email, no cause, nothing logged above debug (no credential-stuffing
         // amplification via logs).
         _ => {
+            // Record the failure against the source IP so repeated wrong
+            // credentials trip the throttle above; then the fixed delay + one
+            // generic envelope (enumeration-safe).
+            throttle.record_failure(&source, now);
             tokio::time::sleep(LOGIN_FAILURE_DELAY).await;
             tracing::debug!("console login rejected");
             invalid_credentials()
@@ -374,12 +437,52 @@ mod tests {
             .layer(axum::middleware::from_fn(auth_middleware))
             .layer(axum::Extension(auth))
             .layer(axum::Extension(bridge.clone()));
+        // A lenient throttle (very high threshold) so the functional tests below
+        // are unaffected by the credential-route rate limit; a dedicated test
+        // exercises the throttle with a tight config. MockConnectInfo supplies
+        // the ConnectInfo<SocketAddr> the handlers now extract.
+        let throttle: SharedConsoleThrottle = Arc::new(AuthFailureTracker::new(
+            routeplane_limits::auth_failures::AuthFailureConfig {
+                threshold: 100_000,
+                ..Default::default()
+            },
+        ));
         let app = Router::new()
             .route("/v1/console/signup", post(signup))
             .route("/v1/console/login", post(login))
             .layer(axum::Extension(bridge.clone()))
+            .layer(axum::Extension(throttle))
+            .layer(axum::extract::connect_info::MockConnectInfo(
+                "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            ))
             .merge(authed);
         (app, bridge)
+    }
+
+    /// A single-route login app whose throttle trips after `threshold` failures,
+    /// keyed on a fixed mock peer IP — for the throttle test only.
+    fn throttled_login_app(threshold: u64) -> Router {
+        let bridge: SharedConsoleAuth = Arc::new(ConsoleAuthBridge::new(
+            b"unit-test-session-secret-0123456789",
+            "rp_console_test".into(),
+            Arc::new(ConsoleAccountStore::ephemeral()),
+        ));
+        let throttle: SharedConsoleThrottle = Arc::new(AuthFailureTracker::new(
+            routeplane_limits::auth_failures::AuthFailureConfig {
+                threshold,
+                window_ms: 300_000,
+                backoff_base_ms: 2_000,
+                backoff_cap_ms: 900_000,
+                slots: 64,
+            },
+        ));
+        Router::new()
+            .route("/v1/console/login", post(login))
+            .layer(axum::Extension(bridge))
+            .layer(axum::Extension(throttle))
+            .layer(axum::extract::connect_info::MockConnectInfo(
+                "203.0.113.7:0".parse::<SocketAddr>().unwrap(),
+            ))
     }
 
     fn json_post(uri: &str, body: serde_json::Value) -> Request<Body> {
@@ -712,5 +815,40 @@ mod tests {
         );
 
         let _ = bridge; // keep the bridge alive through the test
+    }
+
+    #[tokio::test]
+    async fn login_throttles_after_threshold_failures_from_one_ip() {
+        // threshold=3: the 4th wrong-credential attempt from the same IP must be
+        // refused with 429 + Retry-After, before any account exists (pure
+        // brute-force bound). Proves the throttle actually throttles.
+        let app = throttled_login_app(3);
+        let attempt = || {
+            app.clone().oneshot(json_post(
+                "/v1/console/login",
+                serde_json::json!({ "email": "nobody@example.com", "password": "wrong-password-xyz" }),
+            ))
+        };
+        // First 3 are allowed through (and fail 401 invalid_credentials).
+        for i in 0..3 {
+            let resp = attempt().await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "attempt {i} should be a normal 401, not throttled yet"
+            );
+        }
+        // The 4th is throttled.
+        let resp = attempt().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "over-threshold attempt must be 429"
+        );
+        assert!(
+            resp.headers().get("retry-after").is_some(),
+            "429 must carry a Retry-After"
+        );
+        assert_eq!(body_json(resp).await["error"]["code"], "too_many_attempts");
     }
 }

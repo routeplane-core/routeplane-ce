@@ -254,6 +254,9 @@ async fn built_in_names_and_invalid_configs_are_rejected() {
 
 #[tokio::test]
 async fn chat_routes_by_model_id_with_bearer_key_and_records_usage_then_delete_hot_swaps() {
+    // wiremock runs on loopback — opt into private endpoints for this test
+    // (the SSRF guard blocks loopback by default). Metadata stays blocked.
+    std::env::set_var("RP_CUSTOM_PROVIDER_ALLOW_PRIVATE", "on");
     let server = MockServer::start().await;
     mount_custom_upstream(&server, "custom-llama").await;
 
@@ -296,6 +299,9 @@ async fn chat_routes_by_model_id_with_bearer_key_and_records_usage_then_delete_h
 
 #[tokio::test]
 async fn chat_routes_by_explicit_provider_header() {
+    // wiremock runs on loopback — opt into private endpoints for this test
+    // (the SSRF guard blocks loopback by default). Metadata stays blocked.
+    std::env::set_var("RP_CUSTOM_PROVIDER_ALLOW_PRIVATE", "on");
     let server = MockServer::start().await;
     mount_custom_upstream(&server, "any-model").await;
 
@@ -321,6 +327,9 @@ async fn chat_routes_by_explicit_provider_header() {
 
 #[tokio::test]
 async fn custom_model_mapping_never_shadows_a_builtin_model_id() {
+    // wiremock runs on loopback — opt into private endpoints for this test
+    // (the SSRF guard blocks loopback by default). Metadata stays blocked.
+    std::env::set_var("RP_CUSTOM_PROVIDER_ALLOW_PRIVATE", "on");
     // A wiremock that would answer if (wrongly) called — the assertion below is
     // on the RESPONSE + ring, so a stub-openai answer proves no shadowing.
     let server = MockServer::start().await;

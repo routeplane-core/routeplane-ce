@@ -1262,10 +1262,26 @@ async fn main() {
     // operator bootstraps their own account); invite/approval gating is an
     // Enterprise concern. Bodies are bounded by axum's default 2 MiB limit,
     // and password length is capped before hashing (argon2-DoS guard).
+    // Always-on per-source-IP throttle for the PUBLIC credential routes (the
+    // only unauthenticated password endpoints). Dedicated instance, tuned looser
+    // than the keyed default so a fumbling operator isn't locked out, but tight
+    // enough to bound online brute force: 8 attempts / 5 min per IP, then
+    // exponential backoff capped at 15 min. Lock-free (atomic slots).
+    let console_throttle: crate::console_api::SharedConsoleThrottle =
+        std::sync::Arc::new(routeplane_limits::auth_failures::AuthFailureTracker::new(
+            routeplane_limits::auth_failures::AuthFailureConfig {
+                threshold: 8,
+                window_ms: 300_000,
+                backoff_base_ms: 2_000,
+                backoff_cap_ms: 900_000,
+                slots: 4_096,
+            },
+        ));
     let console_public = Router::new()
         .route("/v1/console/signup", post(crate::console_api::signup))
         .route("/v1/console/login", post(crate::console_api::login))
-        .layer(axum::Extension(console_bridge.clone()));
+        .layer(axum::Extension(console_bridge.clone()))
+        .layer(axum::Extension(console_throttle));
 
     // Build our application. Security/hygiene response headers wrap the whole
     // app (public + authed + status) — 2026-06-12 dogfood found none were set.
@@ -1328,7 +1344,15 @@ async fn main() {
 
     tracing::info!("listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    // `into_make_service_with_connect_info` surfaces the TCP peer address to
+    // handlers via `ConnectInfo<SocketAddr>` — the non-spoofable key the console
+    // credential-route throttle uses.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
 
 /// Build the opt-in distributed (Redis) rate limiter (ADR-056 Mode D). Returns
@@ -1545,6 +1569,35 @@ where
         .layer(SetResponseHeaderLayer::if_not_present(
             HeaderName::from_static("referrer-policy"),
             HeaderValue::from_static("no-referrer"),
+        ))
+        // Content-Security-Policy (R-CE-XSS MITIGATION): the Console stores its
+        // session token in localStorage and `/v1/console/api-key` reveals the
+        // gateway rp_ key to a session — so a script injection in the SPA is a
+        // key-theft path. This CSP shrinks the injection surface: no external or
+        // inline scripts (`script-src 'self'` — a Vite production build ships its
+        // JS as same-origin module chunks, no inline `<script>`), no plugins,
+        // no framing, and network egress limited to same-origin (the bundled
+        // single image serves the API + SPA from one origin). It is a MITIGATION,
+        // not elimination — an injected same-origin script could still read the
+        // token; the durable fix is an httpOnly session cookie (tracked
+        // follow-up). `style-src` keeps `'unsafe-inline'` because React inline
+        // `style={{…}}` attributes and Tailwind's runtime styles need it; tighten
+        // to a nonce later. VERIFY against the built SPA (browser console: zero
+        // CSP violations) before relaxing or shipping a cross-origin API base.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("content-security-policy"),
+            HeaderValue::from_static(
+                "default-src 'self'; \
+                 script-src 'self'; \
+                 style-src 'self' 'unsafe-inline'; \
+                 img-src 'self' data:; \
+                 font-src 'self' data:; \
+                 connect-src 'self'; \
+                 object-src 'none'; \
+                 base-uri 'none'; \
+                 frame-ancestors 'none'; \
+                 form-action 'self'",
+            ),
         ))
 }
 
