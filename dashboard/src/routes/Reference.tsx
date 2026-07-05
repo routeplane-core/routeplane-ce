@@ -108,6 +108,14 @@ export function Reference() {
         description="The endpoints served by the Community Edition gateway. All authenticated calls send your rp_ key in the x-routeplane-api-key header."
       />
 
+      <p className="mb-4 rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+        Parameters are forwarded to the upstream provider <span className="font-medium text-foreground">verbatim</span> (a
+        faithful passthrough) — the gateway does not rewrite them. Send what the target model expects; e.g. newer
+        OpenAI-family models require <span className="font-mono">max_completion_tokens</span> rather than{" "}
+        <span className="font-mono">max_tokens</span>. Enterprise-only endpoints return a{" "}
+        <span className="font-mono">402 enterprise_only</span> error in the Community Edition.
+      </p>
+
       <div className="space-y-4">
         {ENDPOINTS.map((e) => (
           <Card key={`${e.method} ${e.path}`}>

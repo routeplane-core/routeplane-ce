@@ -6,6 +6,7 @@ import type { UsageEvent } from "@/lib/api/types";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { PageHeader } from "@/components/layout/PageHeader";
 import { StatCard } from "@/components/ui/stat-card";
+import { EnterpriseHint } from "@/components/EnterpriseHint";
 import { EmptyState, ErrorState, SkeletonRows } from "@/components/ui/states";
 import { AreaChart, BarChart, DonutChart, Legend, SERIES } from "@/components/charts";
 import { formatCompact, formatMicroUsd, formatNumber, formatPercent } from "@/lib/utils";
@@ -91,6 +92,17 @@ export function Usage() {
         <StatCard icon={Cpu} label="Tokens" value={isLoading ? "…" : formatCompact(totals.tokens)} loading={isLoading} sub="prompt + completion" />
         <StatCard icon={Coins} label="Cost" value={isLoading ? "…" : formatMicroUsd(totals.cost)} loading={isLoading} sub="canonical USD" />
         <StatCard icon={Layers} label="Models used" value={isLoading ? "…" : formatNumber(byModel.length)} loading={isLoading} sub={`${byProvider.length} provider${byProvider.length === 1 ? "" : "s"}`} />
+      </div>
+
+      <div className="mt-4 space-y-3">
+        <EnterpriseHint title="Advanced cost optimization — cut token cost up to 37%">
+          Enterprise layers semantic caching and smart cost/latency routing on top of CE's token compression to reduce
+          token spend by up to 37% on typical workloads — with per-business-process cost attribution and multi-currency FinOps.
+        </EnterpriseHint>
+        <EnterpriseHint title="Consumption & prompt analysis">
+          Per-prompt token/cost breakdowns and consumption trends, with each request attributed as company (business
+          process) vs. personal use. The Community Edition shows aggregate usage only.
+        </EnterpriseHint>
       </div>
 
       {isError ? (

@@ -60,6 +60,12 @@ export function Playground() {
         description="Send an OpenAI-compatible chat request through the live CE gateway and watch it stream back."
       />
 
+      <p className="mb-4 rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+        The gateway passes parameters through to the provider <span className="font-medium text-foreground">verbatim</span> —
+        it doesn't rewrite them. If you build requests by hand, send what the upstream expects: newer OpenAI-family models
+        require <span className="font-mono">max_completion_tokens</span> instead of <span className="font-mono">max_tokens</span>.
+      </p>
+
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <Card>
           <CardHeader title="Request" />

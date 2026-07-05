@@ -1,16 +1,22 @@
-// CE Console auth.
+// CE Console auth — email + password accounts with server-issued sessions.
 //
-// The Community Edition gateway is single-tenant and key-authenticated: there is
-// no control plane, no login server, no SSO. The Console therefore gates behind a
-// single screen where the operator pastes their `rp_` gateway key (from
-// configs/keys.json). The key is validated against the live gateway, stored in
-// localStorage, and sent as `x-routeplane-api-key` on every request. The only
-// thing in storage is the operator's OWN key — never any other secret.
+// The Community Edition gateway holds the console accounts (argon2id) and issues
+// a signed session (JWT) on signup/login. The browser stores ONLY that session
+// token and sends it as `Authorization: Bearer <token>`; it never sees or holds
+// the gateway's rp_ key (the gateway maps a valid session to its configured key
+// server-side). 2FA and SSO are Enterprise and are not part of CE.
 
 import { useSyncExternalStore } from "react";
 import { apiUrl } from "@/lib/api/config";
 
-const KEY_STORAGE = "rp_ce_key";
+const TOKEN_STORAGE = "rp_ce_session";
+
+interface SessionResponse {
+  email: string;
+  token: string;
+  token_type: string;
+  expires_in: number;
+}
 
 const listeners = new Set<() => void>();
 function emit() {
@@ -21,55 +27,95 @@ function subscribe(cb: () => void) {
   return () => listeners.delete(cb);
 }
 
-/** The stored rp_ key sent on every gateway request (or null when signed out). */
-export function getStoredKey(): string | null {
+/** The session JWT sent as `Authorization: Bearer` on every gateway call. */
+export function getStoredToken(): string | null {
   try {
-    return localStorage.getItem(KEY_STORAGE);
+    return localStorage.getItem(TOKEN_STORAGE);
   } catch {
     return null;
   }
 }
 
-function readAuthed(): boolean {
-  return Boolean(getStoredKey());
-}
-
-/** Persist the validated key. */
-export function signIn(key: string) {
+function store(token: string) {
   try {
-    localStorage.setItem(KEY_STORAGE, key.trim());
+    localStorage.setItem(TOKEN_STORAGE, token);
   } catch {
     /* storage unavailable — in-memory listeners still fire */
   }
   emit();
 }
 
-/** Clear the credential (Sign out). */
-export function signOut() {
+/** Clear the session locally (no network). Used on 401 and by signOut. */
+export function clearSession() {
   try {
-    localStorage.removeItem(KEY_STORAGE);
+    localStorage.removeItem(TOKEN_STORAGE);
   } catch {
     /* ignore */
   }
   emit();
 }
 
-/** Reactive logged-in flag — true iff an rp_ key is stored. */
+function readAuthed(): boolean {
+  return Boolean(getStoredToken());
+}
+
+/** Reactive logged-in flag — true iff a session token is stored. */
 export function useAuthed(): boolean {
   return useSyncExternalStore(subscribe, readAuthed, () => false);
 }
 
-/**
- * Validate a key against the live CE gateway. `GET /v1/models` returns 200 for a
- * valid key and 401 for an invalid one. Returns true on success; throws on a
- * network/other error so the caller can distinguish "can't reach gateway" from
- * "invalid key".
- */
-export async function validateKey(key: string): Promise<boolean> {
-  const res = await fetch(apiUrl("/v1/models"), {
-    headers: { "x-routeplane-api-key": key.trim() },
+async function post(path: string, body: unknown): Promise<SessionResponse> {
+  const res = await fetch(apiUrl(path), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   });
-  if (res.status === 401 || res.status === 403) return false;
-  if (!res.ok) throw new Error(`gateway ${res.status}`);
-  return true;
+  const text = await res.text();
+  if (!res.ok) {
+    let msg = `Request failed (${res.status})`;
+    try {
+      msg = JSON.parse(text)?.error?.message ?? msg;
+    } catch {
+      /* keep status message */
+    }
+    throw new Error(msg);
+  }
+  return JSON.parse(text) as SessionResponse;
+}
+
+/** Create an account (email + password ≥ 10 chars). Auto-logs in on success. */
+export async function signup(email: string, password: string): Promise<void> {
+  const s = await post("/v1/console/signup", { email: email.trim().toLowerCase(), password });
+  store(s.token);
+}
+
+/** Log in with email + password. */
+export async function login(email: string, password: string): Promise<void> {
+  const s = await post("/v1/console/login", { email: email.trim().toLowerCase(), password });
+  store(s.token);
+}
+
+/** Sign out: best-effort server revocation, then clear locally. */
+export async function signOut(): Promise<void> {
+  const token = getStoredToken();
+  if (token) {
+    try {
+      await fetch(apiUrl("/v1/console/logout"), {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    } catch {
+      /* revoke best-effort — clear locally regardless */
+    }
+  }
+  clearSession();
+}
+
+/** The signed-in account (or null). */
+export async function fetchMe(): Promise<{ email: string; created_at: string } | null> {
+  const token = getStoredToken();
+  if (!token) return null;
+  const res = await fetch(apiUrl("/v1/console/me"), { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) return null;
+  return res.json();
 }

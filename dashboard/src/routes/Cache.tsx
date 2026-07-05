@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Database, DatabaseZap, HardDrive, Trash2, TrendingUp, XCircle } from "lucide-react";
+import { DatabaseZap, HardDrive, Trash2, TrendingUp, XCircle } from "lucide-react";
 import { api } from "@/lib/api/client";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { EnterpriseHint } from "@/components/EnterpriseHint";
 import { PageHeader } from "@/components/layout/PageHeader";
 import { StatCard } from "@/components/ui/stat-card";
 import { SkeletonRows, ErrorState } from "@/components/ui/states";
@@ -98,15 +99,15 @@ export function Cache() {
                 requests with identical parameters return a stored response without hitting the provider. Hits, misses,
                 and evictions are counted in the numbers above.
               </p>
-              <p className="flex items-start gap-2 rounded-md border bg-muted/30 px-3 py-2.5 text-xs">
-                <Database size={14} className="mt-0.5 shrink-0" />
-                <span>
-                  Semantic caching (embedding-based similarity matching that also serves near-duplicate prompts) is a
-                  Routeplane Enterprise feature and is not part of the Community Edition.
-                </span>
-              </p>
             </CardBody>
           </Card>
+
+          <div className="mt-4">
+            <EnterpriseHint title="Smart (semantic) caching">
+              Embedding-based similarity matching serves near-duplicate prompts from cache — not just byte-identical
+              requests — cutting provider spend further. Available on Routeplane Enterprise.
+            </EnterpriseHint>
+          </div>
         </>
       ) : null}
 

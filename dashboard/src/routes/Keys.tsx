@@ -1,13 +1,13 @@
-import { KeyRound } from "lucide-react";
+import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { Eye, EyeOff, KeyRound } from "lucide-react";
+import { api } from "@/lib/api/client";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
 import { PageHeader } from "@/components/layout/PageHeader";
-import { KeyValueList, CodeBlock } from "@/components/ui/misc";
-import { getStoredKey } from "@/lib/auth";
-
-function maskKey(k: string | null): string {
-  if (!k) return "—";
-  return k.length <= 10 ? k : `${k.slice(0, 7)}…${k.slice(-4)}`;
-}
+import { EnterpriseHint } from "@/components/EnterpriseHint";
+import { CopyButton, CodeBlock } from "@/components/ui/misc";
+import { SkeletonRows, ErrorState } from "@/components/ui/states";
 
 const KEYS_JSON_EXAMPLE = `{
   "keys": [
@@ -21,59 +21,70 @@ const KEYS_JSON_EXAMPLE = `{
 }`;
 
 export function Keys() {
-  const key = getStoredKey();
+  const [reveal, setReveal] = useState(false);
+  const apiKey = useQuery({ queryKey: ["console-api-key"], queryFn: api.getConsoleApiKey });
+
+  const key = apiKey.data?.key ?? "";
+  const masked = key ? `${key.slice(0, 6)}${"•".repeat(Math.max(key.length - 10, 4))}${key.slice(-4)}` : "";
 
   return (
     <>
       <PageHeader
         title="API Keys"
-        description="How the Community Edition authenticates callers. Keys are file-configured — there is no runtime key-management API in CE."
+        description="Your Routeplane gateway key — use it as x-routeplane-api-key when calling the gateway from your app or SDK."
       />
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <Card>
-          <CardHeader title="Connected key" description="The rp_ key this Console is using, sent as x-routeplane-api-key." />
-          <CardBody>
-            <KeyValueList
-              items={[
-                {
-                  label: "Key",
-                  value: (
-                    <span className="inline-flex items-center gap-2 font-mono text-xs">
-                      <KeyRound size={13} className="text-muted-foreground" />
-                      {maskKey(key)}
-                    </span>
-                  ),
-                },
-                { label: "Header", value: <span className="font-mono text-xs">x-routeplane-api-key</span> },
-                { label: "Prefix", value: <span className="font-mono text-xs">rp_</span> },
-              ]}
-            />
-            <p className="mt-3 text-xs text-muted-foreground">
-              Only your own key is ever stored (in this browser) — never any other secret. Sign out from Settings to
-              clear it.
-            </p>
+          <CardHeader title="Your gateway key" description="The rp_ key this gateway authenticates callers with." />
+          <CardBody className="space-y-3">
+            {apiKey.isLoading ? (
+              <SkeletonRows rows={2} />
+            ) : apiKey.isError ? (
+              <ErrorState message="Couldn't load your gateway key." onRetry={() => apiKey.refetch()} />
+            ) : (
+              <>
+                {apiKey.data?.name && (
+                  <div className="text-xs text-muted-foreground">
+                    Name: <span className="font-medium text-foreground">{apiKey.data.name}</span>
+                  </div>
+                )}
+                <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-2">
+                  <KeyRound size={14} className="shrink-0 text-muted-foreground" />
+                  <span className="min-w-0 flex-1 truncate font-mono text-sm">{reveal ? key : masked}</span>
+                  <Button variant="ghost" size="sm" onClick={() => setReveal((r) => !r)} aria-label={reveal ? "Hide key" : "Reveal key"}>
+                    {reveal ? <EyeOff size={14} /> : <Eye size={14} />}
+                  </Button>
+                  <CopyButton value={key} label="Copy" />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Send it as <span className="font-mono">x-routeplane-api-key</span> (or{" "}
+                  <span className="font-mono">Authorization: Bearer</span>) on requests to this gateway. Treat it like a
+                  password — anyone with it can spend against your providers.
+                </p>
+              </>
+            )}
           </CardBody>
         </Card>
 
         <Card>
-          <CardHeader title="Where keys live" description="configs/keys.json, loaded by the gateway at boot." />
+          <CardHeader title="Keys for API callers" description="configs/keys.json, loaded by the gateway at boot." />
           <CardBody className="space-y-3">
             <p className="text-sm text-muted-foreground">
               Community Edition keys are declared in <span className="font-mono text-xs">configs/keys.json</span> next to
-              the gateway. Each key carries a name and optional basic rate / spend limits. Editing the file and
-              restarting the gateway applies the change.
+              the gateway, each with a name and optional basic rate / spend limits.
             </p>
             <CodeBlock lang="json" code={KEYS_JSON_EXAMPLE} />
           </CardBody>
         </Card>
       </div>
 
-      <p className="mt-3 text-xs text-muted-foreground">
-        Runtime key issuance, rotation, and revocation — plus scoped virtual keys and per-key governance — are
-        Routeplane Enterprise features managed through the control plane. The Community Edition uses file-configured
-        keys only.
-      </p>
+      <div className="mt-4">
+        <EnterpriseHint title="Multiple API keys with per-key usage tracking">
+          Issue and rotate multiple scoped virtual keys — one per app, team, or environment — each with its own usage,
+          spend, and rate limits tracked independently. The Community Edition uses a single file-configured key.
+        </EnterpriseHint>
+      </div>
     </>
   );
 }

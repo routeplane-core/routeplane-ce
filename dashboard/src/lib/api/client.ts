@@ -1,7 +1,7 @@
 // CE data-plane client. Talks ONLY to the Community-Edition gateway surfaces,
 // authenticated with the operator's stored rp_ key. No control-plane endpoints.
 import { apiUrl } from "@/lib/api/config";
-import { getStoredKey } from "@/lib/auth";
+import { getStoredToken, clearSession } from "@/lib/auth";
 import type {
   CreateProviderInput,
   CustomProvider,
@@ -13,13 +13,22 @@ import type {
 } from "@/lib/api/types";
 
 function headers(extra?: Record<string, string>): HeadersInit {
-  const key = getStoredKey();
-  return { ...(key ? { "x-routeplane-api-key": key } : {}), ...extra };
+  const token = getStoredToken();
+  return { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...extra };
+}
+
+/** A 401 on an authed call means the session expired or was revoked — clear it
+ *  so the app falls back to the login screen. */
+function on401(status: number) {
+  if (status === 401) clearSession();
 }
 
 async function getJSON<T>(path: string): Promise<T> {
   const res = await fetch(apiUrl(path), { headers: headers() });
-  if (!res.ok) throw new Error(`${path} → ${res.status}`);
+  if (!res.ok) {
+    on401(res.status);
+    throw new Error(`${path} → ${res.status}`);
+  }
   return res.json() as Promise<T>;
 }
 
@@ -35,6 +44,7 @@ async function sendJSON<T>(method: string, path: string, body?: unknown): Promis
   });
   const text = await res.text();
   if (!res.ok) {
+    on401(res.status);
     let msg = `${path} → ${res.status}`;
     try {
       const j = JSON.parse(text);
@@ -84,6 +94,10 @@ export const api = {
 
   deleteProvider: (name: string): Promise<void> =>
     sendJSON<void>("DELETE", `/v1/providers/${encodeURIComponent(name)}`),
+
+  /** The operator's own gateway rp_ key (session-authed reveal, for copy). */
+  getConsoleApiKey: (): Promise<{ name: string; key: string }> =>
+    getJSON<{ name: string; key: string }>("/v1/console/api-key"),
 };
 
 /**
@@ -103,6 +117,7 @@ export async function streamChat(
     signal,
   });
   if (!res.ok || !res.body) {
+    on401(res.status);
     const detail = await res.text().catch(() => "");
     throw new Error(detail || `gateway ${res.status}`);
   }

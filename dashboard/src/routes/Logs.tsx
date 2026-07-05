@@ -6,6 +6,7 @@ import type { LogRow } from "@/lib/api/types";
 import { Card, CardBody } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { PageHeader } from "@/components/layout/PageHeader";
+import { EnterpriseHint } from "@/components/EnterpriseHint";
 import { DataTable, type Column } from "@/components/ui/table";
 import { SegmentedControl, Pagination, KeyValueList } from "@/components/ui/misc";
 import { Input } from "@/components/ui/input";
@@ -81,6 +82,13 @@ export function Logs() {
         title="Logs & Traces"
         description="Recent requests from the gateway's in-memory log ring. Filter by outcome or search across key, provider, and model."
       />
+
+      <div className="mb-4">
+        <EnterpriseHint title="Per-user usage logs & attribution">
+          Durable, per-user request logs — who ran each call, attributed as company (business process) vs. personal —
+          with long-term retention and export. The Community Edition keeps an in-memory ring of recent requests only.
+        </EnterpriseHint>
+      </div>
 
       <div className="mb-4 flex flex-wrap items-center gap-3">
         <SegmentedControl

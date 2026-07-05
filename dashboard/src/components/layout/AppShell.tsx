@@ -1,12 +1,12 @@
 import { useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { Command, Lock, LogOut, Moon, PanelLeftClose, PanelLeft, Sun } from "lucide-react";
+import { Command, Lock, LogOut, Moon, PanelLeftClose, PanelLeft, Sun, User } from "lucide-react";
 import { NAV } from "@/lib/nav";
 import { api } from "@/lib/api/client";
 import { cn } from "@/lib/utils";
 import { useTheme } from "@/lib/theme";
-import { getStoredKey, signOut } from "@/lib/auth";
+import { fetchMe, signOut } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Tooltip } from "@/components/ui/tooltip";
 import {
@@ -20,17 +20,13 @@ import {
 import { CommandPalette } from "@/components/ui/command-palette";
 import { BrandLockup, LogoMark } from "@/components/ui/logo";
 
-function maskKey(k: string | null): string {
-  if (!k) return "—";
-  return k.length <= 10 ? k : `${k.slice(0, 7)}…${k.slice(-4)}`;
-}
-
 export function AppShell() {
   const { theme, toggle } = useTheme();
   const [collapsed, setCollapsed] = useState(false);
   // A cheap liveness probe that doubles as the header connection indicator.
   const status = useQuery({ queryKey: ["status"], queryFn: api.getStatus, retry: 0 });
   const connected = status.isSuccess;
+  const me = useQuery({ queryKey: ["console-me"], queryFn: fetchMe, staleTime: 300_000 });
 
   return (
     <div className={cn("grid min-h-screen", collapsed ? "grid-cols-[64px_1fr]" : "grid-cols-[248px_1fr]")}>
@@ -113,13 +109,13 @@ export function AppShell() {
               </button>
             </Tooltip>
             <DropdownMenu>
-              <DropdownMenuTrigger className="rounded-md border px-2 py-1.5 font-mono text-2xs hover:bg-muted">
-                {maskKey(getStoredKey())}
+              <DropdownMenuTrigger className="grid h-8 w-8 place-items-center rounded-full bg-primary/10 text-primary hover:bg-primary/20">
+                <User size={15} />
               </DropdownMenuTrigger>
               <DropdownMenuContent>
-                <DropdownMenuLabel>Gateway key</DropdownMenuLabel>
+                <DropdownMenuLabel>{me.data?.email ?? "Signed in"}</DropdownMenuLabel>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem danger onSelect={() => { signOut(); window.location.reload(); }}>
+                <DropdownMenuItem danger onSelect={() => { void signOut().then(() => window.location.reload()); }}>
                   <LogOut size={14} /> Sign out
                 </DropdownMenuItem>
               </DropdownMenuContent>
