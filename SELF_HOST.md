@@ -56,6 +56,23 @@ client.chat.completions.create(model="gpt-4o", messages=[{"role":"user","content
 - Address a combo (an ordered fallback chain) by putting its name in `model`.
 - `GET /healthz` is an unauthenticated liveness probe.
 
+## The Console (dashboard)
+
+The image bundles a **web console** — a static SPA the gateway serves from the
+same origin. Open **http://localhost:8080/** in a browser, paste an `rp_` key
+from `configs/keys.json`, and you get live usage & analytics, request logs,
+provider health, exact-cache stats, the model catalog, and a streaming
+playground — all read from this gateway, no external service.
+
+It is served only when `RP_CONSOLE_DIR` points at the built assets; the published
+image sets this for you. To run the gateway headless (API only), unset it:
+`docker run -e RP_CONSOLE_DIR= ...` — then `/` is the plain gateway banner again.
+
+Enterprise-only features (sovereign residency, the audit ledger, the MCP agentic
+gateway, semantic cache, multi-tenant control plane, and more) appear in the
+console as clearly-marked **Enterprise** entries that link to
+[routeplane.ai](https://routeplane.ai) — they carry no code or data in CE.
+
 ## What's in CE
 
 OpenAI-compatible API + streaming · 15 providers (incl. Ollama/vLLM via the

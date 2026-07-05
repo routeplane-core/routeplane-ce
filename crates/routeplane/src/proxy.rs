@@ -283,6 +283,17 @@ pub struct AppState {
     /// `(tenant, model)` pair rejects (403 `model_disabled_for_tenant`); an empty
     /// overlay enforces nothing ⇒ byte-identical to the boot-config gateway.
     pub config_overlay: crate::config_overlay::SharedConfigOverlay,
+    /// Runtime custom-provider registry (CE operator surface): operator-defined
+    /// OpenAI-compatible endpoints added over `/v1/providers` with NO restart.
+    /// Hot-swappable via `ArcSwap` (lock-free read — the same posture as the
+    /// FX / policy / auth registries) and persisted to `configs/providers.json`
+    /// (0600; it holds upstream keys like `keys.json`). **Empty by default:**
+    /// with no provider registered every hot-path probe is a single
+    /// `ArcSwap::load` + `HashMap` miss ⇒ byte-identical to today. A custom
+    /// provider can never shadow a built-in name (rejected at registration and
+    /// resolved built-in-first below), and is never residency-eligible (no
+    /// region claim), so sovereign routing is unaffected.
+    pub custom_providers: Arc<crate::custom_providers::CustomProviderStore>,
 }
 
 /// The MCP agentic-security deepening engines ([ADR-055]), grouped so they ride
@@ -579,7 +590,22 @@ impl AppState {
             #[cfg(feature = "enterprise")]
             mcp_agentic: Arc::new(McpAgenticState::new(None)),
             config_overlay: crate::config_overlay::new_shared_empty(),
+            custom_providers: Arc::new(crate::custom_providers::CustomProviderStore::ephemeral()),
         }
+    }
+
+    /// Resolve a provider adapter by name: the built-in registry FIRST (a
+    /// custom provider can never shadow a built-in name — rejected at
+    /// registration and enforced again by this ordering), then the runtime
+    /// custom registry (one lock-free `ArcSwap::load` + `HashMap` probe; an
+    /// empty registry is an instant miss ⇒ byte-identical). Returns an OWNED
+    /// `Arc` clone — one refcount bump per attempt, the cost of supporting
+    /// dynamically-registered adapters whose lifetime is not `&self`'s.
+    pub(crate) fn resolve_provider(&self, name: &str) -> Option<Arc<dyn Provider>> {
+        if let Some(p) = self.providers.get(name) {
+            return Some(p.clone());
+        }
+        self.custom_providers.adapter(name)
     }
 
     /// Record a usage event to the in-memory observability ring AND fan it to the
@@ -1159,13 +1185,19 @@ async fn embed_for_semantic_cache(
 ) -> Option<Vec<f32>> {
     use routeplane_types::{EmbeddingInput, EmbeddingRequest};
     for provider_name in chain {
-        let Some(provider) = state.providers.get(provider_name.as_str()) else {
+        // Built-in registry first, then the runtime custom registry (a custom
+        // OpenAI-compatible endpoint may serve /v1/embeddings too).
+        let Some(provider) = state.resolve_provider(provider_name.as_str()) else {
             continue;
         };
         if !state.health.is_available(provider_name) {
             continue;
         }
-        let Some(api_key) = resolve_api_key(virtual_key, provider_name) else {
+        // Key precedence: the virtual key's `provider_keys` entry (if one is
+        // authored for this name), else the custom provider's registered key.
+        let Some(api_key) = resolve_api_key(virtual_key, provider_name)
+            .or_else(|| state.custom_providers.api_key(provider_name))
+        else {
             continue;
         };
         let req = EmbeddingRequest {
@@ -2706,14 +2738,32 @@ async fn chat_completions_pipeline(
                 RoutingStrategy::parse(plan.strategy.as_router_str()),
             )
         } else {
-            let requested = headers
+            let header_provider = headers
                 .get("x-routeplane-provider")
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or("openai");
-            let targets = requested
-                .split(',')
-                .map(|s| default_target_plan(s.trim()))
-                .collect();
+                .and_then(|h| h.to_str().ok());
+            let targets: Vec<TargetPlan> = match header_provider {
+                // Explicit addressing (comma chain) — unchanged, and it may
+                // name a runtime custom provider directly.
+                Some(requested) => requested
+                    .split(',')
+                    .map(|s| default_target_plan(s.trim()))
+                    .collect(),
+                // No header: runtime custom-provider MODEL routing. A model id
+                // registered on a custom provider routes there — but ONLY when
+                // the id is NOT a built-in catalog model (documented
+                // precedence: a custom provider never shadows a built-in model
+                // id; reach it explicitly via `x-routeplane-provider`). The
+                // probe is one lock-free `ArcSwap::load` + `HashMap` miss when
+                // the registry is empty ⇒ byte-identical legacy default.
+                None => match state
+                    .custom_providers
+                    .provider_for_model(&payload.model)
+                    .filter(|_| !crate::models_api::is_builtin_model(&payload.model))
+                {
+                    Some(custom) => vec![default_target_plan(&custom)],
+                    None => vec![default_target_plan("openai")],
+                },
+            };
             let strat = headers
                 .get("x-routeplane-strategy")
                 .and_then(|h| h.to_str().ok())
@@ -3551,7 +3601,11 @@ async fn chat_completions_pipeline(
         .iter()
         .enumerate()
         .filter_map(|(idx, target)| {
-            if !registry.contains_key(target.provider.as_str()) {
+            // Built-in registry OR the runtime custom registry (lock-free probe,
+            // only reached when the built-in map misses).
+            if !registry.contains_key(target.provider.as_str())
+                && !state.custom_providers.contains(target.provider.as_str())
+            {
                 last_error = format!("Unsupported provider: {}", target.provider);
                 return None;
             }
@@ -3578,7 +3632,12 @@ async fn chat_completions_pipeline(
                         .map(|(pool_idx, key)| (Some(pool_idx), key))
                         .collect()
                     }
+                    // Single-key resolve; for a runtime CUSTOM provider the key
+                    // falls back to its registered upstream key (an authored
+                    // `provider_keys` entry for the same name wins — the
+                    // documented per-key override).
                     _ => resolve_api_key(&virtual_key, &target.provider)
+                        .or_else(|| state.custom_providers.api_key(&target.provider))
                         .map(|key| vec![(None, key)])
                         .unwrap_or_default(),
                 };
@@ -3691,11 +3750,12 @@ async fn chat_completions_pipeline(
         let mut response = *response;
         let target = &ordered_targets[winner_idx];
         let provider_name = &target.provider;
-        // The winner came from `ready`, so the provider is present in the registry.
-        let provider: &dyn Provider = registry
-            .get(provider_name.as_str())
-            .expect("winning target's provider is registered")
-            .as_ref();
+        // The winner came from `ready`, so the provider resolved at dispatch —
+        // but re-resolve defensively (a concurrent custom-provider DELETE could
+        // have swapped the registry mid-flight) instead of `expect()`ing: the
+        // adapter here is only consulted for its residency claim, so a miss
+        // degrades to "no region", never a panic on the request thread.
+        let provider: Option<Arc<dyn Provider>> = state.resolve_provider(provider_name.as_str());
         {
             {
                 for choice in response.choices.iter_mut() {
@@ -4030,7 +4090,9 @@ async fn chat_completions_pipeline(
                     }
                 }
 
-                let route_region = provider.resident_regions().into_iter().next();
+                let route_region = provider
+                    .as_ref()
+                    .and_then(|p| p.resident_regions().into_iter().next());
                 ledger_sink::record_decision(&state.ledger, &tenant_ctx.capabilities, || {
                     ledger_sink::decision_draft(
                         &tenant_ctx.tenant_id,
@@ -4377,8 +4439,11 @@ async fn attempt_target(
     key_index: Option<usize>,
 ) -> TargetOutcome {
     let provider_name = &target.provider;
-    let provider: &dyn Provider = match state.providers.get(provider_name.as_str()) {
-        Some(p) => p.as_ref(),
+    // Built-in first, then the runtime custom registry (lock-free). Owned Arc
+    // (one refcount bump per attempt) so a concurrently-deleted custom adapter
+    // stays alive for the duration of this in-flight attempt.
+    let provider: Arc<dyn Provider> = match state.resolve_provider(provider_name.as_str()) {
+        Some(p) => p,
         None => {
             return TargetOutcome::Exhausted {
                 last_error: format!("Unsupported provider: {provider_name}"),
@@ -4987,8 +5052,11 @@ async fn stream_chat_completions(
     let now_ms = unix_millis();
     for (target_idx, target) in targets.iter().enumerate() {
         let provider_name = &target.provider;
-        let provider = match state.providers.get(provider_name.as_str()) {
-            Some(p) => p.as_ref(),
+        // Built-in first, then the runtime custom registry (lock-free). Owned
+        // Arc so a concurrently-deleted custom adapter stays alive while this
+        // stream is being established.
+        let provider: Arc<dyn Provider> = match state.resolve_provider(provider_name.as_str()) {
+            Some(p) => p,
             None => {
                 last_error = format!("Unsupported provider: {provider_name}");
                 continue;
@@ -5025,7 +5093,11 @@ async fn stream_chat_completions(
                 .map(|(pool_idx, key)| (Some(pool_idx), key))
                 .collect()
             }
+            // Single-key resolve; a runtime CUSTOM provider falls back to its
+            // registered upstream key (an authored `provider_keys` entry for
+            // the same name wins), identical to the buffered path.
             _ => resolve_api_key(&virtual_key, provider_name)
+                .or_else(|| state.custom_providers.api_key(provider_name))
                 .map(|key| vec![(None, key)])
                 .unwrap_or_default(),
         };
@@ -6747,6 +6819,7 @@ mod tests {
             #[cfg(feature = "enterprise")]
             mcp_agentic: Arc::new(McpAgenticState::new(None)),
             config_overlay: crate::config_overlay::new_shared_empty(),
+            custom_providers: Arc::new(crate::custom_providers::CustomProviderStore::ephemeral()),
         });
 
         let vk = VirtualKey {
@@ -6936,6 +7009,7 @@ mod tests {
             #[cfg(feature = "enterprise")]
             mcp_agentic: Arc::new(McpAgenticState::new(None)),
             config_overlay: crate::config_overlay::new_shared_empty(),
+            custom_providers: Arc::new(crate::custom_providers::CustomProviderStore::ephemeral()),
         });
         HedgeProbe {
             slow_started,
@@ -7193,6 +7267,7 @@ mod tests {
             #[cfg(feature = "enterprise")]
             mcp_agentic: Arc::new(McpAgenticState::new(None)),
             config_overlay: crate::config_overlay::new_shared_empty(),
+            custom_providers: Arc::new(crate::custom_providers::CustomProviderStore::ephemeral()),
         });
         let vk = VirtualKey {
             name: "k".into(),
@@ -7319,6 +7394,7 @@ mod tests {
             #[cfg(feature = "enterprise")]
             mcp_agentic: Arc::new(McpAgenticState::new(None)),
             config_overlay: crate::config_overlay::new_shared_empty(),
+            custom_providers: Arc::new(crate::custom_providers::CustomProviderStore::ephemeral()),
         })
     }
 
@@ -7566,6 +7642,7 @@ mod tests {
             #[cfg(feature = "enterprise")]
             mcp_agentic: Arc::new(McpAgenticState::new(None)),
             config_overlay: crate::config_overlay::new_shared_empty(),
+            custom_providers: Arc::new(crate::custom_providers::CustomProviderStore::ephemeral()),
         };
         assert!(!state.export.is_enabled());
         state.emit_usage(UsageEvent::success(
@@ -7647,6 +7724,7 @@ mod tests {
             #[cfg(feature = "enterprise")]
             mcp_agentic: Arc::new(McpAgenticState::new(None)),
             config_overlay: crate::config_overlay::new_shared_empty(),
+            custom_providers: Arc::new(crate::custom_providers::CustomProviderStore::ephemeral()),
         })
     }
 
@@ -8287,6 +8365,7 @@ mod tests {
             #[cfg(feature = "enterprise")]
             mcp_agentic: Arc::new(McpAgenticState::new(None)),
             config_overlay: crate::config_overlay::new_shared_empty(),
+            custom_providers: Arc::new(crate::custom_providers::CustomProviderStore::ephemeral()),
         })
     }
 
@@ -8545,6 +8624,7 @@ mod tests {
             #[cfg(feature = "enterprise")]
             mcp_agentic: Arc::new(McpAgenticState::new(None)),
             config_overlay: crate::config_overlay::new_shared_empty(),
+            custom_providers: Arc::new(crate::custom_providers::CustomProviderStore::ephemeral()),
         })
     }
 

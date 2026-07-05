@@ -77,6 +77,7 @@ mod cache_api;
 mod ce_stubs;
 mod config;
 mod config_overlay;
+mod custom_providers;
 mod embeddings;
 mod feedback_api;
 mod finops_api;
@@ -90,6 +91,7 @@ mod models_api;
 mod observability;
 mod otel;
 mod prompts_api;
+mod providers_api;
 mod proxy;
 mod rerank_api;
 mod residency_api;
@@ -694,6 +696,32 @@ async fn main() {
     // the limiter fails open to the local engine (see distributed.rs).
     let distributed_limiter = build_distributed_limiter().await;
 
+    // Runtime custom-provider registry (CE operator surface): operator-defined
+    // OpenAI-compatible endpoints, added over the authed /v1/providers API with
+    // NO restart. Hot-swappable via ArcSwap (lock-free reads) + persisted to
+    // configs/providers.json with 0600 perms (it holds upstream keys, exactly
+    // like keys.json — both gitignored + dockerignored). Source precedence:
+    // RP_PROVIDERS_FILE > ./configs/providers.json. ABSENT/empty file ⇒ start
+    // empty (ship-dark, byte-identical); PRESENT-but-invalid ⇒ refuse start
+    // (fail-closed, the keys.json doctrine).
+    let providers_path =
+        std::env::var("RP_PROVIDERS_FILE").unwrap_or_else(|_| "configs/providers.json".to_string());
+    let custom_providers = match crate::custom_providers::CustomProviderStore::load(
+        std::path::PathBuf::from(&providers_path),
+    ) {
+        Ok(store) => {
+            tracing::info!(
+                "custom provider registry: {} provider(s) loaded from {providers_path}",
+                store.len()
+            );
+            Arc::new(store)
+        }
+        Err(e) => {
+            tracing::error!("failed to load custom provider registry from {providers_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let state = Arc::new(AppState {
         providers: build_provider_registry(),
         guardrail_engine: GuardrailEngine::new(),
@@ -761,6 +789,9 @@ async fn main() {
         // ONLY when RP_CP_CONFIG_URL is set — absent ⇒ it stays empty for the
         // process lifetime ⇒ enforcement is a permanent no-op (parity-safe).
         config_overlay: config_overlay.clone(),
+        // Runtime custom-provider registry (CE): loaded above; hot-swapped by
+        // the /v1/providers handlers, read lock-free on the request path.
+        custom_providers,
     });
 
     // ADR-064: CP→DP rate-limit distributor — spawned ONLY when RP_CP_CONFIG_URL is
@@ -838,11 +869,17 @@ async fn main() {
     // Health checks must never require a key, or ACA/Kubernetes probes fail.
     // The reliability stack deliberately does NOT wrap these: a load-shed must
     // never make /healthz fail and trigger a pod restart while shedding.
-    let public = Router::new()
-        .route(
-            "/",
-            get(|| async { "Routeplane AI Gateway (Rust) - Alpha" }),
-        )
+    // Whether the bundled Community Edition Console (static SPA) is served from
+    // this origin — set by the single-image build (RP_CONSOLE_DIR → the built
+    // assets). When enabled, the Console SPA owns "/" (served via the router
+    // fallback below, where ServeDir returns index.html for "/"), so the
+    // plain-text gateway banner is NOT mounted there. When disabled, "/" is the
+    // banner and behavior is byte-identical to before.
+    let console_dir: Option<String> = std::env::var("RP_CONSOLE_DIR")
+        .ok()
+        .filter(|d| !d.is_empty());
+
+    let mut public = Router::new()
         .route("/healthz", get(|| async { "OK" }))
         // Platform SRE metrics (no auth, like /healthz) — the full Prometheus
         // text exposition surface (request counts/latency/tokens/cost/cache/
@@ -851,6 +888,12 @@ async fn main() {
         // hot path. Labels are bounded (provider only) and carry NO tenant, key,
         // or content — which is what makes leaving it unauthenticated safe.
         .route("/metrics", get(metrics_handler));
+    if console_dir.is_none() {
+        public = public.route(
+            "/",
+            get(|| async { "Routeplane AI Gateway (Rust) - Alpha" }),
+        );
+    }
 
     // Authenticated routes — require a valid x-routeplane-api-key. The auth
     // `from_fn` is preserved (Task #2) and runs inside the reliability stack.
@@ -929,6 +972,22 @@ async fn main() {
         // catalog to any authed caller (no per-tenant allowlist today).
         .route("/v1/models", get(crate::models_api::list_models))
         .route("/v1/models/{id}", get(crate::models_api::retrieve_model))
+        // Runtime custom-provider registry (CE): add/list/remove operator-
+        // defined OpenAI-compatible providers with NO restart. POST upserts
+        // (validate → persist to configs/providers.json → hot-swap the ArcSwap
+        // snapshot), GET lists with the api_key MASKED (write-only secret),
+        // DELETE removes (404 when absent). Authed like every /v1 route; NOT
+        // entitlement-gated (a CE feature). Traffic to a custom provider rides
+        // the SAME chat pipeline, so usage/logs/analytics/metrics/status all
+        // record it under its registered name automatically.
+        .route(
+            "/v1/providers",
+            post(crate::providers_api::upsert_provider).get(crate::providers_api::list_providers),
+        )
+        .route(
+            "/v1/providers/{name}",
+            axum::routing::delete(crate::providers_api::delete_provider),
+        )
         // FinOps chargeback/showback export (PRD-008 FR-24): gated inside the
         // handler on Feature::FinOpsExport (403 when not entitled). Read-only,
         // tenant-isolated by key ownership; off the chat path.
@@ -1084,24 +1143,42 @@ async fn main() {
 
     // Build our application. Security/hygiene response headers wrap the whole
     // app (public + authed + status) — 2026-06-12 dogfood found none were set.
-    let app = with_security_headers(
-        public
-            .merge(authed)
-            .merge(audio_authed)
-            .merge(status_routes),
-    )
-    // Cross-origin browser access for the Routeplane Console (ADR-061). The
-    // Console is a separate static origin, so every authed call (which carries
-    // `x-routeplane-api-key` / `Authorization`) makes the browser send a CORS
-    // preflight `OPTIONS`. Without an app-wide CORS layer that preflight is
-    // 401'd by auth (or 405'd where OPTIONS is unrouted) and the browser reports
-    // a useless "Failed to fetch" — which is exactly what broke the dashboard's
-    // live pages. Auth is header-based (no cookies), so allow-any-origin carries
-    // no credential-leak / CSRF surface; origins are pinned in prod via
-    // `RP_CORS_ALLOWED_ORIGINS` (comma-separated). This layer is OUTERMOST so the
-    // preflight short-circuits here before auth / reliability ever run.
-    .layer(build_cors_layer())
-    .with_state(state);
+    // Optionally serve the bundled Community Edition Console (a static SPA) from
+    // this same origin — the single Docker image ships the gateway + Console
+    // together. Enabled ONLY when `RP_CONSOLE_DIR` points at the built assets
+    // (the image build sets it); unset ⇒ no static serving and default behavior
+    // is byte-identical. Mounted as the router FALLBACK so it never shadows an API
+    // route; unmatched non-API paths return `index.html` for SPA client-side
+    // routing. It is public (outside the auth layer) so the app can load before
+    // the operator enters a key — the SPA then authenticates its own API calls.
+    let routed = public
+        .merge(authed)
+        .merge(audio_authed)
+        .merge(status_routes);
+    let routed = match &console_dir {
+        Some(dir) => {
+            let index = std::path::Path::new(dir).join("index.html");
+            tracing::info!("Community Edition Console: serving static SPA from {dir}");
+            routed.fallback_service(
+                tower_http::services::ServeDir::new(dir)
+                    .fallback(tower_http::services::ServeFile::new(index)),
+            )
+        }
+        None => routed,
+    };
+    let app = with_security_headers(routed)
+        // Cross-origin browser access for the Routeplane Console (ADR-061). The
+        // Console is a separate static origin, so every authed call (which carries
+        // `x-routeplane-api-key` / `Authorization`) makes the browser send a CORS
+        // preflight `OPTIONS`. Without an app-wide CORS layer that preflight is
+        // 401'd by auth (or 405'd where OPTIONS is unrouted) and the browser reports
+        // a useless "Failed to fetch" — which is exactly what broke the dashboard's
+        // live pages. Auth is header-based (no cookies), so allow-any-origin carries
+        // no credential-leak / CSRF surface; origins are pinned in prod via
+        // `RP_CORS_ALLOWED_ORIGINS` (comma-separated). This layer is OUTERMOST so the
+        // preflight short-circuits here before auth / reliability ever run.
+        .layer(build_cors_layer())
+        .with_state(state);
 
     // Run it
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
@@ -1292,6 +1369,7 @@ async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         &state.cache,
         &state.observability_engine,
         shed_total(),
+        &state.custom_providers.names(),
     ))
 }
 

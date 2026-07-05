@@ -25,15 +25,20 @@ fn circuit_str(state: CircuitState) -> &'static str {
 
 /// Build the `/status` JSON snapshot from the live engines. `shed_total` is
 /// passed in because the capacity-shed counter is a binary-level global.
+/// `custom_providers` is the (sorted) runtime custom-provider name list —
+/// appended to the provider list with an explicit `"custom": true` marker (they
+/// are untracked by the boot-time health registry, which fails open for them,
+/// so `circuit` is honestly reported `closed` with no latency sample).
 pub fn status_snapshot_json(
     health: &HealthTracker,
     cache: &ExactCache,
     observability: &ObservabilityEngine,
     shed_total: u64,
+    custom_providers: &[String],
 ) -> Value {
     let mut names = health.provider_names();
     names.sort_unstable();
-    let providers: Vec<Value> = names
+    let mut providers: Vec<Value> = names
         .iter()
         .map(|p| {
             json!({
@@ -43,6 +48,14 @@ pub fn status_snapshot_json(
             })
         })
         .collect();
+    for name in custom_providers {
+        providers.push(json!({
+            "provider": name,
+            "circuit": "closed", // untracked ⇒ always admitted (fail-open)
+            "latency_ewma_ms": Value::Null,
+            "custom": true,
+        }));
+    }
 
     let (entries, approx_bytes) = cache.stats_snapshot();
     let hits = cache.hits();

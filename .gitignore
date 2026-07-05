@@ -15,6 +15,17 @@ configs/keys.json.bak
 configs/*.bak
 *.bak
 
+# Runtime custom-provider registry — written by the authed /v1/providers API and
+# holds UPSTREAM provider keys (0600), exactly like keys.json. The `.tmp` is the
+# atomic-write staging file; both must never be committed.
+configs/providers.json
+configs/providers.json.tmp
+
+# Console SPA — deps and build output are produced by the build (npm / the
+# console-builder Docker stage), never committed. node_modules is a dev symlink.
+dashboard/node_modules
+dashboard/dist
+
 # cargo-about scratch when regenerating THIRD_PARTY_NOTICES.md
 /about-scratch/
 
