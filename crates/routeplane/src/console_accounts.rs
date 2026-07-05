@@ -134,6 +134,7 @@ impl ConsoleAccountStore {
     }
 
     /// In-memory-only store (tests): mutations skip persistence.
+    #[cfg(test)]
     pub fn ephemeral() -> Self {
         Self {
             shared: Arc::new(ArcSwap::from_pointee(Accounts::default())),
