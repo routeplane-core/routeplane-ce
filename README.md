@@ -142,6 +142,37 @@ print(reply.choices[0].message.content)
 For the full self-hosting walkthrough (env vars, keys, building from source, Apple Silicon
 notes), see [SELF_HOST.md](https://github.com/routeplane-core/routeplane-ce/blob/main/SELF_HOST.md).
 
+## The Console
+
+The same single binary also serves a web console on the gateway's own origin — open
+`http://localhost:8080` in a browser. Create a local operator account, add an
+OpenAI-compatible provider **at runtime with no restart**, try models in the playground,
+and watch the traffic land in usage analytics:
+
+![Demo: creating an operator account in the CE console, adding a local Ollama endpoint as a custom provider at runtime, streaming a haiku from it in the playground, revealing the gateway key, and the request appearing in usage analytics](https://github.com/routeplane-core/routeplane-ce/raw/main/docs/console-demo.gif)
+
+*A real browser session against the real gateway and a local Ollama model — no cloud keys,
+no mocks. Reproduce it (or re-record it) from
+[docs/demo-console/](https://github.com/routeplane-core/routeplane-ce/tree/main/docs/demo-console).*
+
+- **Email + password, self-contained.** Accounts live in a local file
+  (`configs/console-accounts.json`, argon2id-hashed); sessions are signed tokens stored only
+  in your browser. Signup is open by design — the first (usually only) operator bootstraps
+  their own account on a box they control. Logout revokes every outstanding session.
+- **Custom providers at runtime.** Any OpenAI-compatible endpoint (vLLM, Ollama, LocalAI, a
+  cloud service) — its models appear in `/v1/models` and the playground immediately.
+  Upstream keys are write-only: stored server-side with `0600` permissions, echoed back only
+  as `…last4`.
+- **Your gateway key, one click away.** The console reveals the `rp_` key its session
+  authorizes as, ready to paste into an SDK — the browser never needs it to use the console
+  itself.
+
+The console is on when `RP_CONSOLE_DIR` points at the built SPA — the published Docker image
+sets it, so `docker compose up` includes it out of the box. Pointing a custom provider at a
+loopback or private-network address (like local Ollama) is an explicit opt-in:
+`RP_CUSTOM_PROVIDER_ALLOW_PRIVATE=on`. Link-local/cloud-metadata addresses are always
+refused — that guard has no off switch.
+
 ## Works with your tools
 
 Anything that speaks the OpenAI API works unchanged — the integration is always the same two
@@ -211,6 +242,8 @@ dependencies — no Redis, no database, no cloud account.
 | **PII masking (basic)** | Regex-grade masking of common personal-data patterns, inbound and outbound |
 | **Analytics + request logs** | In-memory, queryable over the API; nothing written to disk or sent anywhere |
 | **Auth** | `rp_`-prefixed virtual keys, as `Authorization: Bearer` (what OpenAI SDKs send) or `x-routeplane-api-key` |
+| **Web console** | Bundled SPA served by the gateway itself — email/password login, playground, usage, key reveal. [See it in action.](#the-console) |
+| **Runtime custom providers** | Add any OpenAI-compatible endpoint from the console — usable immediately, no restart; keys stored write-only |
 
 ### Named combos
 
@@ -463,6 +496,11 @@ cheaper targets, `latency` prefers the fastest recent EWMA.
 | `SELF_HOSTED_BASE_URL` | Root URL of your OpenAI-compatible local server, without `/v1` — e.g. `http://ollama:11434` (enables `self_hosted`) |
 | `RP_KEYS_JSON` / `RP_KEYS_FILE` | Key registry without a bind mount |
 | `RP_ROUTING_POLICIES_FILE` | Combos/routing-config file path |
+| `RP_CONSOLE_DIR` | Path to the built console SPA; set ⇒ the gateway serves the console (the Docker image sets it) |
+| `RP_CONSOLE_SESSION_SECRET` | Console session-signing secret (≥32 chars); unset ⇒ random per boot, sessions reset on restart |
+| `RP_CONSOLE_ACCOUNTS_FILE` | Console account store (default `configs/console-accounts.json`) |
+| `RP_CONSOLE_KEY` | Which registry key console sessions authorize as (default: the only/first key) |
+| `RP_CUSTOM_PROVIDER_ALLOW_PRIVATE` | `on` ⇒ allow custom providers on loopback/private IPs (local Ollama/vLLM); link-local/metadata always refused |
 
 ## FAQ
 
