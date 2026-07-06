@@ -26,6 +26,7 @@ async fn status_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         &state.cache,
         &state.observability_engine,
         0,
+        &state.custom_providers.names(),
     ))
 }
 
@@ -42,7 +43,13 @@ fn app(state: Arc<AppState>) -> Router {
 #[tokio::test]
 async fn status_snapshot_has_expected_shape() {
     let state = build_stub_state();
-    let v = status_snapshot_json(&state.health, &state.cache, &state.observability_engine, 0);
+    let v = status_snapshot_json(
+        &state.health,
+        &state.cache,
+        &state.observability_engine,
+        0,
+        &state.custom_providers.names(),
+    );
 
     for key in ["shed_total", "providers", "cache", "usage"] {
         assert!(v.get(key).is_some(), "missing top-level key `{key}`");

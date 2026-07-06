@@ -23,6 +23,17 @@ RUN cargo chef cook --release --recipe-path recipe.json -p routeplane
 COPY . .
 RUN cargo build --release -p routeplane
 
+# Console builder: compile the Community Edition Console (a static React/Vite
+# SPA) to plain assets. Node exists ONLY in this stage — the final image ships
+# the built files and never contains Node or the SPA's node_modules. package.json
+# is copied first so the dependency install layer caches across source-only edits.
+FROM node:22-bookworm-slim AS console-builder
+WORKDIR /console
+COPY dashboard/package.json ./
+RUN npm install --no-audit --no-fund
+COPY dashboard/ ./
+RUN npm run build
+
 # Runtime base.
 #
 # Install ca-certificates, then upgrade all OS packages to the latest point
@@ -49,5 +60,10 @@ COPY LICENSE THIRD_PARTY_NOTICES.md /usr/local/share/doc/routeplane/
 # Ship Cargo.lock so syft's cargo-lock cataloger can enumerate the Rust crates
 # in the image SBOM (without it the SBOM lists only OS packages).
 COPY --from=builder /usr/src/app/Cargo.lock /usr/local/share/routeplane/Cargo.lock
+# The bundled Community Edition Console (static SPA). The gateway serves it
+# same-origin when RP_CONSOLE_DIR is set — so this single image is both the
+# gateway and its dashboard. No Node in this image; just the built assets.
+COPY --from=console-builder --chown=routeplane:routeplane /console/dist /usr/local/share/routeplane/console
+ENV RP_CONSOLE_DIR=/usr/local/share/routeplane/console
 USER 1000:1000
 CMD ["./routeplane"]

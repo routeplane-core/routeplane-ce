@@ -855,12 +855,44 @@ fn combo_models(state: &AppState) -> Vec<ModelObject> {
         .collect()
 }
 
+/// Is `id` a model in the built-in static catalog? Drives the documented
+/// custom-provider precedence rule: a runtime custom provider's model mapping
+/// never shadows a built-in catalog id (the custom provider stays reachable via
+/// an explicit `x-routeplane-provider`). A short static-slice scan, no lock.
+pub fn is_builtin_model(id: &str) -> bool {
+    STATIC_CATALOG.iter().any(|m| m.id == id)
+}
+
+/// Runtime custom-provider models (`owned_by = <provider name>`), folded onto
+/// the catalog at request time — the same posture as the env-discovered
+/// deployments. ADDITIVE + deduplicated by id against everything already in
+/// `existing` (built-in catalog + combos win a contested id, matching the
+/// routing precedence). Empty registry ⇒ empty vec ⇒ byte-identical list.
+fn custom_provider_models(state: &AppState, existing: &[ModelObject]) -> Vec<ModelObject> {
+    state
+        .custom_providers
+        .model_entries()
+        .into_iter()
+        .filter(|(id, _)| !existing.iter().any(|m| &m.id == id))
+        .map(|(id, owner)| ModelObject {
+            id,
+            object: "model",
+            created: CATALOG_CREATED,
+            owned_by: owner,
+            routeplane: None,
+        })
+        .collect()
+}
+
 /// `GET /v1/models` — the full catalog as the OpenAI `{"object":"list", …}`
 /// envelope. Authed (the route rides the same auth layer as chat). 200 always.
-/// The static provider catalog plus any operator-defined combos (ADR-086).
+/// The static provider catalog plus any operator-defined combos (ADR-086) plus
+/// any runtime custom-provider models.
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
     let mut data = full_catalog();
     data.extend(combo_models(&state));
+    let custom = custom_provider_models(&state, &data);
+    data.extend(custom);
     let list = ModelList {
         object: "list",
         data,
@@ -879,6 +911,25 @@ pub async fn retrieve_model(
     }
     if let Some(model) = combo_models(&state).into_iter().find(|m| m.id == id) {
         return (StatusCode::OK, Json(model)).into_response();
+    }
+    // Runtime custom-provider model (additive; built-ins/combos matched above).
+    if let Some((model_id, owner)) = state
+        .custom_providers
+        .model_entries()
+        .into_iter()
+        .find(|(m, _)| m == &id)
+    {
+        return (
+            StatusCode::OK,
+            Json(ModelObject {
+                id: model_id,
+                object: "model",
+                created: CATALOG_CREATED,
+                owned_by: owner,
+                routeplane: None,
+            }),
+        )
+            .into_response();
     }
     crate::api_error::error_response(
         StatusCode::NOT_FOUND,

@@ -31,7 +31,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
-use routeplane_adapters::{Provider, ProviderError};
+use routeplane_adapters::ProviderError;
 use routeplane_limits::{
     estimate_cost_micro_usd, now_unix_ms, Admission, Advisory, Breach, BudgetWarning, LimitKind,
 };
@@ -149,19 +149,37 @@ pub async fn embeddings(
         );
         names
     } else {
-        let requested = headers
+        match headers
             .get("x-routeplane-provider")
             .and_then(|h| h.to_str().ok())
-            .unwrap_or("openai");
-        let chain: Vec<String> = requested
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if chain.is_empty() {
-            vec!["openai".to_string()]
-        } else {
-            chain
+        {
+            // Explicit addressing (comma chain) — unchanged, and it may name a
+            // runtime custom provider directly (resolved in the loop below).
+            Some(requested) => {
+                let chain: Vec<String> = requested
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if chain.is_empty() {
+                    vec!["openai".to_string()]
+                } else {
+                    chain
+                }
+            }
+            // No header: runtime custom-provider MODEL routing — the SAME
+            // precedence as chat (a custom provider never shadows a built-in
+            // catalog id; reach it explicitly via `x-routeplane-provider`).
+            // One lock-free `ArcSwap::load` + `HashMap` probe; an empty
+            // registry is an instant miss ⇒ byte-identical legacy default.
+            None => match state
+                .custom_providers
+                .provider_for_model(&payload.model)
+                .filter(|_| !crate::models_api::is_builtin_model(&payload.model))
+            {
+                Some(custom) => vec![custom],
+                None => vec!["openai".to_string()],
+            },
         }
     };
 
@@ -206,19 +224,24 @@ pub async fn embeddings(
     let mut last_not_supported = false;
 
     for provider_name in &ordered {
-        let provider: &dyn Provider = match registry.get(provider_name.as_str()) {
-            Some(p) => p.as_ref(),
-            None => {
-                last_error = format!("Unsupported provider: {provider_name}");
-                continue;
-            }
+        // Built-in registry FIRST, then the runtime custom registry — the same
+        // `resolve_provider` resolution chat uses (one lock-free ArcSwap load +
+        // HashMap probe; the owned Arc clone is one refcount bump per attempt).
+        let Some(provider) = state.resolve_provider(provider_name.as_str()) else {
+            last_error = format!("Unsupported provider: {provider_name}");
+            continue;
         };
         if !state.health.is_available(provider_name) {
             tracing::warn!("Skipping {} — circuit breaker is OPEN", provider_name);
             last_error = format!("circuit breaker open for {provider_name}");
             continue;
         }
-        let api_key = match resolve_api_key(&virtual_key, provider_name) {
+        // Key precedence: the virtual key's authored `provider_keys` entry (if
+        // one exists for this name), else a runtime custom provider's
+        // registered upstream key — identical to the chat path's fallback.
+        let api_key = match resolve_api_key(&virtual_key, provider_name)
+            .or_else(|| state.custom_providers.api_key(provider_name))
+        {
             Some(k) => k,
             None => {
                 last_error = format!("API key for {provider_name} not configured");

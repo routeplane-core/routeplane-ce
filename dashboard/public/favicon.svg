@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80" role="img" aria-label="Routeplane">
+  <defs>
+    <linearGradient id="hub" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#0EA5E9"/>
+      <stop offset="50%" stop-color="#6366F1"/>
+      <stop offset="100%" stop-color="#A855F7"/>
+    </linearGradient>
+  </defs>
+  <rect width="80" height="80" rx="18" fill="#0B1120"/>
+  <g transform="scale(0.78) translate(11 11)">
+    <line x1="40" y1="40" x2="6" y2="12" stroke="#2D8FCF" stroke-width="5" stroke-linecap="round"/>
+    <line x1="40" y1="40" x2="6" y2="68" stroke="#2D8FCF" stroke-width="5" stroke-linecap="round"/>
+    <line x1="40" y1="40" x2="74" y2="12" stroke="#9456C9" stroke-width="5" stroke-linecap="round"/>
+    <line x1="40" y1="40" x2="74" y2="68" stroke="#9456C9" stroke-width="5" stroke-linecap="round"/>
+    <circle cx="6" cy="12" r="6.5" fill="#0EA5E9"/>
+    <circle cx="6" cy="68" r="6.5" fill="#0EA5E9"/>
+    <circle cx="74" cy="12" r="6.5" fill="#A855F7"/>
+    <circle cx="74" cy="68" r="6.5" fill="#A855F7"/>
+    <circle cx="40" cy="40" r="16" fill="url(#hub)"/>
+  </g>
+</svg>

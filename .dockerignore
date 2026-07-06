@@ -19,3 +19,19 @@ target
 .env.*
 configs/keys.json
 configs/keys.json.bak
+# Runtime custom-provider registry — holds upstream provider keys (written by
+# the /v1/providers API); its .tmp is the atomic-write staging file. Same
+# never-in-an-image-layer posture as keys.json.
+configs/providers.json
+configs/providers.json.tmp
+# Console account registry — holds argon2id password hashes (written by
+# /v1/console/signup); its .tmp is the atomic-write staging file. Same
+# never-in-an-image-layer posture as keys.json.
+configs/console-accounts.json
+configs/console-accounts.json.tmp
+
+# Console SPA build inputs/outputs — deps are installed and the SPA is built
+# inside the `console-builder` Docker stage, so the local node_modules (a dev
+# symlink) and any local dist must never enter the build context.
+dashboard/node_modules
+dashboard/dist

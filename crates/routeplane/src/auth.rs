@@ -967,6 +967,25 @@ fn resolve_gateway_credential<'h>(
     }
 }
 
+/// Extract the raw Bearer token (any prefix) for the console-session fallback.
+/// Parsing mirrors [`bearer_gateway_candidate`] (RFC 7235 scheme match, single
+/// separating space, trimmed token); returns `None` for a non-Bearer or empty
+/// credential. Consulted ONLY after [`resolve_gateway_credential`] declined the
+/// request, so it can never divert an `rp_` gateway-key credential.
+fn bearer_raw_token(header: Option<&str>) -> Option<&str> {
+    let raw = header?;
+    let (scheme, token) = raw.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    let token = token.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
 pub async fn auth_middleware(mut req: Request<Body>, next: Next) -> Result<Response, Response> {
     // The registry handle is the hot-swappable `SharedAuthState` (Task #7). We
     // `load()` the current pointer wait-free (no lock), so a concurrent
@@ -1137,6 +1156,68 @@ pub async fn auth_middleware(mut req: Request<Body>, next: Next) -> Result<Respo
             }
         }
         None => {
+            // CE Console session bridge (console_auth.rs): when no `rp_`
+            // gateway key was presented but a non-`rp_` Bearer credential
+            // exists, it may be a console-session JWT minted by
+            // /v1/console/login|signup. Consulted STRICTLY as a fallback — the
+            // rp_-key paths above are byte-identical, so a session is an
+            // ADDITIONAL accepted credential, never a precedence change.
+            // Verification is pure CPU + two lock-free ArcSwap probes, no I/O:
+            //   1. HS256 signature + exp (alg pinned — `none`/RS256 confusion
+            //      is structurally rejected) via `jsonwebtoken`;
+            //   2. the account's LIVE session_version (logout revocation);
+            //   3. the CONFIGURED console gateway key resolved from the SAME
+            //      registry snapshot as an rp_ key (`bridge.console_key` is
+            //      server-side config, not request material, so the plain
+            //      HashMap probe opens no timing side-channel on key bytes),
+            //      then the identical fail-closed lifecycle gate.
+            // ANY failure falls through to the identical record_failure + 401
+            // below — fail-closed, and invalid session tokens count toward the
+            // R0.2 brute-force throttle exactly like a bad rp_ key. With no
+            // bridge/accounts configured no token can verify, so the default
+            // deployment is byte-identical to today. The browser only ever
+            // holds this JWT — the rp_ key never leaves the server.
+            if non_rp_bearer {
+                let bridge = req
+                    .extensions()
+                    .get::<crate::console_auth::SharedConsoleAuth>()
+                    .cloned();
+                if let Some(bridge) = bridge {
+                    let token = bearer_raw_token(authorization).map(str::to_string);
+                    if let Some(session) = token.and_then(|t| bridge.verify(&t)) {
+                        if let Some(virtual_key) = state.keys.get(bridge.console_key.as_str()) {
+                            let virtual_key = virtual_key.clone();
+                            if virtual_key.lifecycle_state.serves_traffic() {
+                                let tenant_ctx = state.resolve_tenant_context(&virtual_key);
+                                // Tenant-default compiled guardrails are a moat
+                                // surface (ADR-088): the CE stub is structurally
+                                // `None`, and `None` type-checks on both build
+                                // variants, so no cfg fork is needed here.
+                                let tenant_guardrails = TenantGuardrails(None);
+                                tracing::debug!(
+                                    auth_source = "console_session",
+                                    "Authenticated console session (tenant={} tier={:?})",
+                                    tenant_ctx.tenant_id,
+                                    tenant_ctx.tier,
+                                );
+                                req.extensions_mut().insert(virtual_key);
+                                req.extensions_mut().insert(tenant_ctx);
+                                req.extensions_mut().insert(tenant_guardrails);
+                                req.extensions_mut().insert(session);
+                                return Ok(next.run(req).await);
+                            }
+                            // Fall through to the shared 401 (C4: no state leak).
+                            tracing::warn!("Console session refused: console tenant not active");
+                        } else {
+                            // The configured console key vanished from a
+                            // hot-swapped registry: fail closed, never guess.
+                            tracing::warn!(
+                                "Console session refused: configured console key is not in the registry"
+                            );
+                        }
+                    }
+                }
+            }
             // ADR-041 demand signal: a NON-`rp_` Bearer (an `sk-…` provider key
             // attempted as passthrough) is present but unusable. Distinct debug
             // event — never logs the value (C4) — so a climbing rate tells us
@@ -1803,6 +1884,21 @@ mod tests {
         assert_eq!(bearer_gateway_candidate(None), (None, false));
         // Bearer with an empty token is a present-but-unusable Bearer → signal.
         assert_eq!(bearer_gateway_candidate(Some("Bearer ")), (None, true));
+    }
+
+    #[test]
+    fn bearer_raw_token_mirrors_rfc7235_parsing() {
+        // The console-session fallback extractor: any Bearer token, trimmed.
+        assert_eq!(
+            bearer_raw_token(Some("Bearer abc.def.ghi")),
+            Some("abc.def.ghi")
+        );
+        assert_eq!(bearer_raw_token(Some("bearer  tok ")), Some("tok"));
+        // Non-Bearer schemes, bare tokens, and empty credentials are absent.
+        assert_eq!(bearer_raw_token(Some("Basic dXNlcjpwYXNz")), None);
+        assert_eq!(bearer_raw_token(Some("abc.def.ghi")), None);
+        assert_eq!(bearer_raw_token(Some("Bearer ")), None);
+        assert_eq!(bearer_raw_token(None), None);
     }
 
     #[test]

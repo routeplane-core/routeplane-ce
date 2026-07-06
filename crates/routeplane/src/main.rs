@@ -77,6 +77,10 @@ mod cache_api;
 mod ce_stubs;
 mod config;
 mod config_overlay;
+mod console_accounts;
+mod console_api;
+mod console_auth;
+mod custom_providers;
 mod embeddings;
 mod feedback_api;
 mod finops_api;
@@ -90,6 +94,7 @@ mod models_api;
 mod observability;
 mod otel;
 mod prompts_api;
+mod providers_api;
 mod proxy;
 mod rerank_api;
 mod residency_api;
@@ -381,6 +386,101 @@ async fn main() {
     }
 
     let auth_state = shared_auth_state(loaded_auth);
+
+    // ── CE Console email+password auth (console-session bridge) ─────────────
+    // Accounts: RP_CONSOLE_ACCOUNTS_FILE > ./configs/console-accounts.json.
+    // ABSENT/empty ⇒ start empty (open signup creates the first operator
+    // account — approval/invite gating is Enterprise, not built here);
+    // PRESENT-but-invalid ⇒ refuse start (holds password hashes — the
+    // keys.json fail-closed doctrine). 0600 + gitignored + dockerignored.
+    let console_accounts_path = std::env::var("RP_CONSOLE_ACCOUNTS_FILE")
+        .unwrap_or_else(|_| "configs/console-accounts.json".to_string());
+    let console_accounts = match crate::console_accounts::ConsoleAccountStore::load(
+        std::path::PathBuf::from(&console_accounts_path),
+    ) {
+        Ok(store) => {
+            tracing::info!(
+                "console accounts: {} account(s) loaded from {console_accounts_path}",
+                store.len()
+            );
+            Arc::new(store)
+        }
+        Err(e) => {
+            tracing::error!("failed to load console accounts from {console_accounts_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    // Session-signing secret: RP_CONSOLE_SESSION_SECRET (stable across
+    // restarts) or a per-boot random secret. NEVER logged. A CSPRNG failure
+    // refuses to start (a guessable session secret is an auth bypass).
+    let console_secret = match crate::console_auth::session_secret_from_env() {
+        Ok((secret, generated)) => {
+            if generated {
+                tracing::warn!(
+                    "RP_CONSOLE_SESSION_SECRET is not set; using a random per-boot secret — console sessions reset on every restart"
+                );
+            }
+            secret
+        }
+        Err(e) => {
+            tracing::error!("failed to initialise the console session secret: {e}");
+            std::process::exit(1);
+        }
+    };
+    // The gateway key a valid console session authorizes as (single-tenant
+    // CE). RP_CONSOLE_KEY must name a REGISTERED key when set (fail-closed at
+    // boot — a console silently mapping to nothing, or to a guessed key, is an
+    // authz failure); default = the registry's only key, else the
+    // lexicographically-first routeplane_key (deterministic across restarts —
+    // HashMap iteration order is not). Only the key NAME is ever logged.
+    let console_key = {
+        let snapshot = auth_state.load();
+        let resolved = match std::env::var("RP_CONSOLE_KEY") {
+            Ok(k) if !k.trim().is_empty() => {
+                let k = k.trim().to_string();
+                if !snapshot.keys.contains_key(&k) {
+                    tracing::error!(
+                        "RP_CONSOLE_KEY does not match any key in the registry (refusing to start)"
+                    );
+                    std::process::exit(1);
+                }
+                k
+            }
+            _ => {
+                let mut ids: Vec<&String> = snapshot.keys.keys().collect();
+                ids.sort_unstable();
+                match ids.first() {
+                    Some(id) => {
+                        if ids.len() > 1 {
+                            tracing::info!(
+                                "multiple gateway keys registered; console sessions default to the first (set RP_CONSOLE_KEY to choose)"
+                            );
+                        }
+                        (*id).clone()
+                    }
+                    // Unreachable in practice (an empty registry refuses to
+                    // start above) — but never panic on the boot path either.
+                    None => {
+                        tracing::error!("key registry is empty; cannot bind a console key");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        };
+        let key_name = snapshot
+            .keys
+            .get(&resolved)
+            .map(|vk| vk.name.clone())
+            .unwrap_or_default();
+        tracing::info!("console sessions authorize as key '{key_name}'");
+        resolved
+    };
+    let console_bridge: crate::console_auth::SharedConsoleAuth =
+        Arc::new(crate::console_auth::ConsoleAuthBridge::new(
+            &console_secret,
+            console_key,
+            console_accounts.clone(),
+        ));
 
     // Auth-failure rate limiting (security gap R0.2): throttle repeated failed
     // authentication per source IP with escalating backoff. Ship-dark — OFF
@@ -694,6 +794,32 @@ async fn main() {
     // the limiter fails open to the local engine (see distributed.rs).
     let distributed_limiter = build_distributed_limiter().await;
 
+    // Runtime custom-provider registry (CE operator surface): operator-defined
+    // OpenAI-compatible endpoints, added over the authed /v1/providers API with
+    // NO restart. Hot-swappable via ArcSwap (lock-free reads) + persisted to
+    // configs/providers.json with 0600 perms (it holds upstream keys, exactly
+    // like keys.json — both gitignored + dockerignored). Source precedence:
+    // RP_PROVIDERS_FILE > ./configs/providers.json. ABSENT/empty file ⇒ start
+    // empty (ship-dark, byte-identical); PRESENT-but-invalid ⇒ refuse start
+    // (fail-closed, the keys.json doctrine).
+    let providers_path =
+        std::env::var("RP_PROVIDERS_FILE").unwrap_or_else(|_| "configs/providers.json".to_string());
+    let custom_providers = match crate::custom_providers::CustomProviderStore::load(
+        std::path::PathBuf::from(&providers_path),
+    ) {
+        Ok(store) => {
+            tracing::info!(
+                "custom provider registry: {} provider(s) loaded from {providers_path}",
+                store.len()
+            );
+            Arc::new(store)
+        }
+        Err(e) => {
+            tracing::error!("failed to load custom provider registry from {providers_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let state = Arc::new(AppState {
         providers: build_provider_registry(),
         guardrail_engine: GuardrailEngine::new(),
@@ -761,6 +887,9 @@ async fn main() {
         // ONLY when RP_CP_CONFIG_URL is set — absent ⇒ it stays empty for the
         // process lifetime ⇒ enforcement is a permanent no-op (parity-safe).
         config_overlay: config_overlay.clone(),
+        // Runtime custom-provider registry (CE): loaded above; hot-swapped by
+        // the /v1/providers handlers, read lock-free on the request path.
+        custom_providers,
     });
 
     // ADR-064: CP→DP rate-limit distributor — spawned ONLY when RP_CP_CONFIG_URL is
@@ -838,11 +967,17 @@ async fn main() {
     // Health checks must never require a key, or ACA/Kubernetes probes fail.
     // The reliability stack deliberately does NOT wrap these: a load-shed must
     // never make /healthz fail and trigger a pod restart while shedding.
-    let public = Router::new()
-        .route(
-            "/",
-            get(|| async { "Routeplane AI Gateway (Rust) - Alpha" }),
-        )
+    // Whether the bundled Community Edition Console (static SPA) is served from
+    // this origin — set by the single-image build (RP_CONSOLE_DIR → the built
+    // assets). When enabled, the Console SPA owns "/" (served via the router
+    // fallback below, where ServeDir returns index.html for "/"), so the
+    // plain-text gateway banner is NOT mounted there. When disabled, "/" is the
+    // banner and behavior is byte-identical to before.
+    let console_dir: Option<String> = std::env::var("RP_CONSOLE_DIR")
+        .ok()
+        .filter(|d| !d.is_empty());
+
+    let mut public = Router::new()
         .route("/healthz", get(|| async { "OK" }))
         // Platform SRE metrics (no auth, like /healthz) — the full Prometheus
         // text exposition surface (request counts/latency/tokens/cost/cache/
@@ -851,6 +986,12 @@ async fn main() {
         // hot path. Labels are bounded (provider only) and carry NO tenant, key,
         // or content — which is what makes leaving it unauthenticated safe.
         .route("/metrics", get(metrics_handler));
+    if console_dir.is_none() {
+        public = public.route(
+            "/",
+            get(|| async { "Routeplane AI Gateway (Rust) - Alpha" }),
+        );
+    }
 
     // Authenticated routes — require a valid x-routeplane-api-key. The auth
     // `from_fn` is preserved (Task #2) and runs inside the reliability stack.
@@ -929,6 +1070,32 @@ async fn main() {
         // catalog to any authed caller (no per-tenant allowlist today).
         .route("/v1/models", get(crate::models_api::list_models))
         .route("/v1/models/{id}", get(crate::models_api::retrieve_model))
+        // Runtime custom-provider registry (CE): add/list/remove operator-
+        // defined OpenAI-compatible providers with NO restart. POST upserts
+        // (validate → persist to configs/providers.json → hot-swap the ArcSwap
+        // snapshot), GET lists with the api_key MASKED (write-only secret),
+        // DELETE removes (404 when absent). Authed like every /v1 route; NOT
+        // entitlement-gated (a CE feature). Traffic to a custom provider rides
+        // the SAME chat pipeline, so usage/logs/analytics/metrics/status all
+        // record it under its registered name automatically.
+        .route(
+            "/v1/providers",
+            post(crate::providers_api::upsert_provider).get(crate::providers_api::list_providers),
+        )
+        .route(
+            "/v1/providers/{name}",
+            axum::routing::delete(crate::providers_api::delete_provider),
+        )
+        // CE Console auth (SESSION-authed): the session's own identity +
+        // logout (real revocation via a persisted per-account session-version
+        // bump). Ride the SAME auth middleware — a console session is accepted
+        // there via the console bridge; an rp_-key-authed request carries no
+        // ConsoleSession extension, so these return a clean 401 for it.
+        .route("/v1/console/me", get(crate::console_api::me))
+        // Session-only own-key reveal (intentional: the operator copies their
+        // gateway rp_ key into an SDK). Never reachable via rp_-key auth.
+        .route("/v1/console/api-key", get(crate::console_api::api_key))
+        .route("/v1/console/logout", post(crate::console_api::logout))
         // FinOps chargeback/showback export (PRD-008 FR-24): gated inside the
         // handler on Feature::FinOpsExport (403 when not entitled). Read-only,
         // tenant-isolated by key ownership; off the chat path.
@@ -1016,7 +1183,10 @@ async fn main() {
     let authed = authed
         .layer(middleware::from_fn(auth_middleware))
         .layer(axum::Extension(auth_state.clone()))
-        .layer(axum::Extension(prompts));
+        .layer(axum::Extension(prompts))
+        // Console-session bridge (CE Console auth): read by auth_middleware as
+        // the fallback credential seam — same injection pattern as auth_state.
+        .layer(axum::Extension(console_bridge.clone()));
     // Auth-failure tracker extension (R0.2) — added ONLY when the feature is
     // enabled, so the disabled path inserts nothing into the request extensions
     // and `auth_middleware` skips the gate entirely (byte-identical). Applied as
@@ -1066,7 +1236,10 @@ async fn main() {
             post(crate::audio_api::translations),
         )
         .layer(middleware::from_fn(auth_middleware))
-        .layer(axum::Extension(auth_state));
+        .layer(axum::Extension(auth_state))
+        // Same console-session bridge as the main authed router, so a Console
+        // session authorizes the audio surface identically.
+        .layer(axum::Extension(console_bridge.clone()));
     let audio_authed = match auth_failure_tracker_for_audio {
         Some(tracker) => audio_authed.layer(axum::Extension(tracker)),
         None => audio_authed,
@@ -1082,26 +1255,83 @@ async fn main() {
     // applied app-wide below, so this no longer needs its own scoped layer.)
     let status_routes = Router::new().route("/status", get(status));
 
+    // CE Console auth (PUBLIC): signup + login live OUTSIDE the auth layer —
+    // they CREATE/EXCHANGE the credential. Both argon2-verify on the blocking
+    // pool; login adds a fixed failure delay + dummy-verify (no enumeration /
+    // timing oracle). Open signup is intentional for a self-hosted CE (the
+    // operator bootstraps their own account); invite/approval gating is an
+    // Enterprise concern. Bodies are bounded by axum's default 2 MiB limit,
+    // and password length is capped before hashing (argon2-DoS guard).
+    // Always-on per-source-IP throttle for the PUBLIC credential routes (the
+    // only unauthenticated password endpoints). Dedicated instance, tuned looser
+    // than the keyed default so a fumbling operator isn't locked out, but tight
+    // enough to bound online brute force: 8 attempts / 5 min per IP, then
+    // exponential backoff capped at 15 min. Lock-free (atomic slots).
+    let console_throttle: crate::console_api::SharedConsoleThrottle =
+        std::sync::Arc::new(routeplane_limits::auth_failures::AuthFailureTracker::new(
+            routeplane_limits::auth_failures::AuthFailureConfig {
+                threshold: 8,
+                window_ms: 300_000,
+                backoff_base_ms: 2_000,
+                backoff_cap_ms: 900_000,
+                slots: 4_096,
+            },
+        ));
+    let console_public = Router::new()
+        .route("/v1/console/signup", post(crate::console_api::signup))
+        .route("/v1/console/login", post(crate::console_api::login))
+        .layer(axum::Extension(console_bridge.clone()))
+        .layer(axum::Extension(console_throttle));
+
     // Build our application. Security/hygiene response headers wrap the whole
     // app (public + authed + status) — 2026-06-12 dogfood found none were set.
-    let app = with_security_headers(
-        public
-            .merge(authed)
-            .merge(audio_authed)
-            .merge(status_routes),
-    )
-    // Cross-origin browser access for the Routeplane Console (ADR-061). The
-    // Console is a separate static origin, so every authed call (which carries
-    // `x-routeplane-api-key` / `Authorization`) makes the browser send a CORS
-    // preflight `OPTIONS`. Without an app-wide CORS layer that preflight is
-    // 401'd by auth (or 405'd where OPTIONS is unrouted) and the browser reports
-    // a useless "Failed to fetch" — which is exactly what broke the dashboard's
-    // live pages. Auth is header-based (no cookies), so allow-any-origin carries
-    // no credential-leak / CSRF surface; origins are pinned in prod via
-    // `RP_CORS_ALLOWED_ORIGINS` (comma-separated). This layer is OUTERMOST so the
-    // preflight short-circuits here before auth / reliability ever run.
-    .layer(build_cors_layer())
-    .with_state(state);
+    // Optionally serve the bundled Community Edition Console (a static SPA) from
+    // this same origin — the single Docker image ships the gateway + Console
+    // together. Enabled ONLY when `RP_CONSOLE_DIR` points at the built assets
+    // (the image build sets it); unset ⇒ no static serving and default behavior
+    // is byte-identical. Mounted as the router FALLBACK so it never shadows an API
+    // route; unmatched non-API paths return `index.html` for SPA client-side
+    // routing. It is public (outside the auth layer) so the app can load before
+    // the operator enters a key — the SPA then authenticates its own API calls.
+    let routed = public
+        .merge(authed)
+        .merge(audio_authed)
+        .merge(status_routes)
+        .merge(console_public);
+    // Community Edition: the Enterprise-only surface (/v1/moderations,
+    // /v1/guardrails/outcomes, /v1/mcp/*, the /v1/prompts collection) answers a
+    // uniform 402 `enterprise_only` upsell instead of the accidental 404/405
+    // (or, with the bundled Console, the SPA fallback's index.html). Mounted
+    // OUTSIDE the auth layer — these paths required no key to observe before
+    // (they were unmounted), and a caller must see `enterprise_only`, never a
+    // 401 first (see api_error::mount_enterprise_only_stubs). On the enterprise
+    // build this block does not exist and the real routes above are unchanged.
+    #[cfg(not(feature = "enterprise"))]
+    let routed = crate::api_error::mount_enterprise_only_stubs(routed);
+    let routed = match &console_dir {
+        Some(dir) => {
+            let index = std::path::Path::new(dir).join("index.html");
+            tracing::info!("Community Edition Console: serving static SPA from {dir}");
+            routed.fallback_service(
+                tower_http::services::ServeDir::new(dir)
+                    .fallback(tower_http::services::ServeFile::new(index)),
+            )
+        }
+        None => routed,
+    };
+    let app = with_security_headers(routed)
+        // Cross-origin browser access for the Routeplane Console (ADR-061). The
+        // Console is a separate static origin, so every authed call (which carries
+        // `x-routeplane-api-key` / `Authorization`) makes the browser send a CORS
+        // preflight `OPTIONS`. Without an app-wide CORS layer that preflight is
+        // 401'd by auth (or 405'd where OPTIONS is unrouted) and the browser reports
+        // a useless "Failed to fetch" — which is exactly what broke the dashboard's
+        // live pages. Auth is header-based (no cookies), so allow-any-origin carries
+        // no credential-leak / CSRF surface; origins are pinned in prod via
+        // `RP_CORS_ALLOWED_ORIGINS` (comma-separated). This layer is OUTERMOST so the
+        // preflight short-circuits here before auth / reliability ever run.
+        .layer(build_cors_layer())
+        .with_state(state);
 
     // Run it
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
@@ -1114,7 +1344,15 @@ async fn main() {
 
     tracing::info!("listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    // `into_make_service_with_connect_info` surfaces the TCP peer address to
+    // handlers via `ConnectInfo<SocketAddr>` — the non-spoofable key the console
+    // credential-route throttle uses.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
 
 /// Build the opt-in distributed (Redis) rate limiter (ADR-056 Mode D). Returns
@@ -1292,6 +1530,7 @@ async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         &state.cache,
         &state.observability_engine,
         shed_total(),
+        &state.custom_providers.names(),
     ))
 }
 
@@ -1330,6 +1569,35 @@ where
         .layer(SetResponseHeaderLayer::if_not_present(
             HeaderName::from_static("referrer-policy"),
             HeaderValue::from_static("no-referrer"),
+        ))
+        // Content-Security-Policy (R-CE-XSS MITIGATION): the Console stores its
+        // session token in localStorage and `/v1/console/api-key` reveals the
+        // gateway rp_ key to a session — so a script injection in the SPA is a
+        // key-theft path. This CSP shrinks the injection surface: no external or
+        // inline scripts (`script-src 'self'` — a Vite production build ships its
+        // JS as same-origin module chunks, no inline `<script>`), no plugins,
+        // no framing, and network egress limited to same-origin (the bundled
+        // single image serves the API + SPA from one origin). It is a MITIGATION,
+        // not elimination — an injected same-origin script could still read the
+        // token; the durable fix is an httpOnly session cookie (tracked
+        // follow-up). `style-src` keeps `'unsafe-inline'` because React inline
+        // `style={{…}}` attributes and Tailwind's runtime styles need it; tighten
+        // to a nonce later. VERIFY against the built SPA (browser console: zero
+        // CSP violations) before relaxing or shipping a cross-origin API base.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("content-security-policy"),
+            HeaderValue::from_static(
+                "default-src 'self'; \
+                 script-src 'self'; \
+                 style-src 'self' 'unsafe-inline'; \
+                 img-src 'self' data:; \
+                 font-src 'self' data:; \
+                 connect-src 'self'; \
+                 object-src 'none'; \
+                 base-uri 'none'; \
+                 frame-ancestors 'none'; \
+                 form-action 'self'",
+            ),
         ))
 }
 

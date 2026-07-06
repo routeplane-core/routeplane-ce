@@ -63,7 +63,7 @@ pub async fn usage_export(
     Extension(auth_state): Extension<SharedAuthState>,
     Extension(tenant_ctx): Extension<TenantContext>,
 ) -> Response {
-    if let Some(resp) = entitlement_gate(&tenant_ctx) {
+    if let Some(resp) = entitlement_gate(&tenant_ctx, "/v1/finops/usage") {
         return resp;
     }
 
@@ -107,7 +107,7 @@ pub async fn usage_timeseries(
     Extension(tenant_ctx): Extension<TenantContext>,
     Query(params): Query<TimeseriesQuery>,
 ) -> Response {
-    if let Some(resp) = entitlement_gate(&tenant_ctx) {
+    if let Some(resp) = entitlement_gate(&tenant_ctx, "/v1/finops/timeseries") {
         return resp;
     }
 
@@ -184,7 +184,7 @@ pub async fn cache_savings(
     Extension(tenant_ctx): Extension<TenantContext>,
     Query(params): Query<CacheSavingsQuery>,
 ) -> Response {
-    if let Some(resp) = entitlement_gate(&tenant_ctx) {
+    if let Some(resp) = entitlement_gate(&tenant_ctx, "/v1/finops/cache-savings") {
         return resp;
     }
 
@@ -228,11 +228,20 @@ pub async fn cache_savings(
     (StatusCode::OK, Json(body)).into_response()
 }
 
-/// The entitlement gate, mirroring `prompts_api::entitlement_gate`: a not-entitled
-/// tenant → 403 `feature_not_entitled`; an entitled-but-held-back tenant → 403
-/// `feature_not_released` (the only entitlement signals on `TenantContext` are the
-/// tier baseline plus the resolved, post-holdback `CapabilitySet`).
-fn entitlement_gate(ctx: &TenantContext) -> Option<Response> {
+/// The entitlement gate, mirroring `prompts_api::entitlement_gate`. An
+/// entitled-but-held-back tenant → 403 `feature_not_released` (an operator
+/// rollout holdback — truthful on both builds). A NOT-ENTITLED tenant:
+///
+/// * **Enterprise build** — 403 `feature_not_entitled` (a commercial-tier
+///   decision inside a licensed deployment).
+/// * **Community Edition** — the uniform 402 `enterprise_only` upsell
+///   (`api_error::enterprise_only`), naming the endpoint called: on CE the
+///   honest message is "switch to Enterprise", not "you lack a tier". Keys an
+///   operator DID grant `FinOpsExport` (e.g. `tier: business` in `keys.json` —
+///   the bundled Console's Usage/Cache pages ride those) pass the gate exactly
+///   as before; only the refusal envelope changes.
+#[cfg_attr(feature = "enterprise", allow(unused_variables))]
+fn entitlement_gate(ctx: &TenantContext, endpoint: &str) -> Option<Response> {
     if ctx.capabilities.active(Feature::FinOpsExport) {
         return None;
     }
@@ -244,11 +253,18 @@ fn entitlement_gate(ctx: &TenantContext) -> Option<Response> {
             "FinOps usage export is entitled for this tenant but not yet released (rollout holdback).",
         )
     } else {
-        openai_error(
-            StatusCode::FORBIDDEN,
-            "feature_not_entitled",
-            "FinOps usage export requires the Business tier or above.",
-        )
+        #[cfg(not(feature = "enterprise"))]
+        {
+            crate::api_error::enterprise_only(endpoint)
+        }
+        #[cfg(feature = "enterprise")]
+        {
+            openai_error(
+                StatusCode::FORBIDDEN,
+                "feature_not_entitled",
+                "FinOps usage export requires the Business tier or above.",
+            )
+        }
     })
 }
 
@@ -263,4 +279,52 @@ fn openai_error(status: StatusCode, code: &str, message: &str) -> Response {
         }
     });
     (status, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use routeplane_entitlements::{CapabilitySet, Tier};
+
+    fn ctx(tier: Tier) -> TenantContext {
+        TenantContext {
+            tenant_id: "t_test".into(),
+            tier,
+            capabilities: CapabilitySet::resolve(tier, &BTreeSet::new(), &BTreeSet::new()),
+            compliance_frameworks: Vec::new(),
+            compliance_mode: crate::auth::ComplianceMode::Strict,
+        }
+    }
+
+    #[tokio::test]
+    async fn entitled_tenant_passes_the_gate_unchanged() {
+        // A Business-tier key (FinOpsExport in its baseline) still passes — the
+        // CE change only reshapes the NOT-ENTITLED refusal, so the bundled
+        // Console's Usage/Cache pages keep working for granted keys.
+        assert!(entitlement_gate(&ctx(Tier::Business), "/v1/finops/usage").is_none());
+    }
+
+    #[cfg(not(feature = "enterprise"))]
+    #[tokio::test]
+    async fn ce_not_entitled_is_the_uniform_enterprise_only_402() {
+        let resp = entitlement_gate(&ctx(Tier::Free), "/v1/finops/usage")
+            .expect("Free tier is not entitled");
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            resp.headers()
+                .get("x-routeplane-upgrade")
+                .and_then(|v| v.to_str().ok()),
+            Some("https://routeplane.ai")
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(v["error"]["code"], "enterprise_only");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert!(v["error"]["message"]
+            .as_str()
+            .expect("message")
+            .starts_with("/v1/finops/usage is a Routeplane Enterprise feature"));
+    }
 }

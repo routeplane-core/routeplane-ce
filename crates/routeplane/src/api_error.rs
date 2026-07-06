@@ -140,6 +140,83 @@ pub fn model_disabled_for_tenant(model: &str) -> Response {
     )
 }
 
+/// 402 — a Routeplane **Enterprise-only** endpoint called on the Community
+/// Edition build. ONE uniform decline for the whole Enterprise surface
+/// (`/v1/finops/usage`, `/v1/moderations`, `/v1/mcp/*`, `/v1/prompts*`,
+/// `/v1/guardrails/outcomes`), replacing the previous mix of 403
+/// `feature_not_entitled` / 405 / bare 404s.
+///
+/// **Why 402 Payment Required:** the request is well-formed and authorization
+/// is not the issue — the feature is simply not purchasable in this build. 402
+/// is the clearest "upgrade needed" semantic, it is already in the gateway's
+/// vocabulary (the budget-exceeded limit rejection uses it), and the error
+/// infra (`error_response`) carries any `StatusCode`, so nothing forces a 403
+/// fallback. `type` stays `invalid_request_error` so OpenAI SDKs surface a
+/// clean typed error; the `x-routeplane-upgrade` header gives tooling a
+/// machine-readable pointer (the `x-routeplane-*` convention).
+#[cfg(not(feature = "enterprise"))]
+pub fn enterprise_only(endpoint: &str) -> Response {
+    let mut resp = error_response(
+        StatusCode::PAYMENT_REQUIRED,
+        "enterprise_only",
+        format!(
+            "{endpoint} is a Routeplane Enterprise feature and is not available in the \
+             Community Edition. Learn more at https://routeplane.ai."
+        ),
+        "invalid_request_error",
+        None,
+    );
+    resp.headers_mut().insert(
+        "x-routeplane-upgrade",
+        axum::http::HeaderValue::from_static("https://routeplane.ai"),
+    );
+    resp
+}
+
+/// Mount the Community Edition **Enterprise-only stub routes**: every
+/// data-plane endpoint that exists only on the Enterprise build gets a
+/// lightweight route answering [`enterprise_only`] (402) instead of the
+/// accidental 404/405 an unmounted path produced (which, with the bundled
+/// Console enabled, could even be the SPA fallback's `index.html`).
+///
+/// Mounted OUTSIDE the auth layer, deliberately: these paths required no key
+/// to observe their 404/405 before (they were simply absent), so keeping the
+/// stubs public preserves that posture and guarantees a caller sees
+/// `enterprise_only` — never a 401 first. The body is a static upsell message
+/// (no tenant/config state), so there is nothing to protect. Enterprise-only
+/// endpoints that DO exist on the CE build (`/v1/finops/*`, `/v1/prompts/
+/// {reference}*`) keep their existing authed mount and return the same
+/// envelope from their in-handler gate.
+///
+/// `any(...)` handlers: the surface mixes GET and POST routes upstream, and a
+/// wrong-method probe should get the same uniform decline, not a 405.
+#[cfg(not(feature = "enterprise"))]
+pub fn mount_enterprise_only_stubs<S: Clone + Send + Sync + 'static>(
+    router: axum::Router<S>,
+) -> axum::Router<S> {
+    use axum::routing::any;
+
+    /// Render the uniform decline, naming the endpoint actually called.
+    async fn stub(uri: axum::http::Uri) -> Response {
+        enterprise_only(uri.path())
+    }
+
+    router
+        // Advanced-guardrails moat (ADR-088): the callable moderation endpoint
+        // + the detection-telemetry read.
+        .route("/v1/moderations", any(stub))
+        .route("/v1/guardrails/outcomes", any(stub))
+        // Agentic-security moat (ADR-016/055): the entire /v1/mcp/* surface
+        // (13 routes + registry extensions on the Enterprise build) — one
+        // wildcard covers them all, present and future.
+        .route("/v1/mcp", any(stub))
+        .route("/v1/mcp/{*rest}", any(stub))
+        // Prompt-management collection surface (list/create — an Enterprise
+        // Console feature; the CE build mounts only /v1/prompts/{reference}*,
+        // which gate in-handler with the same envelope).
+        .route("/v1/prompts", any(stub))
+}
+
 /// `Json<T>` with an OpenAI-shaped **400** on any extraction failure. axum's
 /// stock `Json` rejects malformed bodies as plaintext 400 and *schema* failures
 /// as 422; OpenAI uses 400 for both. This normalizes the status to 400 and
@@ -235,6 +312,73 @@ mod tests {
         assert!(msg.contains("blocked-model"));
         // No tenant id / config state disclosed beyond the model the caller sent.
         assert!(msg.to_lowercase().contains("disabled"));
+    }
+
+    #[cfg(not(feature = "enterprise"))]
+    #[tokio::test]
+    async fn enterprise_only_is_402_with_uniform_envelope_and_upgrade_header() {
+        let resp = enterprise_only("/v1/moderations");
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            resp.headers()
+                .get("x-routeplane-upgrade")
+                .and_then(|v| v.to_str().ok()),
+            Some("https://routeplane.ai")
+        );
+        let v = body_json(resp).await;
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["code"], "enterprise_only");
+        assert_eq!(v["error"]["param"], serde_json::Value::Null);
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.starts_with("/v1/moderations is a Routeplane Enterprise feature"));
+        assert!(msg.contains("Community Edition"));
+        assert!(msg.contains("https://routeplane.ai"));
+    }
+
+    #[cfg(not(feature = "enterprise"))]
+    #[tokio::test]
+    async fn every_enterprise_stub_route_returns_the_uniform_402() {
+        use tower::ServiceExt as _;
+        let app = mount_enterprise_only_stubs(axum::Router::<()>::new()).with_state(());
+
+        // (method, path) pairs across the whole stubbed surface — including a
+        // deep /v1/mcp/* path (the wildcard) and a wrong-method probe (was 405).
+        let probes = [
+            ("POST", "/v1/moderations"),
+            ("GET", "/v1/moderations"),
+            ("GET", "/v1/guardrails/outcomes"),
+            ("GET", "/v1/mcp"),
+            ("POST", "/v1/mcp/tool-call/authorize"),
+            ("GET", "/v1/mcp/hitl/status/abc"),
+            ("GET", "/v1/prompts"),
+            ("POST", "/v1/prompts"),
+        ];
+        for (m, p) in probes {
+            let req = HttpRequest::builder()
+                .method(m)
+                .uri(p)
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::PAYMENT_REQUIRED,
+                "{m} {p} must be the uniform enterprise_only 402"
+            );
+            assert_eq!(
+                resp.headers()
+                    .get("x-routeplane-upgrade")
+                    .and_then(|v| v.to_str().ok()),
+                Some("https://routeplane.ai"),
+                "{m} {p} must carry the upgrade header"
+            );
+            let v = body_json(resp).await;
+            assert_eq!(v["error"]["code"], "enterprise_only", "{m} {p}");
+            assert!(
+                v["error"]["message"].as_str().unwrap().starts_with(p),
+                "{m} {p}: message must name the endpoint called"
+            );
+        }
     }
 
     #[allow(dead_code)]
