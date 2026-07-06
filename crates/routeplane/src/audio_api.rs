@@ -67,6 +67,7 @@ use crate::guardrails::GuardrailConfig;
 use crate::ledger_sink;
 use crate::ledger_sink::{Outcome, UsageTotals};
 use crate::observability::UsageEvent;
+use crate::provenance::stamp_provenance;
 use crate::proxy::AppState;
 use axum::{
     extract::{Json, Multipart, State},
@@ -458,6 +459,8 @@ async fn run_audio_text(
                         apply_warning_header(ok.headers_mut(), &w);
                     }
                 }
+                // Provenance trio (provider + trace/request correlation ids).
+                stamp_provenance(ok.headers_mut(), provider_name, &request_id);
                 return ok;
             }
             Err(e) => {
@@ -861,9 +864,8 @@ pub async fn speech(
                 if let Ok(ct) = HeaderValue::from_str(&audio.content_type) {
                     ok.headers_mut().insert(CONTENT_TYPE, ct);
                 }
-                if let Ok(p) = HeaderValue::from_str(provider_name) {
-                    ok.headers_mut().insert("x-routeplane-provider", p);
-                }
+                // Provenance trio (provider + trace/request correlation ids).
+                stamp_provenance(ok.headers_mut(), provider_name, &request_id);
                 if !guards.is_unlimited() {
                     let adv = guards.advisory(settle_now);
                     if !adv.is_empty() {

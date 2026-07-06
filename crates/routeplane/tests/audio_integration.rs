@@ -140,6 +140,27 @@ async fn openai_transcription_parses_multipart_and_maps_text() {
     );
     let resp = send(authed_router(state), &ct, body, Some("rp_acme")).await;
     assert_eq!(resp.status(), StatusCode::OK);
+    // Provenance trio: provider + trace/request correlation ids, trace-id and
+    // request-id carrying the SAME req_<uuid> value.
+    assert_eq!(
+        resp.headers()
+            .get("x-routeplane-provider")
+            .and_then(|v| v.to_str().ok()),
+        Some("openai")
+    );
+    let trace = resp
+        .headers()
+        .get("x-routeplane-trace-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("x-routeplane-trace-id present on transcription success")
+        .to_string();
+    assert!(trace.starts_with("req_"), "trace id is req_<uuid>: {trace}");
+    assert_eq!(
+        resp.headers()
+            .get("x-routeplane-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some(trace.as_str())
+    );
     let v = body_json(resp).await;
     assert_eq!(v["text"], "the transcribed words");
 }

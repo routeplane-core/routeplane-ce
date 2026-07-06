@@ -381,8 +381,7 @@ impl Provider for GeminiProvider {
         let gemini_req = build_gemini_request(&request);
 
         // Key is in the URL — sanitize any transport error (Task #3d).
-        let resp = self
-            .client
+        let resp = crate::client::streaming_client()
             .post(url)
             .json(&gemini_req)
             .send()

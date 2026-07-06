@@ -358,6 +358,13 @@ async fn contract_streaming_sse() {
         resp.status()
     );
 
+    // Branding contract: the streamed response echoes the serving provider too
+    // (parity with contract_chat_completion_shape).
+    assert!(
+        resp.headers().get("x-routeplane-provider").is_some(),
+        "streamed response must carry the x-routeplane-provider header"
+    );
+
     let ctype = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)

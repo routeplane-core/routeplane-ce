@@ -121,8 +121,7 @@ impl Provider for OpenAICompatProvider {
             body["stream_options"] = json!({ "include_usage": true });
         }
 
-        let resp = self
-            .client
+        let resp = crate::client::streaming_client()
             .post(url)
             .header("Authorization", format!("Bearer {api_key}"))
             .json(&body)

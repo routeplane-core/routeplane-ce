@@ -131,6 +131,27 @@ async fn openai_image_returns_b64_data_and_defaults_model() {
 
     let resp = invoke(state, HeaderMap::new(), payload("a red panda in a forest")).await;
     assert_eq!(resp.status(), StatusCode::OK);
+    // Provenance trio: provider + trace/request correlation ids, trace-id and
+    // request-id carrying the SAME req_<uuid> value.
+    assert_eq!(
+        resp.headers()
+            .get("x-routeplane-provider")
+            .and_then(|v| v.to_str().ok()),
+        Some("openai")
+    );
+    let trace = resp
+        .headers()
+        .get("x-routeplane-trace-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("x-routeplane-trace-id present on image success")
+        .to_string();
+    assert!(trace.starts_with("req_"), "trace id is req_<uuid>: {trace}");
+    assert_eq!(
+        resp.headers()
+            .get("x-routeplane-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some(trace.as_str())
+    );
     let v = body_json(resp).await;
     assert_eq!(v["created"], 1_700_000_000i64);
     assert_eq!(v["data"][0]["b64_json"], "aGVsbG8=");

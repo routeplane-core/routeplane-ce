@@ -24,13 +24,22 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// the CP session cookie). The CORS spec FORBIDS `Access-Control-Allow-Origin: *`
 /// on a credentialed response — the browser silently blocks reading it — so a
 /// wildcard origin breaks every authed page in-browser (curl never enforces this,
-/// which is why a `*` policy passed CLI checks but failed live). We therefore
-/// reflect the request's specific `Origin` (`mirror_request`) and set
-/// `Access-Control-Allow-Credentials: true`, with an EXPLICIT allowed-header list
-/// (wildcard headers are likewise illegal alongside credentials). Origins default
-/// to mirror-any for local dev; set `RP_CORS_ALLOWED_ORIGINS` (comma-separated) in
-/// staging/prod to pin them to the Console's exact origin. The layer is applied
-/// OUTERMOST so the preflight short-circuits before auth/reliability.
+/// which is why a `*` policy passed CLI checks but failed live). We therefore use
+/// a specific-origin allow-list with `Access-Control-Allow-Credentials: true` and
+/// an EXPLICIT allowed/exposed-header list (wildcards are likewise illegal
+/// alongside credentials). The layer is applied OUTERMOST so the preflight
+/// short-circuits before auth/reliability.
+///
+/// Origin policy is FAIL-CLOSED: `RP_CORS_ALLOWED_ORIGINS` (comma-separated)
+/// pins the exact allowed origins; UNSET ⇒ no origin is ever allowed (the
+/// browser blocks every cross-origin read — same-origin/curl/SDK traffic is
+/// unaffected). The bundled Community Edition Console is served from THIS
+/// origin (`RP_CONSOLE_DIR`, single image), so it never needs CORS and works
+/// out of the box under the fail-closed default. Reflect-any-origin — which
+/// pairs an arbitrary attacker origin with `allow-credentials: true` — is
+/// available ONLY behind the explicit `RP_CORS_DEV_MODE=on` escape hatch, for
+/// local dev (e.g. the Console's Vite dev server on its own port); NEVER set
+/// it on an internet-facing deployment.
 fn build_cors_layer() -> CorsLayer {
     let base = CorsLayer::new()
         .allow_methods([
@@ -42,28 +51,89 @@ fn build_cors_layer() -> CorsLayer {
             Method::OPTIONS,
         ])
         // Explicit list (mandatory with credentials): every request header the
-        // Console sends — branded `x-routeplane-*` + the standard auth/body ones.
+        // surface accepts — branded `x-routeplane-*` + the standard auth/body
+        // ones. Each entry corresponds to a real request-header read in the
+        // handlers (proxy.rs / prompts_api.rs / the idempotency layer).
         .allow_headers([
             HeaderName::from_static("content-type"),
             HeaderName::from_static("authorization"),
+            HeaderName::from_static("idempotency-key"),
             HeaderName::from_static("x-routeplane-api-key"),
             HeaderName::from_static("x-routeplane-provider"),
             HeaderName::from_static("x-routeplane-residency"),
             HeaderName::from_static("x-routeplane-strategy"),
             HeaderName::from_static("x-routeplane-trace-id"),
+            HeaderName::from_static("x-routeplane-config"),
+            HeaderName::from_static("x-routeplane-timeout-ms"),
+            HeaderName::from_static("x-routeplane-cache-control"),
+            HeaderName::from_static("x-routeplane-cohort"),
+            HeaderName::from_static("x-routeplane-output-mask"),
+            HeaderName::from_static("x-routeplane-currency"),
+            HeaderName::from_static("x-routeplane-metadata"),
+            HeaderName::from_static("x-routeplane-pii-mode"),
+            HeaderName::from_static("x-routeplane-use-case"),
+            HeaderName::from_static("x-routeplane-idempotency-key"),
+        ])
+        // Response headers a browser client may READ (without this, CORS hides
+        // everything but the safelist): the provenance trio, the cache/hedge/
+        // replay/guardrail/shed markers, and the rate-limit + budget advisory
+        // set. Each entry corresponds to a real response-header insert.
+        .expose_headers([
+            HeaderName::from_static("x-routeplane-provider"),
+            HeaderName::from_static("x-routeplane-trace-id"),
+            HeaderName::from_static("x-routeplane-request-id"),
+            HeaderName::from_static("x-routeplane-cache"),
+            HeaderName::from_static("x-routeplane-cache-degraded"),
+            HeaderName::from_static("x-routeplane-hedged"),
+            HeaderName::from_static("x-routeplane-idempotent-replayed"),
+            HeaderName::from_static("x-routeplane-guardrails"),
+            HeaderName::from_static("x-routeplane-shed"),
+            HeaderName::from_static("x-routeplane-limit-type"),
+            HeaderName::from_static("x-routeplane-limit-scope"),
+            HeaderName::from_static("x-routeplane-limit-policy"),
+            HeaderName::from_static("x-routeplane-budget-warning"),
+            HeaderName::from_static("x-routeplane-budget-remaining"),
+            HeaderName::from_static("x-routeplane-compliance-warning"),
+            HeaderName::from_static("retry-after"),
+            HeaderName::from_static("x-ratelimit-limit-requests"),
+            HeaderName::from_static("x-ratelimit-remaining-requests"),
+            HeaderName::from_static("x-ratelimit-reset-requests"),
+            HeaderName::from_static("x-ratelimit-limit-tokens"),
+            HeaderName::from_static("x-ratelimit-remaining-tokens"),
+            HeaderName::from_static("x-ratelimit-reset-tokens"),
         ])
         .allow_credentials(true);
+    let dev_mode = std::env::var("RP_CORS_DEV_MODE")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "true" | "1"))
+        .unwrap_or(false);
     match std::env::var("RP_CORS_ALLOWED_ORIGINS") {
         Ok(v) if !v.trim().is_empty() => {
             let origins: Vec<HeaderValue> = v
                 .split(',')
                 .filter_map(|s| s.trim().parse::<HeaderValue>().ok())
                 .collect();
+            tracing::info!("CORS: allow-list ({} origin(s))", origins.len());
             base.allow_origin(AllowOrigin::list(origins))
         }
-        // Dev default: reflect the caller's Origin (credential-safe — a specific
-        // origin, never `*`). Pin via the env list in staging/prod.
-        _ => base.allow_origin(AllowOrigin::mirror_request()),
+        // Explicit dev escape hatch ONLY: reflect the caller's Origin
+        // (credential-safe in form — a specific origin, never `*` — but it
+        // allows ANY origin, so it is local/dev-only).
+        _ if dev_mode => {
+            tracing::warn!(
+                "CORS: DEV reflect-any-origin (RP_CORS_DEV_MODE=on — never set on an internet-facing deployment)"
+            );
+            base.allow_origin(AllowOrigin::mirror_request())
+        }
+        // Fail-closed default: an empty allow-list emits no
+        // `Access-Control-Allow-Origin`, so every cross-origin browser read is
+        // blocked until origins are pinned via RP_CORS_ALLOWED_ORIGINS. The
+        // bundled Console is same-origin and unaffected.
+        _ => {
+            tracing::info!(
+                "CORS: closed (no cross-origin access; set RP_CORS_ALLOWED_ORIGINS to pin origins, or RP_CORS_DEV_MODE=on for local dev)"
+            );
+            base.allow_origin(AllowOrigin::list([]))
+        }
     }
 }
 
@@ -94,6 +164,7 @@ mod models_api;
 mod observability;
 mod otel;
 mod prompts_api;
+mod provenance;
 mod providers_api;
 mod proxy;
 mod rerank_api;
@@ -1251,9 +1322,16 @@ async fn main() {
     // Read-only platform-status surface (no auth, like /healthz) for the internal
     // status board. Carries ONLY non-sensitive aggregate operational state — no
     // keys, tenant ids, bodies, or PII. Like `public`, it is NOT wrapped by the
-    // reliability stack — a load-shed must never make a probe fail. (CORS is now
-    // applied app-wide below, so this no longer needs its own scoped layer.)
-    let status_routes = Router::new().route("/status", get(status));
+    // reliability stack — a load-shed must never make a probe fail. A status
+    // board may fetch this cross-origin, and the surface is credential-free and
+    // non-sensitive, so it keeps its own scoped allow-any CORS layer — the
+    // app-wide layer is fail-closed by default and must stay that way for the
+    // credentialed API surface.
+    let status_routes = Router::new().route("/status", get(status)).layer(
+        CorsLayer::new()
+            .allow_origin(tower_http::cors::Any)
+            .allow_methods([axum::http::Method::GET]),
+    );
 
     // CE Console auth (PUBLIC): signup + login live OUTSIDE the auth layer —
     // they CREATE/EXCHANGE the credential. Both argon2-verify on the blocking
@@ -1326,10 +1404,11 @@ async fn main() {
         // preflight `OPTIONS`. Without an app-wide CORS layer that preflight is
         // 401'd by auth (or 405'd where OPTIONS is unrouted) and the browser reports
         // a useless "Failed to fetch" — which is exactly what broke the dashboard's
-        // live pages. Auth is header-based (no cookies), so allow-any-origin carries
-        // no credential-leak / CSRF surface; origins are pinned in prod via
-        // `RP_CORS_ALLOWED_ORIGINS` (comma-separated). This layer is OUTERMOST so the
-        // preflight short-circuits here before auth / reliability ever run.
+        // live pages. Origins are FAIL-CLOSED: pinned via `RP_CORS_ALLOWED_ORIGINS`
+        // (comma-separated), closed when unset (the bundled same-origin Console is
+        // unaffected), reflect-any only behind RP_CORS_DEV_MODE=on (see
+        // `build_cors_layer`). This layer is OUTERMOST so the preflight
+        // short-circuits here before auth / reliability ever run.
         .layer(build_cors_layer())
         .with_state(state);
 

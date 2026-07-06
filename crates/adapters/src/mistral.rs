@@ -104,8 +104,7 @@ impl Provider for MistralProvider {
         // Strip the Anthropic-only cache marker before egress (Mistral rejects it).
         crate::openai::strip_cache_control_for_openai(&mut body);
 
-        let resp = self
-            .client
+        let resp = crate::client::streaming_client()
             .post(url)
             .header("Authorization", format!("Bearer {api_key}"))
             .json(&body)

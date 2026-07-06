@@ -269,6 +269,11 @@ pub enum Outcome {
     Ok,
     ResidencyBlocked,
     AllFailed,
+    /// A stream started (headers + zero-or-more chunks were sent) but ended on
+    /// a mid-stream provider error or idle timeout instead of a clean terminal
+    /// event. Recorded faithfully — logging a truncated answer as `Ok` is the
+    /// exact optimistic-entry failure mode this enum's doc warns against.
+    StreamTruncated,
 }
 
 /// Token usage. In the entry, OUTSIDE the canonical hash payload (001-E).

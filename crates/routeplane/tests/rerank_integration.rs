@@ -135,6 +135,27 @@ async fn cohere_rerank_returns_ranked_results_and_usage() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
+    // Provenance trio: provider + trace/request correlation ids, trace-id and
+    // request-id carrying the SAME req_<uuid> value.
+    assert_eq!(
+        resp.headers()
+            .get("x-routeplane-provider")
+            .and_then(|v| v.to_str().ok()),
+        Some("cohere")
+    );
+    let trace = resp
+        .headers()
+        .get("x-routeplane-trace-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("x-routeplane-trace-id present on rerank success")
+        .to_string();
+    assert!(trace.starts_with("req_"), "trace id is req_<uuid>: {trace}");
+    assert_eq!(
+        resp.headers()
+            .get("x-routeplane-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some(trace.as_str())
+    );
     let v = body_json(resp).await;
     assert_eq!(v["id"], "rerank-1");
     assert_eq!(v["model"], "rerank-v3.5");

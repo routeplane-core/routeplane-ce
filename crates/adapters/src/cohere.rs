@@ -536,8 +536,7 @@ impl Provider for CohereProvider {
         let url = format!("{}/v2/chat", self.base_url);
         let cohere_req = build_cohere_request(&request, true);
 
-        let resp = self
-            .client
+        let resp = crate::client::streaming_client()
             .post(url)
             .header("Authorization", format!("Bearer {api_key}"))
             .json(&cohere_req)

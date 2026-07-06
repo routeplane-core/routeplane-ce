@@ -117,8 +117,7 @@ impl Provider for AzureOpenAiProvider {
         // Strip the Anthropic-only cache marker before egress (Azure rejects it).
         crate::openai::strip_cache_control_for_openai(&mut body);
 
-        let resp = self
-            .client
+        let resp = crate::client::streaming_client()
             .post(&url)
             .header("api-key", api_key)
             .header("content-type", "application/json")

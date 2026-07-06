@@ -127,7 +127,7 @@ async fn openai_embeddings_returns_openai_shaped_list_with_no_cache_header() {
 }
 
 #[tokio::test]
-async fn embeddings_response_carries_request_id_header() {
+async fn embeddings_response_carries_provenance_headers() {
     let server = MockServer::start().await;
     mount_embeddings_ok(&server).await;
     let state = build_state(openai_registry(&server.uri()));
@@ -147,6 +147,20 @@ async fn embeddings_response_carries_request_id_header() {
     assert!(
         rid_str.starts_with("req_"),
         "request-id must start with req_, got: {rid_str}"
+    );
+    // Provenance trio: trace-id carries the SAME value, and the serving
+    // provider is echoed.
+    assert_eq!(
+        resp.headers()
+            .get("x-routeplane-trace-id")
+            .and_then(|v| v.to_str().ok()),
+        Some(rid_str)
+    );
+    assert_eq!(
+        resp.headers()
+            .get("x-routeplane-provider")
+            .and_then(|v| v.to_str().ok()),
+        Some("openai")
     );
 }
 

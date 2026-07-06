@@ -57,6 +57,29 @@ pub fn build_provider_client() -> Client {
         .unwrap_or_default()
 }
 
+/// Shared pooled client for STREAMING provider calls: finite connect timeout,
+/// but NO whole-body timeout — a legitimate SSE generation can exceed any total
+/// cap (the old shared 120s `timeout` deterministically killed every stream
+/// longer than 120s mid-body, which the proxy then masked as a clean end).
+/// Liveness is enforced where it belongs: the proxy bounds the gap BETWEEN
+/// chunks (`ROUTEPLANE_STREAM_IDLE_TIMEOUT_MS`), so a hung upstream still
+/// terminates while a slow-but-alive generation does not.
+pub fn streaming_client() -> Client {
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            let connect_ms = env_ms(
+                "ROUTEPLANE_PROVIDER_CONNECT_TIMEOUT_MS",
+                DEFAULT_CONNECT_TIMEOUT_MS,
+            );
+            Client::builder()
+                .connect_timeout(Duration::from_millis(connect_ms))
+                .build()
+                .unwrap_or_default()
+        })
+        .clone()
+}
+
 /// Convert a transport-level `reqwest::Error` into a typed [`ProviderError`]
 /// whose message can NEVER echo a secret (Task #3d), classified for retry (G2.3).
 ///
