@@ -101,6 +101,8 @@ fn one_message(role: &str, content: &str) -> ChatCompletionRequest {
             cache_control: None,
             tool_calls: None,
             tool_call_id: (role == "tool").then(|| "call_1".to_string()),
+            refusal: None,
+            reasoning_content: None,
         }],
         ..Default::default()
     }

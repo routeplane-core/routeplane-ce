@@ -59,9 +59,12 @@ async fn buffered_request_maps_to_native_generate_content_shape() {
         .await
         .expect("buffered call against the mock succeeds");
 
-    assert_eq!(
-        out.id, "gemini-resp",
-        "synthesized; Gemini has no top-level id"
+    // Synthesized unique id (Gemini has no top-level id) — no longer the old
+    // hardcoded "gemini-resp" constant that broke client dedupe (upstream fidelity fix).
+    assert!(
+        out.id.starts_with("gemini-") && out.id != "gemini-resp",
+        "unique synthesized id, got {}",
+        out.id
     );
     assert_eq!(out.object, "chat.completion");
     assert_eq!(out.model, "gemini-1.5-flash", "echoes the requested model");
@@ -198,7 +201,17 @@ async fn streaming_uses_alt_sse_and_translates_to_openai_chunks() {
 
     // "Nama" + "ste" + finish chunk; end-of-stream is end-of-body.
     assert_eq!(chunks.len(), 3);
-    assert_eq!(chunks[0].id, "gemini-stream");
+    // upstream fidelity fix: a unique per-stream id (not the old "gemini-stream"), SHARED by every
+    // chunk of this one stream.
+    assert!(
+        chunks[0].id.starts_with("gemini-") && chunks[0].id != "gemini-stream",
+        "unique stream id, got {}",
+        chunks[0].id
+    );
+    assert!(
+        chunks.iter().all(|c| c.id == chunks[0].id),
+        "all chunks of one stream share the id"
+    );
     assert_eq!(chunks[0].model, "gemini-1.5-flash");
     assert_eq!(chunks[0].choices[0].delta.content.as_deref(), Some("Nama"));
     assert_eq!(chunks[1].choices[0].delta.content.as_deref(), Some("ste"));

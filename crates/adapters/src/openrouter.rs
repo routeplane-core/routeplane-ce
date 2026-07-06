@@ -198,6 +198,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             temperature: None,
             top_p: None,

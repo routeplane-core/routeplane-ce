@@ -3800,14 +3800,44 @@ async fn chat_completions_pipeline(
                             post_guardrail_text(text, engine, &guard_config, caps)
                         }
                     });
+                    // The response-only passthrough fields (`reasoning_content`,
+                    // `refusal`) are model-generated text and can carry PII/secrets
+                    // exactly like `content` (a reasoning model's chain-of-thought
+                    // especially) — they MUST go through the same egress pass, or
+                    // they become an unmasked DLP side-channel.
+                    for field in [
+                        &mut choice.message.reasoning_content,
+                        &mut choice.message.refusal,
+                    ] {
+                        if let Some(text) = field.take() {
+                            #[cfg(feature = "enterprise")]
+                            {
+                                *field = Some(match &round_trip {
+                                    Some(rt) => rt.borrow().detokenize_text(&text).into_owned(),
+                                    None => post_guardrail_text(&text, engine, &guard_config, caps),
+                                });
+                            }
+                            #[cfg(not(feature = "enterprise"))]
+                            {
+                                *field =
+                                    Some(post_guardrail_text(&text, engine, &guard_config, caps));
+                            }
+                        }
+                    }
                 }
 
                 #[cfg(feature = "enterprise")]
                 if plan.has_checks(Hook::AfterRequest) {
+                    // Aggregate reasoning_content alongside content so the
+                    // AfterRequest output-injection scan sees the full
+                    // model-generated egress text, not just `content`.
                     let output_text: String = response
                         .choices
                         .iter()
-                        .map(|c| c.message.content.as_text())
+                        .flat_map(|c| {
+                            std::iter::once(c.message.content.as_text())
+                                .chain(c.message.reasoning_content.clone())
+                        })
                         .collect::<Vec<_>>()
                         .join("\n");
                     evaluate_guardrail_hook(
@@ -5533,6 +5563,26 @@ async fn stream_chat_completions(
                                     );
                                 }
                             }
+                            // The response-only passthrough deltas
+                            // (`reasoning_content`, `refusal`) are model-generated
+                            // text — a reasoning model's chain-of-thought can carry
+                            // PII/secrets exactly like `content` — so they go
+                            // through the SAME per-chunk masking (same best-effort
+                            // chunk-boundary caveat as content).
+                            for field in [
+                                choice.delta.reasoning_content.as_mut(),
+                                choice.delta.refusal.as_mut(),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            {
+                                *field = post_guardrail_text(
+                                    field,
+                                    &state_for_stream.guardrail_engine,
+                                    &guard_config,
+                                    &capabilities_for_stream,
+                                );
+                            }
                             // Capture distinct tool-call function NAMES for the
                             // post-stream (record-only) tool_policy check. Only
                             // the bounded identifier name — never the arguments.
@@ -6937,6 +6987,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             temperature: None,
             top_p: None,
@@ -7136,6 +7188,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             temperature: None,
             top_p: None,
@@ -7384,6 +7438,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             temperature: None,
             top_p: None,
@@ -7509,6 +7565,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             temperature: None,
             top_p: None,
@@ -7839,6 +7897,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             temperature: None,
             top_p: None,
@@ -7972,6 +8032,8 @@ mod tests {
                     cache_control: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    refusal: None,
+                    reasoning_content: None,
                 },
                 routeplane_types::Message {
                     role: "user".into(),
@@ -7980,6 +8042,8 @@ mod tests {
                     cache_control: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    refusal: None,
+                    reasoning_content: None,
                 },
             ],
             temperature: None,
@@ -8156,6 +8220,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             temperature: None,
             top_p: None,
@@ -8478,6 +8544,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             temperature: None,
             top_p: None,
@@ -8560,6 +8628,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             ..Default::default()
         };
@@ -8717,6 +8787,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             ..Default::default()
         }

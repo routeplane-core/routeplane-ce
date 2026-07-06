@@ -6,8 +6,8 @@ use reqwest::Client;
 use routeplane_types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Choice, ChunkChoice,
     ContentPart, Delta, EmbeddingData, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage,
-    Message, MessageContent, RerankDocument, RerankRequest, RerankResponse, RerankResult,
-    RerankUsage, Tool, ToolCall, Usage,
+    FunctionCallChunk, Message, MessageContent, RerankDocument, RerankRequest, RerankResponse,
+    RerankResult, RerankUsage, Tool, ToolCall, ToolCallChunk, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -62,6 +62,17 @@ struct CohereChatRequest {
     p: Option<f32>, // top_p (Cohere uses `p`)
     #[serde(skip_serializing_if = "Option::is_none")]
     stop_sequences: Option<Vec<String>>,
+    /// Cohere v2 chat supports these at the top level under the SAME names as the
+    /// canonical request, so they thread straight through. Note the value-semantics
+    /// gap: Cohere's penalties are 0.0–1.0 where OpenAI's are -2.0–2.0 — this is a
+    /// raw passthrough (no remap), matching the other adapters. `None` +
+    /// skip_serializing_if ⇒ a request that omits them is byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<i64>,
     /// Tool/function declarations. Cohere v2's `tools` shape is identical to the
     /// canonical OpenAI [`Tool`] (`{type:"function",function:{name,description,
     /// parameters}}`), so we forward the canonical structs verbatim. `None` ⇒
@@ -212,10 +223,17 @@ fn build_cohere_request(request: &ChatCompletionRequest, stream: bool) -> Cohere
     CohereChatRequest {
         model: request.model.clone(),
         messages,
-        max_tokens: request.max_tokens,
+        // `max_completion_tokens` (the o-series replacement) takes precedence
+        // over `max_tokens` — Cohere has one cap, so both map into it.
+        max_tokens: request.max_completion_tokens.or(request.max_tokens),
         temperature: request.temperature,
         p: request.top_p,
         stop_sequences: request.stop.clone(),
+        // Cohere v2 supports these natively — thread them through so they are no
+        // longer silently dropped (upstream fidelity fix). Raw passthrough (see the struct note).
+        presence_penalty: request.presence_penalty,
+        frequency_penalty: request.frequency_penalty,
+        seed: request.seed,
         // Tools: Cohere v2's shape == the canonical Tool, forward verbatim. An
         // absent/empty list stays omitted so a non-tool request is byte-identical.
         tools: cohere_tools(request.tools.as_deref()),
@@ -332,30 +350,185 @@ fn cohere_usage_to_canonical(usage: &Option<CohereUsage>) -> Usage {
     }
 }
 
-/// Parse a Cohere streaming event. Cohere's SSE format uses JSON lines with
-/// `event` types. We care about `content-delta` (text) and `message-end`
-/// (finish + usage). Returns `Ok(None)` for events we don't translate
-/// (keepalive, etc.).
+/// A unique response id per Cohere stream. Cohere's `message-start` DOES carry a
+/// top-level `id` (captured into the stream state below), but if it is ever
+/// absent we synthesize a unique fallback so a streamed response never collapses
+/// to the old shared literal `"cohere-stream"` (which broke client dedupe /
+/// correlation keyed on the completion id, upstream fidelity fix). Monotonic within the process: a
+/// high-resolution timestamp plus an atomic sequence so two streams that start in
+/// the same instant still differ.
+fn cohere_response_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let ts = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or(0)
+        .unsigned_abs();
+    format!("cohere-{ts:x}{seq:x}")
+}
+
+/// Per-stream translation state for Cohere v2. Cohere spreads identity across a
+/// `message-start` event and streams tool-call arguments INCREMENTALLY (like
+/// OpenAI) across `tool-call-start`/`tool-call-delta` events. OpenAI-shaped chunks
+/// want id/model/created on EVERY chunk, so we hold the id (from message-start, or
+/// a synthesized fallback), the model (the request model — Cohere stream events
+/// don't echo it, matching the buffered path's `model: request.model`) and a
+/// created timestamp stamped ONCE per stream (not per-chunk-regenerated, not 0).
+/// `saw_tool_call` drives the synthesized finish_reason: we NEVER emit
+/// `finish_reason:"tool_calls"` on a stream that carried zero tool-call deltas
+/// (that is the exact broken-agent-loop shape upstream fidelity work fixes).
+struct CohereStreamState {
+    id: String,
+    model: String,
+    created: u64,
+    saw_tool_call: bool,
+}
+
+impl CohereStreamState {
+    fn new(model: String) -> Self {
+        Self {
+            // Fallback id until `message-start` supplies the real one.
+            id: cohere_response_id(),
+            model,
+            // Stamped once, here — reused across every chunk of this stream.
+            created: chrono::Utc::now().timestamp() as u64,
+            saw_tool_call: false,
+        }
+    }
+}
+
+/// Build a single-choice tool-call-delta chunk from `state` (id/model/created) and
+/// one [`ToolCallChunk`] fragment — mirrors anthropic.rs's `tool_call_chunk`.
+fn cohere_tool_call_chunk(state: &CohereStreamState, tc: ToolCallChunk) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: state.id.clone(),
+        object: "chat.completion.chunk".to_string(),
+        created: state.created,
+        model: state.model.clone(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: Delta {
+                tool_calls: Some(vec![tc]),
+                ..Delta::default()
+            },
+            finish_reason: None,
+            logprobs: None,
+        }],
+        usage: None,
+        system_fingerprint: None,
+        service_tier: None,
+    }
+}
+
+/// Parse a Cohere v2 streaming event, mutating per-stream `state`. Cohere's SSE
+/// format is JSON lines keyed by a `type` field. We translate:
+/// * `message-start` — capture the response `id` (emits no chunk).
+/// * `content-delta` — a text delta.
+/// * `tool-call-start` — the FIRST fragment of a tool call (id + type + name +
+///   empty arguments), keyed by the event's top-level `index`. Cohere carries the
+///   call under `delta.message.tool_calls` as a SINGLE object (not an array).
+/// * `tool-call-delta` — an incremental `arguments` fragment (no id/type/name),
+///   under `delta.message.tool_calls.function.arguments`. Cohere streams arguments
+///   incrementally (like OpenAI), so we emit fragments per delta.
+/// * `message-end` — finish reason + usage.
 ///
-/// Tool-calling streaming decision: buffered tool calls are complete (above), but
-/// STREAMING tool calls are a documented follow-on. Cohere v2 emits a distinct
-/// `tool-call-start`/`tool-call-delta`/`tool-call-end` event sequence (separate
-/// from `content-delta`); mapping those incrementally to canonical
-/// `Delta.tool_calls` (index-keyed id/name first, then `arguments` fragments) is
-/// the same per-index accumulation done for Anthropic/Gemini in iter-35 and is
-/// tracked as the Cohere streaming-tool-calls follow-on. The buffered path —
-/// which the trait's one-shot fallback also covers — handles tool calls today;
-/// the `TOOL_CALL` finish reason is already mapped here. Until then a STREAMING
-/// tool-call response surfaces text deltas + the mapped finish reason, never a
-/// panic or corrupted chunk.
-fn parse_cohere_stream_event(line: &str) -> Result<Option<ChatCompletionChunk>, ProviderError> {
-    // Cohere emits `event: content-delta\ndata: {"text": "..."}\n\n` etc.
+/// Returns `Ok(None)` for events we don't translate (`tool-call-end`,
+/// `content-start`/`content-end`, `tool-plan-delta`, keepalives). The `id`/`type`/
+/// `name`-first then `arguments`-fragments accumulation is the same per-index shape
+/// OpenAI/Anthropic/Gemini use.
+fn parse_cohere_stream_event(
+    line: &str,
+    state: &mut CohereStreamState,
+) -> Result<Option<ChatCompletionChunk>, ProviderError> {
     // The SseLineBuffer strips the `data:` prefix, so `line` is the JSON body.
     let value: serde_json::Value = serde_json::from_str(line).map_err(|e| {
         ProviderError::translation(format!("Cohere stream parse error: {e}: {line}"))
     })?;
 
-    // content-delta: extract the text delta.
+    let event_type = value.get("type").and_then(|t| t.as_str());
+
+    // message-start: capture the response id (Cohere puts it at the top level).
+    // The model is not echoed per-event, so `state.model` (the request model)
+    // stands. No leading role delta is emitted — byte-identical to the pre-tool
+    // stream, which never emitted one.
+    if event_type == Some("message-start") {
+        if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
+            state.id = id.to_string();
+        }
+        return Ok(None);
+    }
+
+    // tool-call-start: first fragment for a tool call — id + type + name, with the
+    // (empty) arguments that then stream via `tool-call-delta`. The tool-call index
+    // rides the event's top-level `index`; the call itself is a single object under
+    // `delta.message.tool_calls`.
+    if event_type == Some("tool-call-start") {
+        state.saw_tool_call = true;
+        let index = value.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let tc = value
+            .get("delta")
+            .and_then(|d| d.get("message"))
+            .and_then(|m| m.get("tool_calls"));
+        let id = tc
+            .and_then(|t| t.get("id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let function = tc.and_then(|t| t.get("function"));
+        let name = function
+            .and_then(|f| f.get("name"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let arguments = function
+            .and_then(|f| f.get("arguments"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        return Ok(Some(cohere_tool_call_chunk(
+            state,
+            ToolCallChunk {
+                index,
+                id,
+                tool_type: Some("function".to_string()),
+                function: Some(FunctionCallChunk {
+                    name,
+                    arguments: Some(arguments),
+                }),
+            },
+        )));
+    }
+
+    // tool-call-delta: an incremental `arguments` fragment for the open tool call
+    // (no id/type/name on continuation fragments — exactly OpenAI). Keyed by the
+    // event's top-level `index`.
+    if event_type == Some("tool-call-delta") {
+        let index = value.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let arguments = value
+            .get("delta")
+            .and_then(|d| d.get("message"))
+            .and_then(|m| m.get("tool_calls"))
+            .and_then(|t| t.get("function"))
+            .and_then(|f| f.get("arguments"))
+            .and_then(|v| v.as_str());
+        if let Some(arguments) = arguments {
+            return Ok(Some(cohere_tool_call_chunk(
+                state,
+                ToolCallChunk {
+                    index,
+                    id: None,
+                    tool_type: None,
+                    function: Some(FunctionCallChunk {
+                        name: None,
+                        arguments: Some(arguments.to_string()),
+                    }),
+                },
+            )));
+        }
+        return Ok(None);
+    }
+
+    // content-delta: extract the text delta. (`tool-call-end` and other structural
+    // events carry no content/finish and fall through to `Ok(None)`.)
     if let Some(delta) = value
         .get("delta")
         .and_then(|d| d.get("message"))
@@ -365,15 +538,9 @@ fn parse_cohere_stream_event(line: &str) -> Result<Option<ChatCompletionChunk>, 
     {
         if !delta.is_empty() {
             return Ok(Some(ChatCompletionChunk::content_delta(
-                value
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("cohere-stream"),
-                value
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("cohere"),
-                value.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0),
+                state.id.clone(),
+                state.model.clone(),
+                state.created,
                 delta,
             )));
         }
@@ -390,11 +557,20 @@ fn parse_cohere_stream_event(line: &str) -> Result<Option<ChatCompletionChunk>, 
         .or_else(|| value.get("response").and_then(|r| r.get("finish_reason")))
         .and_then(|v| v.as_str())
     {
-        let mapped = match finish {
-            "COMPLETE" | "STOP_SEQUENCE" => "stop",
-            "MAX_TOKENS" => "length",
-            "TOOL_CALL" => "tool_calls",
-            other => other,
+        // OpenAI convention: once tool-call deltas streamed, the finish is
+        // "tool_calls" regardless of Cohere's exact reason wording. The SAFETY
+        // INTERIM lives in the else arm: with NO tool-call deltas we NEVER surface
+        // "tool_calls" — a bare `TOOL_CALL` with zero streamed calls degrades to
+        // "stop" (emitting "tool_calls" with no tool_calls is the upstream fidelity fix bug).
+        let mapped = if state.saw_tool_call {
+            "tool_calls".to_string()
+        } else {
+            match finish {
+                "COMPLETE" | "STOP_SEQUENCE" | "TOOL_CALL" => "stop",
+                "MAX_TOKENS" => "length",
+                other => other,
+            }
+            .to_string()
         };
         // Surface token usage on the terminal chunk (matching the buffered path and
         // every OpenAI-wire adapter's `include_usage`). Cohere v2 reports it under
@@ -407,24 +583,19 @@ fn parse_cohere_stream_event(line: &str) -> Result<Option<ChatCompletionChunk>, 
             .and_then(|u| serde_json::from_value::<CohereUsage>(u.clone()).ok())
             .map(|u| cohere_usage_to_canonical(&Some(u)));
         return Ok(Some(ChatCompletionChunk {
-            id: value
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("cohere-stream")
-                .to_string(),
+            id: state.id.clone(),
             object: "chat.completion.chunk".to_string(),
-            created: value.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0),
-            model: value
-                .get("model")
-                .and_then(|v| v.as_str())
-                .unwrap_or("cohere")
-                .to_string(),
+            created: state.created,
+            model: state.model.clone(),
             choices: vec![ChunkChoice {
                 index: 0,
                 delta: Delta::default(),
-                finish_reason: Some(mapped.to_string()),
+                finish_reason: Some(mapped),
+                logprobs: None,
             }],
             usage,
+            system_fingerprint: None,
+            service_tier: None,
         }));
     }
 
@@ -500,6 +671,8 @@ impl Provider for CohereProvider {
                     // already the JSON-encoded string OpenAI expects).
                     tool_calls,
                     tool_call_id: None,
+                    refusal: None,
+                    reasoning_content: None,
                 },
                 // OpenAI compatibility: whenever tool calls are present the
                 // finish_reason MUST be "tool_calls" (clients branch on it),
@@ -534,6 +707,10 @@ impl Provider for CohereProvider {
         api_key: String,
     ) -> Result<ChunkStream, ProviderError> {
         let url = format!("{}/v2/chat", self.base_url);
+        // Capture the model before the request is borrowed — Cohere stream events
+        // don't echo it, so the per-stream state carries it (matches the buffered
+        // path's `model: request.model`).
+        let model = request.model.clone();
         let cohere_req = build_cohere_request(&request, true);
 
         let resp = crate::client::streaming_client()
@@ -554,12 +731,15 @@ impl Provider for CohereProvider {
             .map(|result| result.map_err(|e| ProviderError::network("cohere", e.to_string())));
 
         Ok(Box::pin(async_stream::try_stream! {
+            // One state (id/model/created stamped once, saw_tool_call) shared across
+            // every event of THIS stream.
+            let mut state = CohereStreamState::new(model);
             let mut stream = std::pin::pin!(stream);
             while let Some(chunk) = stream.next().await {
                 let bytes = chunk?;
                 buf.push(&bytes);
                 while let Some(payload) = buf.next_payload() {
-                    if let Some(parsed) = parse_cohere_stream_event(&payload)? {
+                    if let Some(parsed) = parse_cohere_stream_event(&payload, &mut state)? {
                         yield parsed;
                     }
                 }
@@ -792,6 +972,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             temperature: None,
             top_p: None,
@@ -846,6 +1028,41 @@ mod tests {
         assert_eq!(out.choices[0].finish_reason, "stop"); // COMPLETE → stop
         assert_eq!(out.usage.prompt_tokens, 3);
         assert_eq!(out.usage.completion_tokens, 4);
+    }
+
+    #[tokio::test]
+    async fn max_completion_tokens_maps_to_cap_and_never_leaks_to_cohere() {
+        // Native-dialect contract: `max_completion_tokens` wins over `max_tokens`
+        // for Cohere's single `max_tokens` cap, and the raw OpenAI key is NEVER
+        // forwarded (Cohere rejects unknown OpenAI keys).
+        let server = MockServer::start().await;
+        let resp = serde_json::json!({
+            "id": "cohere-2",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+            "finish_reason": "COMPLETE",
+            "usage": {"tokens": {"input_tokens": 3, "output_tokens": 1}}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v2/chat"))
+            .and(body_partial_json(serde_json::json!({ "max_tokens": 2048 })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(resp))
+            .mount(&server)
+            .await;
+
+        let p = CohereProvider::with_base_url(server.uri());
+        let mut r = req("command-r");
+        r.max_tokens = Some(4096);
+        r.max_completion_tokens = Some(2048); // takes precedence over max_tokens
+        p.chat_completion(r, "sk-cohere".into())
+            .await
+            .expect("mock call succeeds");
+
+        // Replay the recorded body: no raw OpenAI cap field — only the mapped
+        // native cap.
+        let received = &server.received_requests().await.unwrap()[0];
+        let sent: serde_json::Value = serde_json::from_slice(&received.body).unwrap();
+        assert!(sent.get("max_completion_tokens").is_none());
+        assert_eq!(sent["max_tokens"], 2048);
     }
 
     #[tokio::test]
@@ -1030,6 +1247,25 @@ mod tests {
         assert!(v.get("tool_choice").is_none());
         assert!(v["messages"][0].get("tool_calls").is_none());
         assert!(v["messages"][0].get("tool_call_id").is_none());
+        // upstream fidelity fix: the new penalty/seed fields MUST stay omitted when unset
+        // (Option + skip_serializing_if ⇒ byte-identical to the pre-fix wire).
+        assert!(v.get("presence_penalty").is_none());
+        assert!(v.get("frequency_penalty").is_none());
+        assert!(v.get("seed").is_none());
+    }
+
+    #[test]
+    fn request_threads_presence_frequency_penalty_and_seed() {
+        // upstream fidelity fix: Cohere v2 chat supports presence_penalty / frequency_penalty / seed
+        // at the top level; they must be forwarded (were silently dropped).
+        let mut r = req("command-r");
+        r.presence_penalty = Some(0.5);
+        r.frequency_penalty = Some(0.25);
+        r.seed = Some(7);
+        let v = serde_json::to_value(build_cohere_request(&r, false)).unwrap();
+        assert_eq!(v["presence_penalty"], 0.5);
+        assert_eq!(v["frequency_penalty"], 0.25);
+        assert_eq!(v["seed"], 7);
     }
 
     // --- tool / function calling (Cohere v2 /v2/chat) -------------------------
@@ -1105,6 +1341,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             },
             Message {
                 role: "assistant".into(),
@@ -1120,6 +1358,8 @@ mod tests {
                     },
                 }]),
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             },
             Message {
                 role: "tool".into(),
@@ -1128,6 +1368,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: Some("call_abc".into()),
+                refusal: None,
+                reasoning_content: None,
             },
         ];
         let v = serde_json::to_value(build_cohere_request(&r, false)).unwrap();
@@ -1293,6 +1535,8 @@ mod tests {
             cache_control: None,
             tool_calls: None,
             tool_call_id: None,
+            refusal: None,
+            reasoning_content: None,
         }];
         let creq = build_cohere_request(&r, false);
         let v = serde_json::to_value(&creq).unwrap();
@@ -1352,6 +1596,8 @@ mod tests {
             cache_control: None,
             tool_calls: None,
             tool_call_id: None,
+            refusal: None,
+            reasoning_content: None,
         }];
         let out = p
             .chat_completion(r, "sk-cohere".into())
@@ -1360,19 +1606,62 @@ mod tests {
         assert_eq!(out.choices[0].message.content.as_text(), "a cat");
     }
 
+    /// A stream state with known id/model/created so a chunk's identity is
+    /// asserted against fixed values (the real stream captures the id from
+    /// `message-start` and stamps `created` once).
+    fn stream_state() -> CohereStreamState {
+        CohereStreamState {
+            id: "resp-1".into(),
+            model: "command-r".into(),
+            created: 42,
+            saw_tool_call: false,
+        }
+    }
+
     #[test]
     fn stream_event_parses_content_delta() {
-        let line =
-            r#"{"id":"s1","delta":{"message":{"content":{"text":"Hi"}}},"model":"command-r"}"#;
-        let chunk = parse_cohere_stream_event(line).unwrap().unwrap();
+        // The chunk's id/model/created now come from the per-stream STATE (not the
+        // event) — upstream fidelity fix: no more synthetic `id:"cohere-stream"` / `created:0`.
+        let mut state = stream_state();
+        let line = r#"{"type":"content-delta","delta":{"message":{"content":{"text":"Hi"}}}}"#;
+        let chunk = parse_cohere_stream_event(line, &mut state)
+            .unwrap()
+            .unwrap();
         assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("Hi"));
+        assert_eq!(chunk.id, "resp-1");
+        assert_eq!(chunk.model, "command-r");
+        assert_eq!(chunk.created, 42);
     }
 
     #[test]
     fn stream_event_parses_message_end() {
-        let line = r#"{"id":"s1","finish_reason":"COMPLETE","model":"command-r"}"#;
-        let chunk = parse_cohere_stream_event(line).unwrap().unwrap();
+        let mut state = stream_state();
+        let line = r#"{"type":"message-end","delta":{"finish_reason":"COMPLETE"}}"#;
+        let chunk = parse_cohere_stream_event(line, &mut state)
+            .unwrap()
+            .unwrap();
         assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("stop"));
+        // Terminal chunk reuses the stream id (upstream fidelity fix), never the old "cohere-stream".
+        assert_eq!(chunk.id, "resp-1");
+        assert_ne!(chunk.id, "cohere-stream");
+    }
+
+    #[test]
+    fn stream_event_captures_id_from_message_start() {
+        // upstream fidelity fix: message-start carries the top-level response id; capture it into
+        // state so every following chunk reuses it (emits no chunk itself).
+        let mut state = stream_state();
+        let line = r#"{"type":"message-start","id":"c2f3-msg-1","delta":{"message":{"role":"assistant"}}}"#;
+        assert!(parse_cohere_stream_event(line, &mut state)
+            .unwrap()
+            .is_none());
+        assert_eq!(state.id, "c2f3-msg-1");
+        // A following content delta now carries the captured id.
+        let line = r#"{"type":"content-delta","delta":{"message":{"content":{"text":"x"}}}}"#;
+        let chunk = parse_cohere_stream_event(line, &mut state)
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk.id, "c2f3-msg-1");
     }
 
     #[test]
@@ -1381,15 +1670,206 @@ mod tests {
         // `delta` (the same `delta.*` nesting the content path reads). The
         // terminal chunk must fire with the mapped finish_reason AND surface token
         // usage (previously dropped to None).
-        let line = r#"{"type":"message-end","id":"s2","model":"command-r",
+        let mut state = stream_state();
+        let line = r#"{"type":"message-end",
             "delta":{"finish_reason":"MAX_TOKENS",
                      "usage":{"tokens":{"input_tokens":11,"output_tokens":7}}}}"#;
-        let chunk = parse_cohere_stream_event(line).unwrap().unwrap();
+        let chunk = parse_cohere_stream_event(line, &mut state)
+            .unwrap()
+            .unwrap();
         assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("length"));
         let usage = chunk.usage.expect("terminal chunk carries usage");
         assert_eq!(usage.prompt_tokens, 11);
         assert_eq!(usage.completion_tokens, 7);
         assert_eq!(usage.total_tokens, 18);
+    }
+
+    #[test]
+    fn stream_tool_call_start_then_delta_map_to_index_keyed_tool_call_chunks() {
+        // upstream fidelity fix: Cohere v2 streams tool calls as `tool-call-start` (id/type/name +
+        // empty args) then incremental `tool-call-delta` arguments fragments, keyed
+        // by the event's top-level `index`. Both map to canonical ToolCallChunk
+        // deltas (first fragment carries id/type/name; continuations carry only an
+        // `arguments` fragment — exactly OpenAI).
+        let mut state = stream_state();
+
+        let start = r#"{"type":"tool-call-start","index":0,"delta":{"message":{"tool_calls":{
+            "id":"get_weather_x","type":"function",
+            "function":{"name":"get_weather","arguments":""}}}}}"#;
+        let c = parse_cohere_stream_event(start, &mut state)
+            .unwrap()
+            .unwrap();
+        let tc = c.choices[0].delta.tool_calls.as_ref().unwrap();
+        assert_eq!(tc[0].index, 0);
+        assert_eq!(tc[0].id.as_deref(), Some("get_weather_x"));
+        assert_eq!(tc[0].tool_type.as_deref(), Some("function"));
+        let f = tc[0].function.as_ref().unwrap();
+        assert_eq!(f.name.as_deref(), Some("get_weather"));
+        assert_eq!(f.arguments.as_deref(), Some(""));
+        // Tool-call deltas carry no content.
+        assert!(c.choices[0].delta.content.is_none());
+        // saw_tool_call now latched — drives the terminal finish_reason.
+        assert!(state.saw_tool_call);
+
+        let delta = r#"{"type":"tool-call-delta","index":0,"delta":{"message":{"tool_calls":{
+            "function":{"arguments":"{\"city\":\"paris\"}"}}}}}"#;
+        let c = parse_cohere_stream_event(delta, &mut state)
+            .unwrap()
+            .unwrap();
+        let tc = c.choices[0].delta.tool_calls.as_ref().unwrap();
+        assert_eq!(tc[0].index, 0);
+        // Continuation fragment: no id/type/name, only an arguments fragment.
+        assert!(tc[0].id.is_none());
+        assert!(tc[0].tool_type.is_none());
+        let f = tc[0].function.as_ref().unwrap();
+        assert!(f.name.is_none());
+        assert_eq!(f.arguments.as_deref(), Some("{\"city\":\"paris\"}"));
+
+        // Terminal chunk: TOOL_CALL after tool-call deltas → "tool_calls".
+        let end = r#"{"type":"message-end","delta":{"finish_reason":"TOOL_CALL"}}"#;
+        let c = parse_cohere_stream_event(end, &mut state).unwrap().unwrap();
+        assert_eq!(c.choices[0].finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn stream_tool_call_end_emits_no_chunk() {
+        // `tool-call-end` is structural — no canonical chunk (args already streamed).
+        let mut state = stream_state();
+        let line = r#"{"type":"tool-call-end","index":0}"#;
+        assert!(parse_cohere_stream_event(line, &mut state)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn stream_message_end_tool_call_without_deltas_degrades_to_stop() {
+        // upstream fidelity fix SAFETY INTERIM (adversarial): a `message-end` reporting `TOOL_CALL`
+        // with ZERO preceding tool-call events must NEVER surface
+        // finish_reason:"tool_calls" (that's the empty-tool_calls shape that breaks
+        // agent loops). It degrades to "stop".
+        let mut state = stream_state();
+        assert!(!state.saw_tool_call);
+        let line = r#"{"type":"message-end","delta":{"finish_reason":"TOOL_CALL"}}"#;
+        let chunk = parse_cohere_stream_event(line, &mut state)
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_call_end_to_end_shares_id_and_maps_finish() {
+        // streaming tool-call and gen-param end-to-end: a real SSE tool-call stream through
+        // `chat_completion_stream` yields tool-call deltas whose arguments
+        // reassemble, a terminal finish_reason:"tool_calls", ONE id captured from
+        // message-start shared across every chunk (never the literal
+        // "cohere-stream"), and a non-zero `created`.
+        use futures::StreamExt;
+        let server = MockServer::start().await;
+        let events = [
+            serde_json::json!({"type":"message-start","id":"c2f3-msg-1",
+                "delta":{"message":{"role":"assistant"}}}),
+            serde_json::json!({"type":"tool-call-start","index":0,"delta":{"message":{"tool_calls":{
+                "id":"get_weather_x","type":"function",
+                "function":{"name":"get_weather","arguments":""}}}}}),
+            serde_json::json!({"type":"tool-call-delta","index":0,"delta":{"message":{"tool_calls":{
+                "function":{"arguments":"{\"city\":"}}}}}),
+            serde_json::json!({"type":"tool-call-delta","index":0,"delta":{"message":{"tool_calls":{
+                "function":{"arguments":"\"paris\"}"}}}}}),
+            serde_json::json!({"type":"tool-call-end","index":0}),
+            serde_json::json!({"type":"message-end","delta":{"finish_reason":"TOOL_CALL",
+                "usage":{"tokens":{"input_tokens":10,"output_tokens":5}}}}),
+        ];
+        let sse: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        Mock::given(method("POST"))
+            .and(path("/v2/chat"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let p = CohereProvider::with_base_url(server.uri());
+        let mut r = req("command-r-plus");
+        r.tools = Some(vec![weather_tool()]);
+        let stream = p
+            .chat_completion_stream(r, "sk-cohere".into())
+            .await
+            .expect("stream establishment succeeds");
+        let chunks: Vec<_> = stream.map(|c| c.expect("chunk ok")).collect().await;
+
+        // The tool name arrives on the first fragment.
+        let name = chunks
+            .iter()
+            .find_map(|c| {
+                c.choices[0]
+                    .delta
+                    .tool_calls
+                    .as_ref()
+                    .and_then(|t| t[0].function.as_ref())
+                    .and_then(|f| f.name.clone())
+            })
+            .expect("a tool_call name delta");
+        assert_eq!(name, "get_weather");
+        // The incremental arguments fragments reassemble to the whole JSON.
+        let args: String = chunks
+            .iter()
+            .filter_map(|c| c.choices[0].delta.tool_calls.as_ref())
+            .flat_map(|t| t.iter())
+            .filter_map(|tc| tc.function.as_ref().and_then(|f| f.arguments.clone()))
+            .collect();
+        assert_eq!(args, "{\"city\":\"paris\"}");
+        // Terminal finish_reason is "tool_calls".
+        assert_eq!(
+            chunks.last().unwrap().choices[0].finish_reason.as_deref(),
+            Some("tool_calls")
+        );
+        // upstream fidelity fix: one id from message-start, shared by every chunk; non-zero created.
+        assert_eq!(chunks[0].id, "c2f3-msg-1");
+        assert!(chunks.iter().all(|c| c.id == "c2f3-msg-1"));
+        assert!(chunks.iter().all(|c| c.id != "cohere-stream"));
+        assert!(chunks.iter().all(|c| c.created != 0));
+    }
+
+    #[tokio::test]
+    async fn streaming_plain_text_never_yields_tool_calls_finish() {
+        // upstream fidelity fix (b): a text-only stream (no tool-call events) must never surface
+        // finish_reason:"tool_calls".
+        use futures::StreamExt;
+        let server = MockServer::start().await;
+        let events = [
+            serde_json::json!({"type":"message-start","id":"c2f3-msg-2",
+                "delta":{"message":{"role":"assistant"}}}),
+            serde_json::json!({"type":"content-delta",
+                "delta":{"message":{"content":{"text":"Hello"}}}}),
+            serde_json::json!({"type":"message-end","delta":{"finish_reason":"COMPLETE",
+                "usage":{"tokens":{"input_tokens":2,"output_tokens":1}}}}),
+        ];
+        let sse: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        Mock::given(method("POST"))
+            .and(path("/v2/chat"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let p = CohereProvider::with_base_url(server.uri());
+        let stream = p
+            .chat_completion_stream(req("command-r"), "sk-cohere".into())
+            .await
+            .expect("stream establishment succeeds");
+        let chunks: Vec<_> = stream.map(|c| c.expect("chunk ok")).collect().await;
+        assert_eq!(
+            chunks.last().unwrap().choices[0].finish_reason.as_deref(),
+            Some("stop")
+        );
+        assert!(chunks
+            .iter()
+            .all(|c| c.choices[0].finish_reason.as_deref() != Some("tool_calls")));
+        // No chunk carried a tool_calls delta either.
+        assert!(chunks
+            .iter()
+            .all(|c| c.choices[0].delta.tool_calls.is_none()));
     }
 
     // --- rerank (Cohere v2 /v2/rerank) ----------------------------------------

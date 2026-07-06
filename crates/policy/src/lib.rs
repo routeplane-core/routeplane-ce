@@ -60,6 +60,7 @@ const PARAM_ALLOWLIST: &[&str] = &[
     "model",
     "temperature",
     "max_tokens",
+    "max_completion_tokens",
     "top_p",
     "stop",
     "n",
@@ -71,7 +72,14 @@ const PARAM_ALLOWLIST: &[&str] = &[
 /// Request fields addressable by a conditional `when` clause (PRD-006 §4.2c).
 /// `messages` is deliberately NOT addressable (routing must never depend on
 /// prompt content).
-const CONDITION_PARAM_FIELDS: &[&str] = &["model", "user", "stream", "max_tokens", "temperature"];
+const CONDITION_PARAM_FIELDS: &[&str] = &[
+    "model",
+    "user",
+    "stream",
+    "max_tokens",
+    "max_completion_tokens",
+    "temperature",
+];
 
 // --- Cache directive bounds (PRD-007 §5.1 / G2.5) ------------------------------
 
@@ -1496,6 +1504,7 @@ fn param_value(field: &str, req: &ChatCompletionRequest) -> Option<Value> {
         "user" => req.user.clone().map(Value::String),
         "stream" => req.stream.map(Value::Bool),
         "max_tokens" => req.max_tokens.map(Value::from),
+        "max_completion_tokens" => req.max_completion_tokens.map(Value::from),
         "temperature" => req
             .temperature
             .and_then(|t| serde_json::Number::from_f64(t as f64).map(Value::Number)),
@@ -1842,6 +1851,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             temperature: None,
             top_p: None,
@@ -1959,6 +1970,43 @@ mod tests {
         assert_eq!(shaped.max_tokens, Some(1024)); // default filled
         assert_eq!(shaped.temperature, Some(0.2)); // override forced
         assert_eq!(shaped.top_p, None); // dropped
+    }
+
+    #[test]
+    fn max_completion_tokens_is_shapeable_and_condition_readable() {
+        // The reasoning-model cap must be shapeable exactly like `max_tokens`
+        // (else a client-sent max_completion_tokens outflanks an operator cost
+        // cap) and readable by `when` conditions.
+        let cfg = parse(
+            r#"{"targets":[{"provider":"openai","params":{
+                "override":{"max_completion_tokens":100},
+                "drop":["max_tokens"]
+            }}]}"#,
+        )
+        .unwrap();
+        let plan = cfg.evaluate(&Metadata::default(), &req(), &mut Rng::seeded(1));
+        let mut base = req();
+        base.max_tokens = Some(4096);
+        base.max_completion_tokens = Some(100_000);
+        let shaped = plan.targets[0].params.apply(base);
+        assert_eq!(shaped.max_completion_tokens, Some(100)); // override forced
+        assert_eq!(shaped.max_tokens, None); // dropped
+
+        // Condition path: params.max_completion_tokens is addressable and
+        // evaluates (mirrors the params.max_tokens condition contract).
+        let cfg = parse(
+            r#"{"strategy":"conditional",
+                "targets":[{"name":"a","provider":"anthropic"},{"name":"b","provider":"openai"}],
+                "conditions":[{"when":{"params.max_completion_tokens":{"gt":1000}},"target":"a"}],
+                "default_target":"b"}"#,
+        )
+        .unwrap();
+        let mut big = req();
+        big.max_completion_tokens = Some(100_000);
+        let plan = cfg.evaluate(&Metadata::default(), &big, &mut Rng::seeded(1));
+        assert_eq!(plan.targets[0].provider, "anthropic");
+        let plan = cfg.evaluate(&Metadata::default(), &req(), &mut Rng::seeded(1));
+        assert_eq!(plan.targets[0].provider, "openai"); // absent → default branch
     }
 
     #[test]

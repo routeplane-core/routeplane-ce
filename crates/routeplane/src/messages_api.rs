@@ -143,6 +143,8 @@ fn to_canonical_request(req: AnthropicMessagesRequest) -> ChatCompletionRequest 
                     cache_control: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    refusal: None,
+                    reasoning_content: None,
                 });
             }
         }
@@ -156,6 +158,8 @@ fn to_canonical_request(req: AnthropicMessagesRequest) -> ChatCompletionRequest 
             cache_control: None,
             tool_calls: None,
             tool_call_id: None,
+            refusal: None,
+            reasoning_content: None,
         });
     }
 
@@ -629,6 +633,8 @@ mod tests {
                     cache_control: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    refusal: None,
+                    reasoning_content: None,
                 },
                 finish_reason: "stop".into(),
                 logprobs: None,
@@ -687,6 +693,8 @@ mod tests {
                     cache_control: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    refusal: None,
+                    reasoning_content: None,
                 },
                 finish_reason: "length".into(),
                 logprobs: None,

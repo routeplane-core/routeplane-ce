@@ -31,6 +31,17 @@ pub struct ChatCompletionRequest {
     /// previously dropped, which is why Anthropic hardcoded 1024.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// OpenAI's replacement for `max_tokens` on o-series / reasoning models
+    /// (those models 400 on `max_tokens`). The reasoning-model output cap:
+    /// forwarded verbatim to OpenAI-wire providers; native dialects
+    /// (Anthropic/Gemini/Cohere) map it into their single cap, preferring it
+    /// over `max_tokens` when both are set. `None` ⇒ omitted ⇒ byte-identical
+    /// to a pre-field request.
+    // NOTE: forward-compat unknown-field passthrough (a flattened `extra` map)
+    // is deferred to a dedicated ADR — unknown request fields are dropped at
+    // deserialization, the pre-existing safe posture.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u32>,
     /// Stop sequence(s). OpenAI accepts EITHER a bare string (`"\n"`) OR an array
     /// (`["\n", "END"]`); we accept both on the wire (via [`deserialize_stop`]) and
     /// normalize to a list, then serialize it through to each provider that
@@ -187,6 +198,16 @@ pub struct Message {
     /// assistant emitted. `None` ⇒ omitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// OpenAI's `refusal` — set on an assistant message when the model declined
+    /// a structured-outputs request. Passthrough: present only when the upstream
+    /// supplied it, so a response without it stays byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    /// Reasoning text emitted alongside `content` by reasoning models
+    /// (DeepSeek/xAI `reasoning_content`). Passthrough: forwarded to the client
+    /// verbatim when present, omitted otherwise (byte-identical).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 // --- Tool / function-calling types (OpenAI tool calling) -----------------------
@@ -466,6 +487,16 @@ pub struct ChatCompletionChunk {
     /// provider supplies it so observability can record real token counts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// Backend configuration fingerprint on streamed chunks (OpenAI
+    /// `system_fingerprint`). Passthrough: present only when the upstream
+    /// supplied it, absent otherwise (byte-identical). `None` ⇒ omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_fingerprint: Option<String>,
+    /// The service tier that processed the request (OpenAI `service_tier`).
+    /// Passthrough on chunks, mirroring [`ChatCompletionResponse`]. `None` ⇒
+    /// omitted ⇒ byte-identical for providers that don't report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
 /// One choice within a streamed chunk. The incremental content lives in `delta`.
@@ -475,6 +506,12 @@ pub struct ChunkChoice {
     pub delta: Delta,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
+    /// Per-choice log-probability payload on a streamed chunk (OpenAI
+    /// `logprobs`). Carried as a raw [`serde_json::Value`] (same rationale as
+    /// [`Choice::logprobs`]) so the nested shape round-trips verbatim. `None` ⇒
+    /// omitted ⇒ byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<serde_json::Value>,
 }
 
 /// The incremental delta for a streamed choice. All fields are optional because
@@ -492,6 +529,14 @@ pub struct Delta {
     /// ⇒ byte-identical to a content-only delta.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallChunk>>,
+    /// Streamed `refusal` delta (OpenAI structured outputs). Passthrough; `None`
+    /// ⇒ omitted ⇒ byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    /// Streamed reasoning-text delta (DeepSeek/xAI `reasoning_content`).
+    /// Passthrough; `None` ⇒ omitted ⇒ byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 /// One incremental tool-call delta within a streamed [`Delta`]. `index`
@@ -538,10 +583,15 @@ impl ChatCompletionChunk {
                     role: None,
                     content: Some(content.into()),
                     tool_calls: None,
+                    refusal: None,
+                    reasoning_content: None,
                 },
                 finish_reason: None,
+                logprobs: None,
             }],
             usage: None,
+            system_fingerprint: None,
+            service_tier: None,
         }
     }
 }
@@ -1160,6 +1210,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             ..Default::default()
         };
@@ -1172,6 +1224,7 @@ mod tests {
             "logit_bias",
             "service_tier",
             "reasoning_effort",
+            "max_completion_tokens",
         ] {
             assert!(
                 v.get(absent).is_none(),
@@ -1180,6 +1233,101 @@ mod tests {
         }
         // Exactly the two required keys present (no new field leaked in).
         assert_eq!(v.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn request_round_trips_max_completion_tokens() {
+        // The typed max_completion_tokens field must parse and re-serialize
+        // verbatim. Unknown fields (e.g. `prediction`, `store`) are DROPPED at
+        // deserialization — the pre-existing safe posture; forward-compat
+        // passthrough is deferred to a dedicated ADR.
+        let original = serde_json::json!({
+            "model": "o4-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_completion_tokens": 4096,
+            "prediction": {"type": "content", "content": "guess"},
+            "store": true
+        });
+        let parsed: ChatCompletionRequest = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(parsed.max_completion_tokens, Some(4096));
+        let back = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(back["max_completion_tokens"], 4096);
+        // Unknown inbound keys do not survive (dropped at ingress).
+        assert!(back.get("prediction").is_none());
+        assert!(back.get("store").is_none());
+    }
+
+    #[test]
+    fn chunk_round_trips_reasoning_refusal_logprobs_and_fingerprint() {
+        // The streaming passthrough fields must parse out of an OpenAI-wire
+        // chunk and re-serialize verbatim; absent ⇒ omitted (byte-identical).
+        let original = serde_json::json!({
+            "id": "c1",
+            "object": "chat.completion.chunk",
+            "created": 1u64,
+            "model": "deepseek-reasoner",
+            "system_fingerprint": "fp_xyz",
+            "service_tier": "default",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": "42",
+                    "reasoning_content": "thinking ...",
+                    "refusal": null
+                },
+                "finish_reason": null,
+                "logprobs": {"content": []}
+            }]
+        });
+        let parsed: ChatCompletionChunk = serde_json::from_value(original).unwrap();
+        assert_eq!(parsed.system_fingerprint.as_deref(), Some("fp_xyz"));
+        assert_eq!(parsed.service_tier.as_deref(), Some("default"));
+        assert_eq!(
+            parsed.choices[0].delta.reasoning_content.as_deref(),
+            Some("thinking ...")
+        );
+        assert!(parsed.choices[0].delta.refusal.is_none());
+        assert_eq!(
+            parsed.choices[0].logprobs,
+            Some(serde_json::json!({"content": []}))
+        );
+        let back = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(back["system_fingerprint"], "fp_xyz");
+        assert_eq!(
+            back["choices"][0]["delta"]["reasoning_content"],
+            "thinking ..."
+        );
+        assert_eq!(
+            back["choices"][0]["logprobs"],
+            serde_json::json!({"content": []})
+        );
+        // A null/absent refusal stays omitted on the way back out.
+        assert!(back["choices"][0]["delta"].get("refusal").is_none());
+    }
+
+    #[test]
+    fn message_round_trips_refusal_and_reasoning_content() {
+        let original = serde_json::json!({
+            "role": "assistant",
+            "content": "the answer is 42",
+            "refusal": null,
+            "reasoning_content": "step by step ..."
+        });
+        let msg: Message = serde_json::from_value(original).unwrap();
+        assert!(msg.refusal.is_none());
+        assert_eq!(msg.reasoning_content.as_deref(), Some("step by step ..."));
+        let back = serde_json::to_value(&msg).unwrap();
+        assert_eq!(back["reasoning_content"], "step by step ...");
+        assert!(back.get("refusal").is_none());
+        // Absent on input ⇒ absent on output (byte-identical guarantee).
+        let plain: Message = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": "hi"
+        }))
+        .unwrap();
+        let back = serde_json::to_value(&plain).unwrap();
+        assert!(back.get("refusal").is_none());
+        assert!(back.get("reasoning_content").is_none());
     }
 
     #[test]
@@ -1394,10 +1542,15 @@ mod tests {
                     role: Some("assistant".to_string()),
                     content: Some("Hello".to_string()),
                     tool_calls: None,
+                    refusal: None,
+                    reasoning_content: None,
                 },
                 finish_reason: None,
+                logprobs: None,
             }],
             usage: None,
+            system_fingerprint: None,
+            service_tier: None,
         };
         let json = serde_json::to_value(&chunk).unwrap();
         assert_eq!(json["object"], "chat.completion.chunk");
@@ -1405,7 +1558,10 @@ mod tests {
         assert_eq!(json["choices"][0]["delta"]["content"], "Hello");
         // Absent fields must be omitted, matching OpenAI's wire format.
         assert!(json["choices"][0].get("finish_reason").is_none());
+        assert!(json["choices"][0].get("logprobs").is_none());
         assert!(json.get("usage").is_none());
+        assert!(json.get("system_fingerprint").is_none());
+        assert!(json.get("service_tier").is_none());
     }
 
     #[test]
@@ -1419,8 +1575,11 @@ mod tests {
                 index: 0,
                 delta: Delta::default(),
                 finish_reason: Some("stop".to_string()),
+                logprobs: None,
             }],
             usage: None,
+            system_fingerprint: None,
+            service_tier: None,
         };
         let json = serde_json::to_value(&chunk).unwrap();
         assert!(json["choices"][0]["delta"].get("role").is_none());
@@ -1449,6 +1608,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             temperature: None,
             top_p: None,
@@ -1502,6 +1663,8 @@ mod tests {
             cache_control: None,
             tool_calls: None,
             tool_call_id: None,
+            refusal: None,
+            reasoning_content: None,
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert!(v.get("cache_control").is_none());
@@ -2027,6 +2190,8 @@ mod tests {
             cache_control: None,
             tool_calls: None,
             tool_call_id: None,
+            refusal: None,
+            reasoning_content: None,
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["content"], "hi"); // bare string, not an array
@@ -2093,6 +2258,8 @@ mod tests {
             cache_control: None,
             tool_calls: None,
             tool_call_id: None,
+            refusal: None,
+            reasoning_content: None,
         };
         assert_eq!(msg.content.as_text(), "hello");
     }
@@ -2226,6 +2393,8 @@ mod tests {
             cache_control: None,
             tool_calls: None,
             tool_call_id: None,
+            refusal: None,
+            reasoning_content: None,
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert!(v.get("tool_calls").is_none());
@@ -2282,9 +2451,14 @@ mod tests {
             role: None,
             content: Some("hi".into()),
             tool_calls: None,
+            refusal: None,
+            reasoning_content: None,
         };
         let v = serde_json::to_value(&d).unwrap();
         assert!(v.get("tool_calls").is_none());
+        // The new passthrough fields must be omitted too (parity guarantee).
+        assert!(v.get("refusal").is_none());
+        assert!(v.get("reasoning_content").is_none());
     }
 }
 
@@ -2313,7 +2487,7 @@ mod proptests {
         ) -> ChatCompletionRequest {
             ChatCompletionRequest {
                 model,
-                messages: vec![Message { role: role.to_string(), content: content.into(), name, cache_control: None, tool_calls: None, tool_call_id: None }],
+                messages: vec![Message { role: role.to_string(), content: content.into(), name, cache_control: None, tool_calls: None, tool_call_id: None, refusal: None, reasoning_content: None }],
                 temperature, top_p, stream, max_tokens, stop, n,
                 presence_penalty, frequency_penalty, user,
                 tools: None, tool_choice: None, parallel_tool_calls: None,

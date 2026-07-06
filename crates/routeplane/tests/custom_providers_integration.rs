@@ -75,6 +75,8 @@ fn chat_payload(model: &str) -> ChatCompletionRequest {
             cache_control: None,
             tool_calls: None,
             tool_call_id: None,
+            refusal: None,
+            reasoning_content: None,
         }],
         stream: Some(false),
         ..Default::default()

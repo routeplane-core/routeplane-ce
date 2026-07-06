@@ -178,6 +178,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             temperature: None,
             top_p: None,
@@ -251,10 +253,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reasoning_content_field_is_ignored_not_a_parse_error() {
+    async fn reasoning_content_field_passes_through_to_the_client() {
         // deepseek-reasoner returns an extra `reasoning_content` field on the
-        // message; canonical types tolerate unknown fields, so the parse must
-        // succeed and ignore it — never a panic / Translation error.
+        // message; the canonical types carry it as a typed passthrough field, so
+        // it must survive the parse AND reach the client — not be dropped.
         let server = MockServer::start().await;
         let resp = serde_json::json!({
             "id": "chatcmpl-ds-r1",
@@ -282,8 +284,14 @@ mod tests {
         let out = p
             .chat_completion(req("deepseek-reasoner"), "sk-ds-test".into())
             .await
-            .expect("unknown reasoning_content field must not break deserialization");
+            .expect("reasoning_content field must not break deserialization");
         assert_eq!(out.choices[0].message.content.as_text(), "the answer is 42");
+        // PASSTHROUGH: the reasoning text is surfaced on the canonical message,
+        // not silently dropped (response/chunk passthrough).
+        assert_eq!(
+            out.choices[0].message.reasoning_content.as_deref(),
+            Some("let me think step by step ...")
+        );
         assert_eq!(out.usage.total_tokens, 14);
     }
 

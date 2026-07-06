@@ -141,6 +141,8 @@ fn request() -> ChatCompletionRequest {
             cache_control: None,
             tool_calls: None,
             tool_call_id: None,
+            refusal: None,
+            reasoning_content: None,
         }],
         stream: Some(true),
         ..Default::default()
