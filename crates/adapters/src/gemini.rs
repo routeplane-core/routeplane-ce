@@ -1,12 +1,13 @@
 use crate::sse::SseLineBuffer;
+use crate::vision::parse_data_url;
 use crate::{ChunkStream, Provider, ProviderError};
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
 use routeplane_types::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Choice, ChunkChoice, Delta,
-    EmbeddingData, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, FunctionCallChunk, Message,
-    ToolCallChunk, Usage,
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Choice, ChunkChoice,
+    ContentPart, Delta, EmbeddingData, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage,
+    FunctionCallChunk, Message, MessageContent, ToolCallChunk, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -96,6 +97,23 @@ struct GeminiGenerationConfig {
     stopSequences: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     candidateCount: Option<u32>,
+    // Gemini v1beta generationConfig DOES support these (a prior comment wrongly
+    // claimed otherwise) — mapped from the canonical request so they are no longer
+    // silently dropped. All Option + skip_serializing_if ⇒ a request that omits
+    // them serializes byte-identically.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presencePenalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frequencyPenalty: Option<f32>,
+    /// Gemini's boolean log-probs toggle, from the canonical `logprobs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    responseLogprobs: Option<bool>,
+    /// Number of top log-probs to return, from the canonical `top_logprobs`
+    /// (Gemini honours it only when `responseLogprobs` is true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<u32>,
     /// Gemini's JSON-mode toggle, mapped from the canonical OpenAI
     /// `response_format`. Either JSON shape (`{"type":"json_object"}` or
     /// `{"type":"json_schema",...}`) sets `"application/json"`. `None` ⇒ omitted.
@@ -114,11 +132,18 @@ impl GeminiGenerationConfig {
         let (response_mime_type, response_schema) =
             map_response_format(request.response_format.as_ref());
         let cfg = GeminiGenerationConfig {
-            maxOutputTokens: request.max_tokens,
+            // `max_completion_tokens` (the o-series replacement) takes precedence
+            // over `max_tokens` — Gemini has one cap, so both map into it.
+            maxOutputTokens: request.max_completion_tokens.or(request.max_tokens),
             temperature: request.temperature,
             topP: request.top_p,
             stopSequences: request.stop.clone(),
             candidateCount: request.n,
+            seed: request.seed,
+            presencePenalty: request.presence_penalty,
+            frequencyPenalty: request.frequency_penalty,
+            responseLogprobs: request.logprobs,
+            logprobs: request.top_logprobs,
             responseMimeType: response_mime_type,
             responseSchema: response_schema,
         };
@@ -127,6 +152,11 @@ impl GeminiGenerationConfig {
             && cfg.topP.is_none()
             && cfg.stopSequences.is_none()
             && cfg.candidateCount.is_none()
+            && cfg.seed.is_none()
+            && cfg.presencePenalty.is_none()
+            && cfg.frequencyPenalty.is_none()
+            && cfg.responseLogprobs.is_none()
+            && cfg.logprobs.is_none()
             && cfg.responseMimeType.is_none()
             && cfg.responseSchema.is_none()
         {
@@ -187,6 +217,26 @@ struct GeminiUsage {
     promptTokenCount: u32,
     candidatesTokenCount: u32,
     totalTokenCount: u32,
+    /// Context-cache read tokens (Gemini context caching). Absent on responses
+    /// that didn't hit a cached prefix ⇒ `None`. Lifted to `Usage.cached_tokens`.
+    #[serde(default)]
+    cachedContentTokenCount: Option<u32>,
+}
+
+/// A unique response id per Gemini call (Gemini's generateContent gives no
+/// top-level id, and the old hardcoded "gemini-resp"/"gemini-stream" broke
+/// client dedupe/correlation keyed on the completion id). Monotonic within the
+/// process: a high-resolution timestamp plus an atomic sequence so two calls in
+/// the same instant still differ. A stream reuses ONE id across all its chunks.
+fn gemini_response_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let ts = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or(0)
+        .unsigned_abs();
+    format!("gemini-{ts:x}{seq:x}")
 }
 
 // --- Embeddings (batchEmbedContents) ----------------------------------------
@@ -252,7 +302,7 @@ impl Provider for GeminiProvider {
             self.base_url, request.model, api_key
         );
 
-        let gemini_req = build_gemini_request(&request);
+        let gemini_req = build_gemini_request(&request)?;
 
         // The API key is in the URL query string for Gemini, so any error that
         // could carry the URL MUST be sanitized (Task #3d) — never propagate the
@@ -274,89 +324,96 @@ impl Provider for GeminiProvider {
             .await
             .map_err(|e| crate::client::sanitize_transport_error("gemini", e))?;
 
-        let candidate = result
-            .candidates
-            .first()
-            .ok_or("No candidates in Gemini response")?;
-
-        // Walk the candidate's parts: concatenate `text` parts; map each
-        // `functionCall` part → a canonical tool_call. Gemini gives no per-call
-        // id, so we synthesize a stable one from the index (callers correlate by
-        // name + order, and we echo this id back when threading the tool result).
-        let mut response_text = String::new();
-        let mut tool_calls: Vec<routeplane_types::ToolCall> = Vec::new();
-        for (i, part) in candidate.content.parts.iter().enumerate() {
-            if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                response_text.push_str(t);
-            } else if let Some(fc) = part.get("functionCall") {
-                let name = fc
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                // Gemini's `args` is a JSON OBJECT; OpenAI's `arguments` is a
-                // JSON-encoded STRING — re-serialize. Never panic on the request
-                // thread.
-                let arguments = fc
-                    .get("args")
-                    .map(|a| serde_json::to_string(a).unwrap_or_else(|_| "{}".to_string()))
-                    .unwrap_or_else(|| "{}".to_string());
-                tool_calls.push(routeplane_types::ToolCall {
-                    id: format!("call_{i}"),
-                    tool_type: "function".to_string(),
-                    function: routeplane_types::FunctionCall { name, arguments },
-                });
-            }
+        if result.candidates.is_empty() {
+            return Err("No candidates in Gemini response".into());
         }
-        let has_tool_calls = !tool_calls.is_empty();
-        let tool_calls = if has_tool_calls {
-            Some(tool_calls)
-        } else {
-            None
-        };
-        // Gemini's finishReason for a tool call is still "STOP"; OpenAI expects
-        // "tool_calls" when the turn produced tool calls. Otherwise normalize
-        // Gemini's uppercase enum via map_gemini_finish ("STOP" → "stop",
-        // "MAX_TOKENS" → "length", "SAFETY"/"RECITATION" → "content_filter") so the
-        // buffered path emits the same OpenAI-canonical finish_reason as the
-        // streaming path, instead of leaking the raw Gemini enum to clients.
-        let finish_reason = if has_tool_calls {
-            "tool_calls".to_string()
-        } else {
-            map_gemini_finish(&candidate.finishReason)
-        };
+
+        // Fan ALL candidates into choices[] (index = candidate order). Previously
+        // only candidates[0] was surfaced while `candidateCount = n` was billed and
+        // `candidatesTokenCount` sums output across EVERY candidate — the client
+        // paid for N and received 1. Each candidate's parts are walked the same
+        // way: concatenate `text`; map each `functionCall` → a canonical tool_call
+        // (Gemini gives no per-call id, so synthesize a stable `call_<i>`).
+        let choices: Vec<Choice> = result
+            .candidates
+            .iter()
+            .enumerate()
+            .map(|(ci, candidate)| {
+                let mut response_text = String::new();
+                let mut tool_calls: Vec<routeplane_types::ToolCall> = Vec::new();
+                for (i, part) in candidate.content.parts.iter().enumerate() {
+                    if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                        response_text.push_str(t);
+                    } else if let Some(fc) = part.get("functionCall") {
+                        let name = fc
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        // Gemini's `args` is a JSON OBJECT; OpenAI's `arguments` is
+                        // a JSON-encoded STRING — re-serialize. Never panic.
+                        let arguments = fc
+                            .get("args")
+                            .map(|a| serde_json::to_string(a).unwrap_or_else(|_| "{}".to_string()))
+                            .unwrap_or_else(|| "{}".to_string());
+                        tool_calls.push(routeplane_types::ToolCall {
+                            id: format!("call_{i}"),
+                            tool_type: "function".to_string(),
+                            function: routeplane_types::FunctionCall { name, arguments },
+                        });
+                    }
+                }
+                let has_tool_calls = !tool_calls.is_empty();
+                // Gemini's finishReason stays "STOP" for a tool call; OpenAI
+                // expects "tool_calls". Otherwise normalize the uppercase enum via
+                // map_gemini_finish so buffered == streaming canonical form.
+                let finish_reason = if has_tool_calls {
+                    "tool_calls".to_string()
+                } else {
+                    map_gemini_finish(&candidate.finishReason)
+                };
+                Choice {
+                    index: ci as u32,
+                    message: Message {
+                        role: "assistant".to_string(),
+                        content: response_text.into(),
+                        name: None,
+                        cache_control: None,
+                        tool_calls: if has_tool_calls {
+                            Some(tool_calls)
+                        } else {
+                            None
+                        },
+                        tool_call_id: None,
+                        refusal: None,
+                        reasoning_content: None,
+                    },
+                    finish_reason,
+                    // Gemini's generateContent has no per-choice logprobs here.
+                    logprobs: None,
+                }
+            })
+            .collect();
 
         let usage = result.usageMetadata.unwrap_or(GeminiUsage {
             promptTokenCount: 0,
             candidatesTokenCount: 0,
             totalTokenCount: 0,
+            cachedContentTokenCount: None,
         });
 
         Ok(ChatCompletionResponse {
-            id: "gemini-resp".to_string(), // Gemini doesn't provide a top-level ID in this format
+            id: gemini_response_id(),
             object: "chat.completion".to_string(),
             created: chrono::Utc::now().timestamp() as u64,
             model: request.model,
-            choices: vec![Choice {
-                index: 0,
-                message: Message {
-                    role: "assistant".to_string(),
-                    content: response_text.into(),
-                    name: None,
-                    cache_control: None,
-                    tool_calls,
-                    tool_call_id: None,
-                },
-                finish_reason,
-                // Gemini's generateContent has no per-choice logprobs in this
-                // dialect; absent ⇒ omitted (byte-identical to before).
-                logprobs: None,
-            }],
+            choices,
             usage: Usage {
                 prompt_tokens: usage.promptTokenCount,
                 completion_tokens: usage.candidatesTokenCount,
                 total_tokens: usage.totalTokenCount,
-                cached_tokens: None,
+                // Gemini context-cache read tokens (upstream fidelity fix) — was silently dropped.
+                cached_tokens: usage.cachedContentTokenCount,
                 cache_creation_tokens: None,
             },
             // OpenAI-only response metadata Gemini does not report.
@@ -377,8 +434,18 @@ impl Provider for GeminiProvider {
             self.base_url, request.model, api_key
         );
 
+        // Streaming surfaces only the first candidate, so don't request (and get
+        // billed for) N: clamp candidateCount to 1 here. The buffered path fans
+        // ALL candidates out instead (upstream fidelity fix).
+        let mut request = request;
+        if request.n.is_some_and(|n| n > 1) {
+            request.n = Some(1);
+        }
+
         let model = request.model.clone();
-        let gemini_req = build_gemini_request(&request);
+        let gemini_req = build_gemini_request(&request)?;
+        // One unique id shared across every chunk of THIS stream (upstream fidelity fix).
+        let stream_id = gemini_response_id();
 
         // Key is in the URL — sanitize any transport error (Task #3d).
         let resp = crate::client::streaming_client()
@@ -393,7 +460,11 @@ impl Provider for GeminiProvider {
             return Err(crate::client::error_from_response("gemini", resp).await);
         }
 
-        Ok(Box::pin(gemini_sse_to_chunks(resp.bytes_stream(), model)))
+        Ok(Box::pin(gemini_sse_to_chunks(
+            resp.bytes_stream(),
+            model,
+            stream_id,
+        )))
     }
 
     async fn embeddings(
@@ -464,7 +535,47 @@ impl Provider for GeminiProvider {
     }
 }
 
-fn build_gemini_request(request: &ChatCompletionRequest) -> GeminiRequest {
+/// Build the Gemini `contents` parts for a message, preserving IMAGE parts as
+/// Gemini `inlineData` (was: every part stringified via `as_text()`, silently
+/// dropping images so a vision request got a confidently-wrong text-only answer
+/// — upstream fidelity fix). Data-URL images decode to `{inlineData:{mimeType,data}}`; an http(s)
+/// image URL cannot be forwarded as inline bytes and Gemini's `fileData` needs a
+/// GCS/Files-API URI, so we FAIL LOUD with a typed 422 rather than drop it
+/// (PRD-011 FR-10). A plain-text message stays byte-identical (one text part).
+fn gemini_content_parts(content: &MessageContent) -> Result<Vec<Value>, ProviderError> {
+    match content {
+        MessageContent::Text(t) => Ok(vec![gemini_text_part(t.clone())]),
+        MessageContent::Parts(parts) => {
+            let mut out: Vec<Value> = Vec::with_capacity(parts.len());
+            for p in parts {
+                match p {
+                    ContentPart::Text { text, .. } => out.push(gemini_text_part(text.clone())),
+                    ContentPart::ImageUrl { image_url } => {
+                        if let Some(data) = parse_data_url(&image_url.url) {
+                            out.push(json!({
+                                "inlineData": {
+                                    "mimeType": data.media_type,
+                                    "data": data.base64_payload,
+                                }
+                            }));
+                        } else {
+                            return Err(ProviderError::BadRequest {
+                                provider: "gemini".to_string(),
+                                status: 422,
+                                body: "gemini requires inline (data:) image URLs; a plain http(s) \
+                                       image URL cannot be forwarded as inline bytes"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn build_gemini_request(request: &ChatCompletionRequest) -> Result<GeminiRequest, ProviderError> {
     // Lift system messages to `systemInstruction`; map remaining roles to
     // Gemini's two-role model: user -> "user", assistant (and anything else)
     // -> "model". A system message is NO LONGER mis-encoded as a model turn
@@ -523,7 +634,7 @@ fn build_gemini_request(request: &ChatCompletionRequest) -> GeminiRequest {
         }
         contents.push(GeminiContent {
             role: role.to_string(),
-            parts: vec![gemini_text_part(m.content.as_text())],
+            parts: gemini_content_parts(&m.content)?,
         });
     }
 
@@ -536,12 +647,12 @@ fn build_gemini_request(request: &ChatCompletionRequest) -> GeminiRequest {
         })
     };
 
-    GeminiRequest {
+    Ok(GeminiRequest {
         contents,
         systemInstruction: system_instruction,
         generationConfig: GeminiGenerationConfig::from_request(request),
         tools: build_gemini_tools(request.tools.as_deref()),
-    }
+    })
 }
 
 /// Translate canonical OpenAI tool definitions to Gemini's `tools` shape: a
@@ -590,6 +701,7 @@ fn translate_gemini_chunk(
     payload: &str,
     created: u64,
     model: &str,
+    id: &str,
     state: &mut GeminiStreamState,
     out: &mut Vec<ChatCompletionChunk>,
 ) -> Result<(), ProviderError> {
@@ -612,12 +724,7 @@ fn translate_gemini_chunk(
         for part in parts {
             if let Some(text) = part["text"].as_str() {
                 if !text.is_empty() {
-                    out.push(ChatCompletionChunk::content_delta(
-                        "gemini-stream",
-                        model,
-                        created,
-                        text,
-                    ));
+                    out.push(ChatCompletionChunk::content_delta(id, model, created, text));
                 }
             } else if let Some(fc) = part.get("functionCall") {
                 let tool_index = state.next_tool_index;
@@ -636,7 +743,7 @@ fn translate_gemini_chunk(
                     .map(|a| serde_json::to_string(a).unwrap_or_else(|_| "{}".to_string()))
                     .unwrap_or_else(|| "{}".to_string());
                 out.push(ChatCompletionChunk {
-                    id: "gemini-stream".to_string(),
+                    id: id.to_string(),
                     object: "chat.completion.chunk".to_string(),
                     created,
                     model: model.to_string(),
@@ -645,6 +752,8 @@ fn translate_gemini_chunk(
                         delta: Delta {
                             role: None,
                             content: None,
+                            refusal: None,
+                            reasoning_content: None,
                             tool_calls: Some(vec![ToolCallChunk {
                                 index: tool_index,
                                 // Synthesize a stable id (mirrors the buffered
@@ -658,8 +767,11 @@ fn translate_gemini_chunk(
                             }]),
                         },
                         finish_reason: None,
+                        logprobs: None,
                     }],
                     usage: None,
+                    system_fingerprint: None,
+                    service_tier: None,
                 });
             }
         }
@@ -670,7 +782,8 @@ fn translate_gemini_chunk(
             prompt_tokens: u["promptTokenCount"].as_u64().unwrap_or(0) as u32,
             completion_tokens: u["candidatesTokenCount"].as_u64().unwrap_or(0) as u32,
             total_tokens: u["totalTokenCount"].as_u64().unwrap_or(0) as u32,
-            cached_tokens: None,
+            // Gemini context-cache read tokens (upstream fidelity fix) — was silently dropped.
+            cached_tokens: u["cachedContentTokenCount"].as_u64().map(|c| c as u32),
             cache_creation_tokens: None,
         });
         // Gemini's finishReason stays "STOP" for a tool call; OpenAI expects
@@ -681,7 +794,7 @@ fn translate_gemini_chunk(
             map_gemini_finish(finish)
         };
         out.push(ChatCompletionChunk {
-            id: "gemini-stream".to_string(),
+            id: id.to_string(),
             object: "chat.completion.chunk".to_string(),
             created,
             model: model.to_string(),
@@ -689,8 +802,11 @@ fn translate_gemini_chunk(
                 index: 0,
                 delta: Delta::default(),
                 finish_reason: Some(finish_reason),
+                logprobs: None,
             }],
             usage,
+            system_fingerprint: None,
+            service_tier: None,
         });
     }
 
@@ -710,6 +826,7 @@ fn map_gemini_finish(reason: &str) -> String {
 fn gemini_sse_to_chunks(
     mut bytes: impl futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin + Send + 'static,
     model: String,
+    id: String,
 ) -> impl futures::Stream<Item = Result<ChatCompletionChunk, ProviderError>> + Send + 'static {
     async_stream::stream! {
         let created = chrono::Utc::now().timestamp() as u64;
@@ -723,7 +840,7 @@ fn gemini_sse_to_chunks(
             sse.push(&chunk);
             while let Some(payload) = sse.next_payload() {
                 let mut out = Vec::new();
-                match translate_gemini_chunk(&payload, created, &model, &mut state, &mut out) {
+                match translate_gemini_chunk(&payload, created, &model, &id, &mut state, &mut out) {
                     Ok(()) => { for c in out { yield Ok(c); } }
                     Err(e) => { yield Err(e); return; }
                 }
@@ -745,6 +862,8 @@ mod tests {
             cache_control: None,
             tool_calls: None,
             tool_call_id: None,
+            refusal: None,
+            reasoning_content: None,
         }
     }
 
@@ -770,7 +889,8 @@ mod tests {
 
     #[test]
     fn system_message_becomes_system_instruction_not_a_model_turn() {
-        let g = build_gemini_request(&req(vec![msg("system", "be terse"), msg("user", "hello")]));
+        let g = build_gemini_request(&req(vec![msg("system", "be terse"), msg("user", "hello")]))
+            .unwrap();
         let si = g.systemInstruction.expect("systemInstruction set");
         assert_eq!(si.parts[0]["text"], "be terse");
         assert_eq!(g.contents.len(), 1);
@@ -800,7 +920,7 @@ mod tests {
     fn tools_map_to_function_declarations() {
         let mut r = req(vec![msg("user", "weather?")]);
         r.tools = Some(vec![weather_tool()]);
-        let g = build_gemini_request(&r);
+        let g = build_gemini_request(&r).unwrap();
         let v = serde_json::to_value(&g).unwrap();
         // Gemini: tools[0].functionDeclarations[0] carries name/description/parameters.
         let decl = &v["tools"][0]["functionDeclarations"][0];
@@ -850,12 +970,55 @@ mod tests {
         assert_eq!(calls[0].function.arguments, "{\"location\":\"SF\"}");
     }
 
+    #[tokio::test]
+    async fn max_completion_tokens_maps_to_cap_and_never_leaks_to_gemini() {
+        // Native-dialect contract: `max_completion_tokens` wins over `max_tokens`
+        // for Gemini's `generationConfig.maxOutputTokens`, and the raw OpenAI
+        // key is NEVER forwarded (Gemini rejects unknown keys).
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let resp = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "hello"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 1, "totalTokenCount": 4}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-1.5-flash:generateContent"))
+            .and(body_partial_json(serde_json::json!({
+                "generationConfig": {"maxOutputTokens": 2048}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(resp))
+            .mount(&server)
+            .await;
+
+        let provider = GeminiProvider::with_base_url(server.uri());
+        let mut r = req(vec![msg("user", "hi")]);
+        r.max_tokens = Some(4096);
+        r.max_completion_tokens = Some(2048); // takes precedence over max_tokens
+        provider
+            .chat_completion(r, "gk-test".into())
+            .await
+            .expect("mock call succeeds");
+
+        // Replay the recorded body: no raw OpenAI cap field — only the mapped
+        // native cap.
+        let received = &server.received_requests().await.unwrap()[0];
+        let sent: serde_json::Value = serde_json::from_slice(&received.body).unwrap();
+        assert!(sent.get("max_completion_tokens").is_none());
+        assert!(sent.get("max_tokens").is_none());
+    }
+
     #[test]
     fn assistant_role_maps_to_model() {
         let g = build_gemini_request(&req(vec![
             msg("user", "hi"),
             msg("assistant", "hello there"),
-        ]));
+        ]))
+        .unwrap();
         assert_eq!(g.contents[0].role, "user");
         assert_eq!(g.contents[1].role, "model");
     }
@@ -865,7 +1028,7 @@ mod tests {
         let mut r = req(vec![msg("user", "hi")]);
         r.max_tokens = Some(512);
         r.stop = Some(vec!["END".into()]);
-        let g = build_gemini_request(&r);
+        let g = build_gemini_request(&r).unwrap();
         let cfg = g.generationConfig.expect("generationConfig set");
         assert_eq!(cfg.maxOutputTokens, Some(512));
         assert_eq!(cfg.stopSequences.as_deref(), Some(&["END".to_string()][..]));
@@ -873,7 +1036,7 @@ mod tests {
 
     #[test]
     fn no_generation_config_when_all_absent() {
-        let g = build_gemini_request(&req(vec![msg("user", "hi")]));
+        let g = build_gemini_request(&req(vec![msg("user", "hi")])).unwrap();
         assert!(g.generationConfig.is_none());
     }
 
@@ -881,7 +1044,7 @@ mod tests {
     fn response_format_json_object_maps_to_response_mime_type() {
         let mut r = req(vec![msg("user", "hi")]);
         r.response_format = Some(serde_json::json!({"type": "json_object"}));
-        let g = build_gemini_request(&r);
+        let g = build_gemini_request(&r).unwrap();
         let cfg = g.generationConfig.expect("generationConfig set");
         assert_eq!(cfg.responseMimeType.as_deref(), Some("application/json"));
         assert!(cfg.responseSchema.is_none());
@@ -894,7 +1057,7 @@ mod tests {
             "type": "json_schema",
             "json_schema": {"name": "p", "schema": {"type": "object"}}
         }));
-        let g = build_gemini_request(&r);
+        let g = build_gemini_request(&r).unwrap();
         let cfg = g.generationConfig.expect("generationConfig set");
         assert_eq!(cfg.responseMimeType.as_deref(), Some("application/json"));
         assert_eq!(
@@ -904,27 +1067,32 @@ mod tests {
     }
 
     #[test]
-    fn openai_only_request_fields_never_leak_into_gemini_body() {
-        // seed / logit_bias / logprobs / service_tier / reasoning_effort have no
-        // Gemini equivalent and must not appear anywhere in the native body.
+    fn gemini_supported_gen_params_map_and_unsupported_never_leak() {
+        // upstream fidelity fix: seed / presence_penalty / frequency_penalty / logprobs / top_logprobs
+        // DO have v1beta generationConfig equivalents and must map (a prior comment
+        // wrongly claimed otherwise). logit_bias / service_tier / reasoning_effort
+        // have no Gemini equivalent and must NOT appear in the native body.
         let mut r = req(vec![msg("user", "hi")]);
         r.seed = Some(9);
+        r.presence_penalty = Some(0.5);
+        r.frequency_penalty = Some(0.25);
         r.logprobs = Some(true);
+        r.top_logprobs = Some(3);
         r.service_tier = Some("flex".into());
         r.reasoning_effort = Some("high".into());
-        let g = build_gemini_request(&r);
-        let v = serde_json::to_value(&g).unwrap();
-        let flat = v.to_string();
-        for leaked in [
-            "seed",
-            "logit_bias",
-            "logprobs",
-            "service_tier",
-            "reasoning_effort",
-        ] {
+        let g = build_gemini_request(&r).unwrap();
+        let flat = serde_json::to_value(&g).unwrap().to_string();
+        let cfg = g.generationConfig.as_ref().expect("generationConfig set");
+        assert_eq!(cfg.seed, Some(9));
+        assert_eq!(cfg.presencePenalty, Some(0.5));
+        assert_eq!(cfg.frequencyPenalty, Some(0.25));
+        assert_eq!(cfg.responseLogprobs, Some(true));
+        assert_eq!(cfg.logprobs, Some(3));
+
+        for leaked in ["logit_bias", "service_tier", "reasoning_effort"] {
             assert!(
                 !flat.contains(leaked),
-                "{leaked} must not leak to Gemini body"
+                "{leaked} has no Gemini equivalent and must not leak"
             );
         }
     }
@@ -934,7 +1102,15 @@ mod tests {
         let mut out = Vec::new();
         let mut state = GeminiStreamState::default();
         let payload = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"Hi"}]}}]}"#;
-        translate_gemini_chunk(payload, 1, "gemini-1.5-flash", &mut state, &mut out).unwrap();
+        translate_gemini_chunk(
+            payload,
+            1,
+            "gemini-1.5-flash",
+            "test-id",
+            &mut state,
+            &mut out,
+        )
+        .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].choices[0].delta.content.as_deref(), Some("Hi"));
     }
@@ -944,7 +1120,15 @@ mod tests {
         let mut out = Vec::new();
         let mut state = GeminiStreamState::default();
         let payload = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"!"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":3,"totalTokenCount":7}}"#;
-        translate_gemini_chunk(payload, 1, "gemini-1.5-flash", &mut state, &mut out).unwrap();
+        translate_gemini_chunk(
+            payload,
+            1,
+            "gemini-1.5-flash",
+            "test-id",
+            &mut state,
+            &mut out,
+        )
+        .unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].choices[0].delta.content.as_deref(), Some("!"));
         assert_eq!(out[1].choices[0].finish_reason.as_deref(), Some("stop"));
@@ -959,7 +1143,15 @@ mod tests {
         let mut out = Vec::new();
         let mut state = GeminiStreamState::default();
         let payload = r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"location":"SF"}}}]}}]}"#;
-        translate_gemini_chunk(payload, 1, "gemini-1.5-flash", &mut state, &mut out).unwrap();
+        translate_gemini_chunk(
+            payload,
+            1,
+            "gemini-1.5-flash",
+            "test-id",
+            &mut state,
+            &mut out,
+        )
+        .unwrap();
         assert_eq!(out.len(), 1);
         let tc = out[0].choices[0].delta.tool_calls.as_ref().unwrap();
         assert_eq!(tc[0].index, 0);
@@ -979,10 +1171,12 @@ mod tests {
         let mut out = Vec::new();
         let mut state = GeminiStreamState::default();
         let call = r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"f","args":{}}}]}}]}"#;
-        translate_gemini_chunk(call, 1, "gemini-1.5-flash", &mut state, &mut out).unwrap();
+        translate_gemini_chunk(call, 1, "gemini-1.5-flash", "test-id", &mut state, &mut out)
+            .unwrap();
         let mut out2 = Vec::new();
         let fin = r#"{"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":3,"totalTokenCount":7}}"#;
-        translate_gemini_chunk(fin, 1, "gemini-1.5-flash", &mut state, &mut out2).unwrap();
+        translate_gemini_chunk(fin, 1, "gemini-1.5-flash", "test-id", &mut state, &mut out2)
+            .unwrap();
         assert_eq!(
             out2[0].choices[0].finish_reason.as_deref(),
             Some("tool_calls")
@@ -997,12 +1191,16 @@ mod tests {
             "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":4,\"totalTokenCount\":9}}\n\n",
         );
         let byte_stream = stream::iter(vec![Ok(bytes::Bytes::from(raw.to_string()))]);
-        let chunks: Vec<_> = gemini_sse_to_chunks(byte_stream, "gemini-1.5-flash".to_string())
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .map(|r| r.unwrap())
-            .collect();
+        let chunks: Vec<_> = gemini_sse_to_chunks(
+            byte_stream,
+            "gemini-1.5-flash".to_string(),
+            "test-id".to_string(),
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
         assert_eq!(chunks.len(), 2);
         let tc = chunks[0].choices[0].delta.tool_calls.as_ref().unwrap();
         assert_eq!(tc[0].id.as_deref(), Some("call_0"));
@@ -1027,16 +1225,132 @@ mod tests {
             "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"lo\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":4,\"candidatesTokenCount\":2,\"totalTokenCount\":6}}\n\n",
         );
         let byte_stream = stream::iter(vec![Ok(bytes::Bytes::from(raw.to_string()))]);
-        let chunks: Vec<_> = gemini_sse_to_chunks(byte_stream, "gemini-1.5-flash".to_string())
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .map(|r| r.unwrap())
-            .collect();
+        let chunks: Vec<_> = gemini_sse_to_chunks(
+            byte_stream,
+            "gemini-1.5-flash".to_string(),
+            "test-id".to_string(),
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].choices[0].delta.content.as_deref(), Some("Hel"));
         assert_eq!(chunks[1].choices[0].delta.content.as_deref(), Some("lo"));
         assert_eq!(chunks[2].choices[0].finish_reason.as_deref(), Some("stop"));
         assert_eq!(chunks[2].usage.as_ref().unwrap().total_tokens, 6);
+        // upstream fidelity fix: every chunk of one stream shares the id passed in.
+        assert!(chunks.iter().all(|c| c.id == "test-id"));
+    }
+
+    /// upstream fidelity fix — a message with an image part builds a Gemini `inlineData` part
+    /// (mimeType + decoded base64), instead of silently stringifying it away.
+    #[test]
+    fn vision_data_url_becomes_inline_data() {
+        use routeplane_types::{ContentPart, ImageUrlContent, MessageContent};
+        let m = routeplane_types::Message {
+            role: "user".into(),
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "what is this?".into(),
+                    cache_control: None,
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrlContent {
+                        url: "data:image/png;base64,AAECAwQ=".into(),
+                        detail: None,
+                    },
+                },
+            ]),
+            name: None,
+            cache_control: None,
+            tool_calls: None,
+            tool_call_id: None,
+            refusal: None,
+            reasoning_content: None,
+        };
+        let g = build_gemini_request(&req(vec![m])).unwrap();
+        let parts = &g.contents[0].parts;
+        assert_eq!(parts[0]["text"], "what is this?");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[1]["inlineData"]["data"], "AAECAwQ=");
+    }
+
+    /// upstream fidelity fix — a non-inlinable http(s) image URL FAILS LOUD with a typed 422 rather
+    /// than being silently dropped (PRD-011 FR-10).
+    #[test]
+    fn vision_http_url_is_rejected_422() {
+        use routeplane_types::{ContentPart, ImageUrlContent, MessageContent};
+        let m = routeplane_types::Message {
+            role: "user".into(),
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrlContent {
+                    url: "https://example.com/cat.png".into(),
+                    detail: None,
+                },
+            }]),
+            name: None,
+            cache_control: None,
+            tool_calls: None,
+            tool_call_id: None,
+            refusal: None,
+            reasoning_content: None,
+        };
+        match build_gemini_request(&req(vec![m])) {
+            Err(ProviderError::BadRequest { status, .. }) => assert_eq!(status, 422),
+            other => panic!("expected 422 BadRequest, got {other:?}"),
+        }
+    }
+
+    /// upstream fidelity fix — an n>1 response fans ALL candidates into choices[] (was: only [0]
+    /// surfaced while candidatesTokenCount billed for all N). upstream fidelity fix — cached tokens
+    /// lift. upstream fidelity fix — the response id is unique, not the old "gemini-resp".
+    #[tokio::test]
+    async fn multi_candidate_fans_out_and_lifts_cached_tokens() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let resp = serde_json::json!({
+            "candidates": [
+                {"content": {"role": "model", "parts": [{"text": "one"}]}, "finishReason": "STOP"},
+                {"content": {"role": "model", "parts": [{"text": "two"}]}, "finishReason": "STOP"}
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 5, "candidatesTokenCount": 8, "totalTokenCount": 13,
+                "cachedContentTokenCount": 3
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-1.5-flash:generateContent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(resp))
+            .mount(&server)
+            .await;
+
+        let provider = GeminiProvider::with_base_url(server.uri());
+        let mut r = req(vec![msg("user", "hi")]);
+        r.n = Some(2);
+        let out = provider
+            .chat_completion(r, "gk-test".into())
+            .await
+            .expect("mock call succeeds");
+        // Both candidates surfaced, indexed in order.
+        assert_eq!(out.choices.len(), 2);
+        assert_eq!(out.choices[0].index, 0);
+        assert_eq!(out.choices[0].message.content.as_text(), "one");
+        assert_eq!(out.choices[1].index, 1);
+        assert_eq!(out.choices[1].message.content.as_text(), "two");
+        // upstream fidelity fix: cached read tokens are lifted.
+        assert_eq!(out.usage.cached_tokens, Some(3));
+        // upstream fidelity fix: unique id, not the old hardcoded constant.
+        assert!(out.id.starts_with("gemini-"));
+        assert_ne!(out.id, "gemini-resp");
+    }
+
+    /// upstream fidelity fix — two calls yield DIFFERENT response ids.
+    #[test]
+    fn response_ids_are_unique() {
+        assert_ne!(gemini_response_id(), gemini_response_id());
     }
 }

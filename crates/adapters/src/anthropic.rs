@@ -173,7 +173,12 @@ fn build_anthropic_request(request: &ChatCompletionRequest) -> AnthropicRequest 
         messages,
         // max_tokens is threaded from the canonical request; Anthropic REQUIRES
         // it, so an absent value falls back to the documented default (G2.3).
-        max_tokens: request.max_tokens.unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS),
+        // `max_completion_tokens` (the o-series replacement) takes precedence
+        // when set — Anthropic has one cap, so both map into it.
+        max_tokens: request
+            .max_completion_tokens
+            .or(request.max_tokens)
+            .unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS),
         system,
         temperature: request.temperature,
         top_p: request.top_p,
@@ -560,6 +565,8 @@ impl Provider for AnthropicProvider {
                     cache_control: None,
                     tool_calls,
                     tool_call_id: None,
+                    refusal: None,
+                    reasoning_content: None,
                 },
                 finish_reason,
                 // Anthropic does not return OpenAI-style logprobs.
@@ -700,12 +707,14 @@ fn translate_anthropic_event(
                     index: 0,
                     delta: Delta {
                         role: Some("assistant".to_string()),
-                        content: None,
-                        tool_calls: None,
+                        ..Delta::default()
                     },
                     finish_reason: None,
+                    logprobs: None,
                 }],
                 usage: None,
+                system_fingerprint: None,
+                service_tier: None,
             });
             Ok(false)
         }
@@ -815,6 +824,7 @@ fn translate_anthropic_event(
                     index: 0,
                     delta: Delta::default(),
                     finish_reason: stop,
+                    logprobs: None,
                 }],
                 usage: Some(Usage {
                     prompt_tokens,
@@ -823,6 +833,8 @@ fn translate_anthropic_event(
                     cached_tokens: state.cache_read_tokens,
                     cache_creation_tokens: state.cache_creation_tokens,
                 }),
+                system_fingerprint: None,
+                service_tier: None,
             });
             Ok(false)
         }
@@ -842,13 +854,15 @@ fn tool_call_chunk(state: &AnthropicStreamState, tc: ToolCallChunk) -> ChatCompl
         choices: vec![ChunkChoice {
             index: 0,
             delta: Delta {
-                role: None,
-                content: None,
                 tool_calls: Some(vec![tc]),
+                ..Delta::default()
             },
             finish_reason: None,
+            logprobs: None,
         }],
         usage: None,
+        system_fingerprint: None,
+        service_tier: None,
     }
 }
 
@@ -957,6 +971,8 @@ mod tests {
             cache_control: None,
             tool_calls: None,
             tool_call_id: None,
+            refusal: None,
+            reasoning_content: None,
         }
     }
 
@@ -1151,6 +1167,8 @@ mod tests {
             cache_control: None,
             tool_calls: None,
             tool_call_id: None,
+            refusal: None,
+            reasoning_content: None,
         }
     }
 
@@ -1512,6 +1530,47 @@ mod tests {
             .await
             .expect("mock call succeeds");
         assert_eq!(out.choices[0].message.content.as_text(), "hello");
+    }
+
+    #[tokio::test]
+    async fn max_completion_tokens_maps_to_cap_and_never_leaks_to_anthropic() {
+        // Native-dialect contract: `max_completion_tokens` wins over `max_tokens`
+        // for Anthropic's single cap, and the raw OpenAI key is NEVER forwarded
+        // (Anthropic rejects unknown OpenAI keys).
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let resp = serde_json::json!({
+            "id":"msg_1","model":"claude-3-5-sonnet","stop_reason":"end_turn",
+            "content":[{"type":"text","text":"hello"}],
+            "usage":{"input_tokens":5,"output_tokens":1}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(serde_json::json!({"max_tokens": 2048})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(resp))
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::with_base_url(server.uri());
+        let mut r = req(vec![msg("user", "hi")]);
+        r.max_tokens = Some(4096);
+        r.max_completion_tokens = Some(2048); // takes precedence over max_tokens
+        provider
+            .chat_completion(r, "ak-test".into())
+            .await
+            .expect("mock call succeeds");
+
+        // Replay the recorded body: no `max_completion_tokens` key may leak
+        // alongside the mapped cap.
+        let received = &server.received_requests().await.unwrap()[0];
+        let sent: serde_json::Value = serde_json::from_slice(&received.body).unwrap();
+        assert!(
+            sent.get("max_completion_tokens").is_none(),
+            "the OpenAI field itself must not leak; only the mapped max_tokens"
+        );
+        assert_eq!(sent["max_tokens"], 2048);
     }
 
     #[tokio::test]

@@ -87,10 +87,13 @@ pub fn buffered_response_as_stream(
             model: resp.model.clone(),
             choices: vec![ChunkChoice {
                 index: 0,
-                delta: Delta { role: Some("assistant".to_string()), content: Some(content), tool_calls: None },
+                delta: Delta { role: Some("assistant".to_string()), content: Some(content), ..Delta::default() },
                 finish_reason: None,
+                logprobs: None,
             }],
             usage: None,
+            system_fingerprint: None,
+            service_tier: None,
         });
 
         // Final chunk: finish_reason + usage (mirrors include_usage behavior).
@@ -103,8 +106,11 @@ pub fn buffered_response_as_stream(
                 index: 0,
                 delta: Delta::default(),
                 finish_reason: Some(if finish.is_empty() { "stop".to_string() } else { finish }),
+                logprobs: None,
             }],
             usage: Some(resp.usage),
+            system_fingerprint: None,
+            service_tier: None,
         });
     }
 }

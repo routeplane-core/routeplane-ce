@@ -103,7 +103,8 @@ impl CacheKey {
 ///
 /// The tool-calling / structured-output / determinism parameters
 /// (`tools`, `tool_choice`, `parallel_tool_calls`, `response_format`, `seed`,
-/// `logprobs`, `top_logprobs`, `logit_bias`, `service_tier`, `reasoning_effort`)
+/// `logprobs`, `top_logprobs`, `logit_bias`, `service_tier`,
+/// `reasoning_effort`, `max_completion_tokens`)
 /// ARE output-affecting and MUST participate in the digest: two requests with
 /// identical messages/model but a different `response_format` or `tools` array
 /// produce different responses, so they must key distinctly (else request B is
@@ -121,6 +122,12 @@ struct KeyView<'a> {
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    /// Reasoning-model output cap — output-affecting exactly like `max_tokens`
+    /// (a truncated response cached under `max_completion_tokens: 16` must not
+    /// be served to a `max_completion_tokens: 4096` request). Skip-if-none so
+    /// requests that omit it hash byte-identically to gen-0 keys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stop: Option<&'a [String]>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -197,6 +204,7 @@ pub fn exact_key_gen(
         temperature: req.temperature,
         top_p: req.top_p,
         max_tokens: req.max_tokens,
+        max_completion_tokens: req.max_completion_tokens,
         stop: req.stop.as_deref(),
         n: req.n,
         presence_penalty: req.presence_penalty,
@@ -831,6 +839,7 @@ mod tests {
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"logit_bias":{"123":-100.0}}"#,
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"service_tier":"flex"}"#,
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}"#,
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":16}"#,
         ];
         for v in variants {
             let req = req_from_json(v);

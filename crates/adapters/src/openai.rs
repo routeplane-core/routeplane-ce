@@ -97,13 +97,23 @@ pub(crate) fn lift_openai_cached_tokens(v: &mut serde_json::Value) {
     }
 }
 
-/// Strip the `cache_control` prompt-caching marker from every message (and every
-/// message content part) of an outbound OpenAI-dialect request body, in place.
-/// `cache_control` is an Anthropic-only passthrough; OpenAI caches automatically
-/// and rejects unknown fields on some endpoints, so it MUST NOT leak into the
-/// OpenAI request. A request without any `cache_control` is untouched (byte-
-/// identical). Shared by every OpenAI-wire adapter (Azure, self-hosted, Groq,
-/// DeepSeek, Mistral-as-OpenAI) via [`strip_cache_control_for_openai`].
+/// Strip gateway-internal / response-only message fields from an outbound
+/// OpenAI-dialect request body, in place:
+///
+/// - `cache_control` — an Anthropic-only passthrough; OpenAI caches
+///   automatically and rejects unknown fields on some endpoints, so it MUST
+///   NOT leak into the OpenAI request (stripped from messages AND array-form
+///   content parts).
+/// - `reasoning_content` / `refusal` — RESPONSE-only fields on the canonical
+///   `Message`. The standard client pattern appends `choices[0].message` to
+///   the next request's history, which would round-trip them upstream;
+///   DeepSeek documents a **400** when `reasoning_content` appears in input
+///   messages, and other providers likewise reject them as input. Stripped
+///   from every outbound request message.
+///
+/// A request carrying none of these is untouched (byte-identical). Shared by
+/// every OpenAI-wire adapter (Azure, self-hosted, Groq, DeepSeek,
+/// Mistral-as-OpenAI, Bedrock, ...) via [`strip_cache_control_for_openai`].
 pub(crate) fn strip_cache_control_for_openai(body: &mut serde_json::Value) {
     let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return;
@@ -111,6 +121,9 @@ pub(crate) fn strip_cache_control_for_openai(body: &mut serde_json::Value) {
     for msg in messages.iter_mut() {
         if let Some(obj) = msg.as_object_mut() {
             obj.remove("cache_control");
+            // Response-only fields must never be echoed upstream as input.
+            obj.remove("reasoning_content");
+            obj.remove("refusal");
         }
         // Strip from array-form content parts too (a per-part marker).
         if let Some(parts) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
@@ -647,6 +660,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             temperature: None,
             top_p: None,
@@ -728,6 +743,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             seed: Some(42),
             response_format: Some(serde_json::json!({
@@ -749,6 +766,62 @@ mod tests {
         assert_eq!(out.system_fingerprint.as_deref(), Some("fp_zzz"));
         assert_eq!(out.service_tier.as_deref(), Some("default"));
         assert!(out.choices[0].logprobs.is_some());
+    }
+
+    // --- request passthrough: max_completion_tokens -----------------------------
+
+    #[tokio::test]
+    async fn max_completion_tokens_reaches_wire_verbatim() {
+        // OpenAI-wire contract: the typed `max_completion_tokens` must reach the
+        // upstream body verbatim (the whole typed request is serialized — this
+        // test pins it). Unknown caller-supplied fields are dropped at
+        // deserialization (forward-compat passthrough deferred to a dedicated ADR).
+        use routeplane_types::Message;
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let resp = serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1700000000u64,
+            "model": "o4-mini",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({
+                "max_completion_tokens": 4096
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(resp))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAIProvider::with_base_url(server.uri());
+        let req = ChatCompletionRequest {
+            model: "o4-mini".into(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: "hi".into(),
+                name: None,
+                cache_control: None,
+                tool_calls: None,
+                tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
+            }],
+            max_completion_tokens: Some(4096),
+            ..Default::default()
+        };
+        provider
+            .chat_completion(req, "sk-test".into())
+            .await
+            .expect("mock call succeeds");
     }
 
     // --- tool / function calling (verbatim OpenAI passthrough) -----------------
@@ -812,6 +885,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             temperature: None,
             top_p: None,
@@ -889,6 +964,50 @@ mod tests {
         );
     }
 
+    // --- streaming passthrough: reasoning_content / refusal / logprobs ---------
+
+    #[tokio::test]
+    async fn streaming_passes_reasoning_refusal_and_logprobs_through() {
+        // Reasoning-model / structured-outputs streaming fields must ride the
+        // shared OpenAI SSE translation to the canonical chunks untouched — not
+        // be dropped by the typed parse.
+        let raw = concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"deepseek-reasoner\",\"system_fingerprint\":\"fp_x\",\"service_tier\":\"default\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"thinking \"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"deepseek-reasoner\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"42\"},\"finish_reason\":null,\"logprobs\":{\"content\":[]}}]}\n\n",
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"deepseek-reasoner\",\"choices\":[{\"index\":0,\"delta\":{\"refusal\":\"I cannot\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let byte_stream = stream::iter(vec![Ok(bytes::Bytes::from(raw.to_string()))]);
+        let chunks: Vec<_> = openai_sse_to_chunks(byte_stream)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(
+            chunks[0].choices[0].delta.reasoning_content.as_deref(),
+            Some("thinking ")
+        );
+        assert_eq!(chunks[0].system_fingerprint.as_deref(), Some("fp_x"));
+        assert_eq!(chunks[0].service_tier.as_deref(), Some("default"));
+        assert_eq!(
+            chunks[1].choices[0].logprobs,
+            Some(serde_json::json!({"content": []}))
+        );
+        assert_eq!(
+            chunks[2].choices[0].delta.refusal.as_deref(),
+            Some("I cannot")
+        );
+        // Re-serialization keeps the fields (client sees them verbatim) and a
+        // chunk WITHOUT them stays clean (byte-identical parity).
+        let v = serde_json::to_value(&chunks[0]).unwrap();
+        assert_eq!(v["choices"][0]["delta"]["reasoning_content"], "thinking ");
+        let v1 = serde_json::to_value(&chunks[1]).unwrap();
+        assert!(v1.get("system_fingerprint").is_none());
+        assert!(v1["choices"][0]["delta"].get("reasoning_content").is_none());
+    }
+
     // --- prompt-caching: strip cache_control on egress + surface cached_tokens --
 
     #[test]
@@ -915,6 +1034,96 @@ mod tests {
         let before = clean.clone();
         strip_cache_control_for_openai(&mut clean);
         assert_eq!(clean, before);
+    }
+
+    #[tokio::test]
+    async fn reasoning_content_and_refusal_are_not_echoed_upstream_in_request_messages() {
+        // The standard client pattern appends `choices[0].message` (which may
+        // carry the response-only `reasoning_content`/`refusal`) to the next
+        // request's history. Those fields must be stripped from outbound request
+        // messages — DeepSeek 400s when `reasoning_content` appears in input.
+        use routeplane_types::Message;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let resp = serde_json::json!({
+            "id": "chatcmpl-2",
+            "object": "chat.completion",
+            "created": 1700000000u64,
+            "model": "deepseek-reasoner",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(resp))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAIProvider::with_base_url(server.uri());
+        // Follow-up turn: history includes a prior assistant message that came
+        // back from a reasoning model with reasoning_content + refusal set.
+        let req = ChatCompletionRequest {
+            model: "deepseek-reasoner".into(),
+            messages: vec![
+                Message {
+                    role: "user".into(),
+                    content: "solve it".into(),
+                    name: None,
+                    cache_control: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    refusal: None,
+                    reasoning_content: None,
+                },
+                Message {
+                    role: "assistant".into(),
+                    content: "42".into(),
+                    name: None,
+                    cache_control: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    refusal: Some("nope".into()),
+                    reasoning_content: Some("chain of thought ...".into()),
+                },
+                Message {
+                    role: "user".into(),
+                    content: "why?".into(),
+                    name: None,
+                    cache_control: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    refusal: None,
+                    reasoning_content: None,
+                },
+            ],
+            ..Default::default()
+        };
+        provider
+            .chat_completion(req, "sk-test".into())
+            .await
+            .expect("mock call succeeds");
+
+        // Replay the recorded body: no request message may carry the
+        // response-only fields.
+        let received = &server.received_requests().await.unwrap()[0];
+        let sent: serde_json::Value = serde_json::from_slice(&received.body).unwrap();
+        for m in sent["messages"].as_array().unwrap() {
+            assert!(
+                m.get("reasoning_content").is_none(),
+                "reasoning_content must be stripped from outbound request messages"
+            );
+            assert!(
+                m.get("refusal").is_none(),
+                "refusal must be stripped from outbound request messages"
+            );
+        }
+        assert_eq!(sent["messages"][1]["content"], "42");
     }
 
     #[tokio::test]
@@ -961,6 +1170,8 @@ mod tests {
                 cache_control: Some(serde_json::json!({"type": "ephemeral"})),
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             temperature: None,
             top_p: None,
@@ -1018,6 +1229,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             temperature: None,
             top_p: None,
@@ -1752,6 +1965,8 @@ mod tests {
                 cache_control: None,
                 tool_calls: None,
                 tool_call_id: None,
+                refusal: None,
+                reasoning_content: None,
             }],
             temperature: None,
             top_p: None,
