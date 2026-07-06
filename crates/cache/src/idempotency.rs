@@ -109,6 +109,15 @@ pub struct StoredResponse {
     pub content_type: String,
     pub body: Bytes,
     pub fingerprint: [u8; 32],
+    /// Provenance of the ORIGINAL dispatch: the serving provider and the
+    /// gateway request id, re-stamped on replay so a replayed response keeps
+    /// the provenance headers of the response it repeats. Additive +
+    /// default-tolerant: `None` means "stored without provenance" (an older
+    /// entry) and a replay simply omits the re-stamp — a serializing follow-on
+    /// (e.g. a Redis backend) MUST keep these `#[serde(default)]` so
+    /// pre-provenance snapshots still deserialize.
+    pub provider: Option<String>,
+    pub request_id: Option<String>,
     created_at_ms: u64,
     ttl_ms: u64,
 }
@@ -297,6 +306,9 @@ impl IdempotencyStore {
     /// gone (expired/reclaimed) or the body is oversize — in which case the
     /// response is still returned to the caller but a future request re-runs.
     /// Only ever called on a 2xx (failures are never cached — see [`release`]).
+    /// `provider`/`request_id` carry the original dispatch's provenance for
+    /// re-stamping on replay (`None` ⇒ the replay omits it).
+    #[allow(clippy::too_many_arguments)]
     pub fn store(
         &self,
         key: &IdempotencyKey,
@@ -304,6 +316,8 @@ impl IdempotencyStore {
         content_type: String,
         body: Bytes,
         fingerprint: [u8; 32],
+        provider: Option<String>,
+        request_id: Option<String>,
     ) -> bool {
         if body.len() > IDEMP_MAX_BODY_BYTES {
             // Oversize: drop the reservation so a retry can re-run rather than 409.
@@ -328,6 +342,8 @@ impl IdempotencyStore {
                     content_type: content_type.clone(),
                     body: body.clone(),
                     fingerprint,
+                    provider: provider.clone(),
+                    request_id: request_id.clone(),
                     created_at_ms: now,
                     ttl_ms: self.ttl_ms,
                 }),
@@ -482,21 +498,25 @@ mod tests {
         // Concurrent identical request while in-flight → InFlight (409).
         assert!(matches!(store.reserve(&key, f), ReserveOutcome::InFlight));
 
-        // Store the completed 2xx.
+        // Store the completed 2xx (with the original dispatch's provenance).
         assert!(store.store(
             &key,
             200,
             "application/json".into(),
             Bytes::from_static(b"{\"ok\":1}"),
-            f
+            f,
+            Some("openai".into()),
+            Some("req_orig".into()),
         ));
 
-        // Re-sent same key + same body → Replay (verbatim).
+        // Re-sent same key + same body → Replay (verbatim, provenance intact).
         match store.reserve(&key, f) {
             ReserveOutcome::Replay(r) => {
                 assert_eq!(r.status, 200);
                 assert_eq!(&r.body[..], b"{\"ok\":1}");
                 assert_eq!(r.content_type, "application/json");
+                assert_eq!(r.provider.as_deref(), Some("openai"));
+                assert_eq!(r.request_id.as_deref(), Some("req_orig"));
             }
             other => panic!("expected Replay, got {other:?}"),
         }
@@ -519,6 +539,8 @@ mod tests {
             "application/json".into(),
             Bytes::from_static(b"x"),
             fp("body-A"),
+            None,
+            None,
         );
         // Same key, DIFFERENT body fingerprint → 422-class.
         assert!(matches!(
@@ -555,6 +577,8 @@ mod tests {
             "application/json".into(),
             Bytes::from_static(b"x"),
             f,
+            None,
+            None,
         );
         // Within TTL (60s from t=1000): replay.
         clock.set(60_000);
@@ -595,6 +619,8 @@ mod tests {
             "application/json".into(),
             Bytes::from_static(b"A"),
             f,
+            None,
+            None,
         );
         // Tenant A replays.
         assert!(matches!(
@@ -614,7 +640,7 @@ mod tests {
         let f = fp("body");
         assert!(matches!(store.reserve(&key, f), ReserveOutcome::Reserved));
         let big = Bytes::from(vec![b'x'; IDEMP_MAX_BODY_BYTES + 1]);
-        assert!(!store.store(&key, 200, "application/json".into(), big, f));
+        assert!(!store.store(&key, 200, "application/json".into(), big, f, None, None));
         // Reservation released → a retry re-runs rather than 409.
         assert!(matches!(store.reserve(&key, f), ReserveOutcome::Reserved));
     }
@@ -636,6 +662,8 @@ mod tests {
                     "application/json".into(),
                     Bytes::from_static(b"x"),
                     f,
+                    None,
+                    None,
                 );
             }
         }
@@ -661,6 +689,8 @@ mod tests {
             "application/json".into(),
             Bytes::from_static(b"x"),
             f,
+            None,
+            None,
         );
         // A late release (e.g. a dropped loser) must not delete the stored response.
         store.release(&key);

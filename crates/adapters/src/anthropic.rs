@@ -609,8 +609,7 @@ impl Provider for AnthropicProvider {
         let mut body = serde_json::to_value(&anthropic_req)?;
         body["stream"] = json!(true);
 
-        let resp = self
-            .client
+        let resp = crate::client::streaming_client()
             .post(url)
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")

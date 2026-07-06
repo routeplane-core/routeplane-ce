@@ -187,6 +187,71 @@ async fn same_key_same_body_replays_with_single_dispatch() {
     assert_eq!(state.idempotency.replays(), 1);
 }
 
+// --- replay re-stamps the ORIGINAL provenance (provider + request id) -----------
+
+#[tokio::test]
+async fn replay_carries_original_provenance_headers() {
+    let server = MockServer::start().await;
+    mount_openai_counting(&server).await;
+    let state = build_state(&server.uri());
+
+    let first = invoke(
+        state.clone(),
+        "t_a",
+        headers_with_key(Some("idem-prov")),
+        payload("hi", false),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_provider = first
+        .headers()
+        .get("x-routeplane-provider")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let first_request_id = first
+        .headers()
+        .get("x-routeplane-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    assert_eq!(first_provider.as_deref(), Some("openai"));
+    assert!(
+        first_request_id.is_some(),
+        "a success response carries a request id"
+    );
+    let _ = axum::body::to_bytes(first.into_body(), 1 << 20).await;
+
+    let second = invoke(
+        state.clone(),
+        "t_a",
+        headers_with_key(Some("idem-prov")),
+        payload("hi", false),
+    )
+    .await;
+    assert_eq!(
+        second
+            .headers()
+            .get("x-routeplane-idempotent-replayed")
+            .and_then(|v| v.to_str().ok()),
+        Some("true")
+    );
+    // The replay carries the ORIGINAL dispatch's provenance — the same provider
+    // and the same request id as the first response, not a fresh req_<uuid>.
+    assert_eq!(
+        second
+            .headers()
+            .get("x-routeplane-provider")
+            .and_then(|v| v.to_str().ok()),
+        first_provider.as_deref()
+    );
+    assert_eq!(
+        second
+            .headers()
+            .get("x-routeplane-request-id")
+            .and_then(|v| v.to_str().ok()),
+        first_request_id.as_deref()
+    );
+}
+
 // --- same key + DIFFERENT body → 422 -------------------------------------------
 
 #[tokio::test]

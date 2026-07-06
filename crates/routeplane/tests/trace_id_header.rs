@@ -45,6 +45,21 @@ async fn trace_id_header_present_on_buffered_success() {
         "request-id and trace-id carry the same value"
     );
 
+    // Branding contract: a BUFFERED success must echo which provider served it —
+    // parity with the streaming path, which has always set
+    // `x-routeplane-provider` (the live acceptance suite asserts this on real
+    // completions).
+    let provider = resp
+        .headers()
+        .get("x-routeplane-provider")
+        .expect("x-routeplane-provider header present on a buffered response")
+        .to_str()
+        .expect("provider name is valid ascii");
+    assert!(
+        !provider.is_empty(),
+        "provider header must name the serving provider"
+    );
+
     // Drain the body (hygiene).
     let _ = to_bytes(resp.into_body(), usize::MAX).await;
 }

@@ -24,6 +24,7 @@ use crate::guardrails::GuardrailConfig;
 use crate::ledger_sink;
 use crate::ledger_sink::{Outcome, UsageTotals};
 use crate::observability::UsageEvent;
+use crate::provenance::stamp_provenance;
 use crate::proxy::AppState;
 use axum::{
     extract::{Json, State},
@@ -339,9 +340,8 @@ pub async fn embeddings(
                         apply_warning_header(ok.headers_mut(), &w);
                     }
                 }
-                if let Ok(v) = HeaderValue::from_str(&request_id) {
-                    ok.headers_mut().insert("x-routeplane-request-id", v);
-                }
+                // Provenance trio (provider + trace/request correlation ids).
+                stamp_provenance(ok.headers_mut(), provider_name, &request_id);
                 return ok;
             }
             Err(e) => {

@@ -10,6 +10,7 @@ use crate::ledger_sink;
 // handle under `enterprise`, the uninhabited CE slot otherwise.
 use crate::ledger_sink::{LedgerHandle, Outcome, SecurityCategory, SecurityOutcome, UsageTotals};
 use crate::observability::{ObservabilityEngine, UsageEvent};
+use crate::provenance::{stamp_provenance, PROVIDER_HEADER, REQUEST_ID_HEADER, TRACE_ID_HEADER};
 #[cfg(feature = "enterprise")]
 use crate::webhook_client::ReqwestWebhookClient;
 use axum::{
@@ -1132,17 +1133,9 @@ const STREAM_OBSERVE_CAP_BYTES: usize = 256 * 1024;
 /// byte-identical when `hedge` is unconfigured.
 const HEDGED_HEADER: &str = "x-routeplane-hedged";
 
-/// Response header carrying the per-request correlation id (`req_<uuid>`) so a
-/// client can attach feedback to this exact trace via `POST /v1/feedback`
-/// (Portkey/Helicone parity). Additive: the golden/A-B parity corpus has no such
-/// header, and the parity check is `is_additive_superset` (baseline ⊆ current),
-/// so a NEW header never regresses parity even though its value is per-request.
-const TRACE_ID_HEADER: &str = "x-routeplane-trace-id";
-/// PRD-009 (#160), re-added atop #170: the same per-request correlation id is also
-/// emitted as `x-routeplane-request-id` — the header dev shipped before #170
-/// standardised on `trace-id`. Both carry the identical `req_<uuid>` value, so a
-/// client using either name correlates the same request. Additive (parity-safe).
-const REQUEST_ID_HEADER: &str = "x-routeplane-request-id";
+// The provenance-header trio (provider/trace-id/request-id) — consts and the
+// shared `stamp_provenance` stamp live in `crate::provenance` and are imported
+// above, so every serving endpoint emits the same contract.
 
 // --- Exact-match cache surface (G2.5 / PRD-007) -------------------------------
 
@@ -2499,12 +2492,27 @@ async fn chat_completions_core_idem(
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("application/json")
                     .to_string();
+                // Persist the provenance the pipeline stamped on this success,
+                // so a replay re-stamps the ORIGINAL serving provider + request
+                // id instead of losing them.
+                let stored_provider = parts
+                    .headers
+                    .get(PROVIDER_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let stored_request_id = parts
+                    .headers
+                    .get(REQUEST_ID_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
                 state.idempotency.store(
                     &idem_key,
                     parts.status.as_u16(),
                     content_type,
                     bytes.clone(),
                     fingerprint,
+                    stored_provider,
+                    stored_request_id,
                 );
                 // Re-assemble the identical response from the buffered parts.
                 Response::from_parts(parts, Body::from(bytes))
@@ -2543,6 +2551,13 @@ fn idempotent_replay_response(stored: &routeplane_cache::idempotency::StoredResp
     let h = resp.headers_mut();
     if let Ok(ct) = HeaderValue::from_str(&stored.content_type) {
         h.insert(header::CONTENT_TYPE, ct);
+    }
+    // Re-stamp the ORIGINAL dispatch's provenance: the replay serves the
+    // provider's prior response, so it carries that provider + the request id
+    // of the request that produced it. `None` = a pre-provenance entry —
+    // replay without the trio rather than fabricate one.
+    if let (Some(provider), Some(request_id)) = (&stored.provider, &stored.request_id) {
+        stamp_provenance(h, provider, request_id);
     }
     h.insert(IDEMPOTENT_REPLAYED_HEADER, HeaderValue::from_static("true"));
     resp
@@ -3046,6 +3061,8 @@ async fn chat_completions_pipeline(
                     HeaderValue::from_static(CACHE_DEGRADED_VALUE),
                 );
             }
+            // Provenance trio — provider matches the hit's usage-event label.
+            stamp_provenance(resp.headers_mut(), "(cache)", &request_id);
             return resp;
         }
     }
@@ -3209,7 +3226,7 @@ async fn chat_completions_pipeline(
                             contains_regulated_data: classification.contains_personal_data,
                         },
                     );
-                    return (
+                    let mut resp = (
                         StatusCode::OK,
                         [
                             ("content-type", "application/json"),
@@ -3218,6 +3235,10 @@ async fn chat_completions_pipeline(
                         hit.entry.body.clone(),
                     )
                         .into_response();
+                    // Provenance trio — provider matches the hit's usage-event
+                    // label.
+                    stamp_provenance(resp.headers_mut(), "(semantic-cache)", &request_id);
+                    return resp;
                 }
             }
             // Miss (or force_refresh): keep the embedding for the write-side insert.
@@ -4348,15 +4369,11 @@ async fn chat_completions_pipeline(
                     ok.headers_mut()
                         .insert(HEDGED_HEADER, HeaderValue::from_static("true"));
                 }
-                // Feedback API correlation: surface the per-request id as
-                // `x-routeplane-trace-id` so a client can attach feedback to this
-                // exact trace via POST /v1/feedback. Additive — the golden/A-B
-                // corpus has no such header, so the baseline stays a subset of
-                // the current headers (parity check is `is_additive_superset`).
-                if let Ok(v) = HeaderValue::from_str(&request_id) {
-                    ok.headers_mut().insert(TRACE_ID_HEADER, v.clone());
-                    ok.headers_mut().insert(REQUEST_ID_HEADER, v);
-                }
+                // Provenance trio (provider + trace/request correlation ids) —
+                // buffered parity with the streaming path. The acceptance suite
+                // asserts the provider header on live completions; additive for
+                // golden/A-B (parity check is `is_additive_superset`).
+                stamp_provenance(ok.headers_mut(), provider_name.as_str(), &request_id);
                 return ok;
             }
         }
@@ -5443,7 +5460,43 @@ async fn stream_chat_completions(
 
             let mut stream = futures::stream::iter(std::iter::once(Ok(first))).chain(upstream);
 
-            while let Some(item) = stream.next().await {
+            // Streaming truth: a mid-stream provider error, chunk-serialization
+            // failure, or idle timeout must NOT be masked as a clean end. Track
+            // the truncation cause; the terminal frame + the outcome/usage
+            // accounting below branch on it.
+            let mut stream_error: Option<String> = None;
+            // Liveness bound BETWEEN chunks (the whole-body cap moved off the
+            // streaming client — a >2min generation is legitimate; a silent
+            // upstream is not). 0 disables.
+            let idle_ms: u64 = std::env::var("ROUTEPLANE_STREAM_IDLE_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120_000);
+
+            loop {
+                let item = if idle_ms == 0 {
+                    stream.next().await
+                } else {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(idle_ms),
+                        stream.next(),
+                    )
+                    .await
+                    {
+                        Ok(item) => item,
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                "Stream idle timeout ({idle_ms}ms) from {}",
+                                provider_name_owned
+                            );
+                            stream_error = Some(format!(
+                                "no data from upstream provider for {idle_ms}ms"
+                            ));
+                            break;
+                        }
+                    }
+                };
+                let Some(item) = item else { break };
                 match item {
                     Ok(mut chunk) => {
                         if !chunk.model.is_empty() { model_seen = chunk.model.clone(); }
@@ -5516,18 +5569,34 @@ async fn stream_chat_completions(
                             }
                             Err(e) => {
                                 tracing::error!("Failed to serialize stream chunk: {}", e);
+                                stream_error = Some("internal chunk serialization failure".to_string());
                                 break;
                             }
                         }
                     }
                     Err(e) => {
                         tracing::warn!("Mid-stream error from {}: {}", provider_name_owned, e);
+                        stream_error = Some(e.to_string());
                         break;
                     }
                 }
             }
 
-            yield Ok("data: [DONE]\n\n".to_string());
+            // Terminal frame carries the truth: a truncated stream ends with an
+            // OpenAI-style error event and NO `[DONE]` (a client seeing `[DONE]`
+            // is entitled to treat the answer as complete).
+            if let Some(err) = &stream_error {
+                let frame = serde_json::json!({
+                    "error": {
+                        "message": format!("stream truncated: {err}"),
+                        "type": "stream_error",
+                        "code": "routeplane_stream_truncated",
+                    }
+                });
+                yield Ok(format!("data: {frame}\n\n"));
+            } else {
+                yield Ok("data: [DONE]\n\n".to_string());
+            }
 
             // Normal completion: the inline accounting below runs. Disarm the
             // fail-safe FIRST (no `.await` between here and the settle, so this and
@@ -5564,7 +5633,13 @@ async fn stream_chat_completions(
                         region_owned.as_deref(),
                         sovereign,
                         client_provider_requested,
-                        Outcome::Ok,
+                        // Faithful outcome: a truncated stream must never enter
+                        // the audit record as Ok.
+                        if stream_error.is_some() {
+                            Outcome::StreamTruncated
+                        } else {
+                            Outcome::Ok
+                        },
                         UsageTotals {
                             prompt_tokens: usage.prompt_tokens,
                             completion_tokens: usage.completion_tokens,
@@ -5586,6 +5661,10 @@ async fn stream_chat_completions(
                 usage.prompt_tokens, usage.completion_tokens, usage.total_tokens,
                 region_owned, sovereign,
             )
+            // Faithful observability: the spend is real (tokens streamed before
+            // the failure), but the request did NOT succeed — flip the verdict
+            // and carry the truncation cause.
+            .with_stream_error(stream_error.clone())
             .with_cache_status(stream_cache_status, cache_ns_for_stream)
             .with_use_case(use_case_for_stream)
             .with_cost(stream_cost)

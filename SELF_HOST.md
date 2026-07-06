@@ -84,6 +84,17 @@ Enterprise-only (not in CE): sovereign data-residency routing, the hash-chained
 audit ledger, the MCP agentic-security gateway, semantic cache, and the
 multi-tenant control plane (SSO/RBAC, key issuance, entitlements).
 
+## Configuration (env vars)
+
+| Variable | Default | What it does |
+|---|---|---|
+| `RP_CONSOLE_DIR` | set in the image | Serve the bundled Console SPA from this directory; unset ⇒ headless API only. |
+| `RP_CORS_ALLOWED_ORIGINS` | unset (closed) | Comma-separated origins allowed to call the API cross-origin from a browser. Unset ⇒ CORS is **fail-closed**: no cross-origin browser access. The bundled Console is served from the gateway's own origin, so it works out of the box without this. |
+| `RP_CORS_DEV_MODE` | off | `on` ⇒ reflect ANY origin (dev escape hatch for e.g. a Console dev server on another port). Never set it on an internet-facing deployment. |
+| `ROUTEPLANE_STREAM_IDLE_TIMEOUT_MS` | `120000` | Max silence BETWEEN streaming chunks before the gateway truncates the stream (with an explicit `routeplane_stream_truncated` error frame instead of `[DONE]`). `0` disables. Whole-stream duration is unbounded — long generations are fine. |
+| `ROUTEPLANE_PROVIDER_CONNECT_TIMEOUT_MS` | `5000` | Cap on establishing the connection to a provider. |
+| `ROUTEPLANE_PROVIDER_REQUEST_TIMEOUT_MS` | `120000` | Whole-request cap for buffered (non-streaming) provider calls. |
+
 ## Notes
 
 - Single-node uses in-process rate-limits + cache — no Redis required.

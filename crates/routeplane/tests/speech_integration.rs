@@ -148,6 +148,20 @@ async fn openai_speech_returns_binary_audio_with_content_type_and_defaults_model
             .and_then(|v| v.to_str().ok()),
         Some("openai")
     );
+    // Provenance trio: the correlation ids ride along, and trace-id/request-id
+    // carry the SAME req_<uuid> value.
+    let trace = resp
+        .headers()
+        .get("x-routeplane-trace-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("x-routeplane-trace-id present on speech success");
+    assert!(trace.starts_with("req_"), "trace id is req_<uuid>: {trace}");
+    assert_eq!(
+        resp.headers()
+            .get("x-routeplane-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some(trace)
+    );
     let bytes = body_bytes(resp).await;
     assert_eq!(bytes, audio);
 }

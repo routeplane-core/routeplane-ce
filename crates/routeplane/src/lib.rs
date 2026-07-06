@@ -25,6 +25,7 @@ pub mod models_api;
 pub mod observability;
 pub mod otel;
 pub mod prompts_api;
+pub mod provenance;
 pub mod providers_api;
 pub mod proxy;
 pub mod rerank_api;

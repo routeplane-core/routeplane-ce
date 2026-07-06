@@ -31,6 +31,10 @@ async fn status_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
 }
 
 fn app(state: Arc<AppState>) -> Router {
+    // Mirrors main.rs's SCOPED status-route CORS layer (allow-any, GET): /status
+    // is credential-free so it stays permissive even though the app-wide layer
+    // is fail-closed by default. If main.rs changes the status construction,
+    // change this in lockstep.
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::OPTIONS]);

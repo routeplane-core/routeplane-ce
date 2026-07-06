@@ -186,6 +186,18 @@ impl UsageEvent {
         self
     }
 
+    /// Streaming truth: a stream that truncated mid-flight keeps its observed
+    /// (real) token spend but must not read as a success. `None` (the clean-end
+    /// path) is a no-op — byte-identical event.
+    #[must_use]
+    pub fn with_stream_error(mut self, error: Option<String>) -> Self {
+        if let Some(e) = error {
+            self.success = false;
+            self.error = Some(format!("stream truncated: {e}"));
+        }
+        self
+    }
+
     /// A successful provider call.
     #[allow(clippy::too_many_arguments)]
     pub fn success(
