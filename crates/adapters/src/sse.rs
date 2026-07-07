@@ -92,19 +92,23 @@ fn opening_chunk_choice(c: &Choice) -> ChunkChoice {
 /// alives) are ignored — providers here put their whole JSON on `data:` lines.
 #[derive(Default)]
 pub struct SseLineBuffer {
-    buf: String,
+    buf: Vec<u8>,
 }
 
 impl SseLineBuffer {
     pub fn new() -> Self {
-        Self { buf: String::new() }
+        Self { buf: Vec::new() }
     }
 
-    /// Append a freshly-read byte chunk. Invalid UTF-8 is replaced rather than
-    /// erroring — upstreams send UTF-8 JSON, and a lossy boundary is preferable
-    /// to dropping the whole stream.
+    /// Append a freshly-read byte chunk. Bytes are buffered **raw** and decoding
+    /// is deferred to [`next_payload`](Self::next_payload). This matters for
+    /// non-ASCII: a `bytes_stream()` read can split a multibyte UTF-8 codepoint
+    /// (Devanagari/Tamil/CJK/emoji) across two chunks, and decoding each chunk in
+    /// isolation with `from_utf8_lossy` would turn the split codepoint into
+    /// permanent `U+FFFD` mojibake mid-stream even though the upstream sent valid
+    /// UTF-8.
     pub fn push(&mut self, bytes: &[u8]) {
-        self.buf.push_str(&String::from_utf8_lossy(bytes));
+        self.buf.extend_from_slice(bytes);
     }
 
     /// Pop the next complete `data:` payload, or `None` if no full line is
@@ -113,9 +117,13 @@ impl SseLineBuffer {
     /// are consumed and skipped internally.
     pub fn next_payload(&mut self) -> Option<String> {
         loop {
-            let newline = self.buf.find('\n')?;
-            // Split off the line (without the trailing '\n').
-            let line: String = self.buf.drain(..=newline).collect();
+            let newline = self.buf.iter().position(|&b| b == b'\n')?;
+            // Drain the COMPLETE line (including the trailing '\n'). Decoding is
+            // safe here: `\n` (0x0A) is never a UTF-8 continuation byte, so a line
+            // boundary never falls inside a codepoint — the only place a split can
+            // occur is a chunk boundary, and those are already reassembled here.
+            let line_bytes: Vec<u8> = self.buf.drain(..=newline).collect();
+            let line = String::from_utf8_lossy(&line_bytes);
             let line = line.trim_end_matches('\n').trim_end_matches('\r');
 
             if let Some(rest) = line.strip_prefix("data:") {
@@ -210,6 +218,32 @@ mod tests {
         let mut b = SseLineBuffer::new();
         b.push(b": keep-alive\n\nevent: message\ndata: payload\n");
         assert_eq!(b.next_payload().as_deref(), Some("payload"));
+    }
+
+    #[test]
+    fn multibyte_utf8_split_across_pushes_is_not_corrupted() {
+        // Devanagari "नमस्ते": each codepoint is 3 bytes. A read boundary lands
+        // INSIDE the first codepoint; buffering raw bytes avoids U+FFFD mojibake.
+        let full = "data: नमस्ते\n".as_bytes();
+        let split = 7;
+        assert!(
+            full[split] & 0b1100_0000 == 0b1000_0000,
+            "split must be mid-codepoint"
+        );
+        let mut b = SseLineBuffer::new();
+        b.push(&full[..split]);
+        assert_eq!(b.next_payload(), None);
+        b.push(&full[split..]);
+        assert_eq!(b.next_payload().as_deref(), Some("नमस्ते"));
+    }
+
+    #[test]
+    fn multibyte_emoji_split_survives() {
+        let full = "data: 😀\n".as_bytes();
+        let mut b = SseLineBuffer::new();
+        b.push(&full[..8]);
+        b.push(&full[8..]);
+        assert_eq!(b.next_payload().as_deref(), Some("😀"));
     }
 
     // --- buffered_response_as_stream: faithful translation (ledger #38) --------
