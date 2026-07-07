@@ -104,6 +104,26 @@ async fn mount_embeddings_ok(server: &MockServer) {
 }
 
 #[tokio::test]
+async fn empty_input_is_422_not_500() {
+    // The empty-input guard fires at the route edge, before any provider call.
+    let server = MockServer::start().await;
+    let state = build_state(openai_registry(&server.uri()));
+    let resp = invoke(
+        state,
+        HeaderMap::new(),
+        payload(EmbeddingInput::Batch(vec![])),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "empty input must be a 422 client error, not a 500"
+    );
+    let v = body_json(resp).await;
+    assert_eq!(v["error"]["param"], "input");
+}
+
+#[tokio::test]
 async fn openai_embeddings_returns_openai_shaped_list_with_no_cache_header() {
     let server = MockServer::start().await;
     mount_embeddings_ok(&server).await;

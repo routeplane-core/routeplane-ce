@@ -186,6 +186,9 @@ pub struct AppState {
     pub health: HealthTracker,
     pub router: Router,
     pub deadline_config: DeadlineConfig,
+    /// Semantic input caps (message/input counts), enforced on the parsed
+    /// request before fan-out (#31 DoS hardening). Copy struct, resolved once.
+    pub server_limits: crate::config::ServerLimits,
     /// Guardrails-v2 webhook client (ssrf + webhook from the advanced crate).
     /// MOAT (ADR-088): rides `enterprise` — absent on the CE build.
     #[cfg(feature = "enterprise")]
@@ -569,6 +572,7 @@ impl AppState {
             residency_engine: ResidencyEngine::new(),
             router: Router::with_defaults(),
             deadline_config: DeadlineConfig::default(),
+            server_limits: crate::config::ServerLimits::default(),
             #[cfg(feature = "enterprise")]
             guardrail_webhooks: ReqwestWebhookClient::new(
                 crate::config::GuardrailWebhookLimits::default(),
@@ -2602,6 +2606,33 @@ async fn chat_completions_pipeline(
 ) -> Response {
     let deadline = Deadline::start(&state.deadline_config);
     let request_id = format!("req_{}", uuid::Uuid::new_v4().simple());
+
+    // #31 semantic input caps: reject an oversized message set BEFORE the
+    // residency/guardrail/limits fan-out. The byte-level body cap does not stop a
+    // well-formed body of tens of thousands of tiny messages. The COUNT check is
+    // O(1); the total-chars pass runs only when the count is within bounds.
+    {
+        let limits = &state.server_limits;
+        let total_chars = if payload.messages.len() <= limits.max_messages {
+            payload
+                .messages
+                .iter()
+                .map(|m| m.content.as_text().len())
+                .sum()
+        } else {
+            usize::MAX
+        };
+        if let Err((param, message)) = limits.check_chat_input(payload.messages.len(), total_chars)
+        {
+            return crate::api_error::error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "routeplane_input_limit_exceeded",
+                message,
+                "invalid_request_error",
+                Some(param),
+            );
+        }
+    }
 
     // Per-(key,model) limits (PRD-008 §9): resolve the served-model scope using the
     // CLIENT-REQUESTED model (`payload.model`) — that is what an operator caps. The
@@ -6921,6 +6952,7 @@ mod tests {
             health: HealthTracker::new(["openai"]),
             router: Router::with_defaults(),
             deadline_config: DeadlineConfig::default(),
+            server_limits: crate::config::ServerLimits::default(),
             #[cfg(feature = "enterprise")]
             guardrail_webhooks: ReqwestWebhookClient::new(GuardrailWebhookLimits::default()),
             limits: LimitRegistry::build(std::iter::empty()),
@@ -7113,6 +7145,7 @@ mod tests {
                 request_deadline: Duration::from_millis(deadline_ms),
                 per_attempt_timeout: Duration::from_millis(deadline_ms),
             },
+            server_limits: crate::config::ServerLimits::default(),
             #[cfg(feature = "enterprise")]
             guardrail_webhooks: ReqwestWebhookClient::new(GuardrailWebhookLimits::default()),
             limits: LimitRegistry::build(std::iter::empty()),
@@ -7373,6 +7406,7 @@ mod tests {
                 request_deadline: Duration::from_millis(5_000),
                 per_attempt_timeout: Duration::from_millis(5_000),
             },
+            server_limits: crate::config::ServerLimits::default(),
             #[cfg(feature = "enterprise")]
             guardrail_webhooks: ReqwestWebhookClient::new(GuardrailWebhookLimits::default()),
             limits: LimitRegistry::build(std::iter::empty()),
@@ -7502,6 +7536,7 @@ mod tests {
             health: HealthTracker::new(["openai"]),
             router: Router::with_defaults(),
             deadline_config: DeadlineConfig::default(),
+            server_limits: crate::config::ServerLimits::default(),
             #[cfg(feature = "enterprise")]
             guardrail_webhooks: ReqwestWebhookClient::new(GuardrailWebhookLimits::default()),
             limits: LimitRegistry::build(std::iter::empty()),
@@ -7752,6 +7787,7 @@ mod tests {
             health: HealthTracker::new(["openai"]),
             router: Router::with_defaults(),
             deadline_config: DeadlineConfig::default(),
+            server_limits: crate::config::ServerLimits::default(),
             #[cfg(feature = "enterprise")]
             guardrail_webhooks: ReqwestWebhookClient::new(GuardrailWebhookLimits::default()),
             limits: LimitRegistry::build(std::iter::empty()),
@@ -7834,6 +7870,7 @@ mod tests {
             health: HealthTracker::new(["openai"]),
             router: Router::with_defaults(),
             deadline_config: DeadlineConfig::default(),
+            server_limits: crate::config::ServerLimits::default(),
             #[cfg(feature = "enterprise")]
             guardrail_webhooks: ReqwestWebhookClient::new(GuardrailWebhookLimits::default()),
             limits: LimitRegistry::build(std::iter::empty()),
@@ -8483,6 +8520,7 @@ mod tests {
             health: HealthTracker::new([name]),
             router: Router::with_defaults(),
             deadline_config: DeadlineConfig::default(),
+            server_limits: crate::config::ServerLimits::default(),
             #[cfg(feature = "enterprise")]
             guardrail_webhooks: ReqwestWebhookClient::new(GuardrailWebhookLimits::default()),
             limits: LimitRegistry::build(std::iter::empty()),
@@ -8746,6 +8784,7 @@ mod tests {
             health: HealthTracker::new([] as [&str; 0]),
             router: Router::with_defaults(),
             deadline_config: DeadlineConfig::default(),
+            server_limits: crate::config::ServerLimits::default(),
             #[cfg(feature = "enterprise")]
             guardrail_webhooks: ReqwestWebhookClient::new(GuardrailWebhookLimits::default()),
             limits: LimitRegistry::build(std::iter::empty()),
