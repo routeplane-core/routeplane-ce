@@ -1969,14 +1969,7 @@ fn sovereign_block_response(
         None,
         Some(region.as_str()),
     );
-    (
-        StatusCode::UNPROCESSABLE_ENTITY,
-        format!(
-            "Sovereign routing: request contains personal data but no {}-resident provider is configured",
-            region.as_str()
-        ),
-    )
-        .into_response()
+    crate::api_error::sovereign_block(region.as_str())
 }
 
 /// Response header carrying the `warn`-mode compliance flag ([ADR-035] §4): the

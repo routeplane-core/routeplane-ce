@@ -49,6 +49,25 @@ pub fn unauthorized() -> Response {
     )
 }
 
+/// 422 — sovereign-residency refusal: the request carries regulated personal
+/// data but no provider resident in the required `region` is configured, so the
+/// gateway refuses rather than route regulated data out of jurisdiction. This is
+/// the flagship compliance path (DPDP / India-first), so it gets a FULL OpenAI
+/// envelope with the machine-branchable code `routeplane_sovereign_block` —
+/// clients can detect a residency refusal programmatically (it was bare
+/// `text/plain` before, so SDKs saw a typed 422 with an unparseable body).
+pub fn sovereign_block(region: &str) -> Response {
+    error_response(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "routeplane_sovereign_block",
+        format!(
+            "Sovereign routing: request contains personal data but no {region}-resident provider is configured"
+        ),
+        "invalid_request_error",
+        None,
+    )
+}
+
 /// 500 — a programmer/config error (e.g. a missing required extension). Generic
 /// body; the cause is logged, never disclosed.
 pub fn internal_error() -> Response {

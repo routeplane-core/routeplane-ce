@@ -19,7 +19,68 @@
 //! means for its dialect.
 
 use futures::Stream;
-use routeplane_types::{ChatCompletionChunk, ChatCompletionResponse, ChunkChoice, Delta};
+use routeplane_types::{
+    ChatCompletionChunk, ChatCompletionResponse, Choice, ChunkChoice, Delta, FunctionCallChunk,
+    ToolCall, ToolCallChunk,
+};
+
+/// Convert a buffered response's complete `tool_calls` into a single set of
+/// streaming `ToolCallChunk` deltas (each carries the whole call — id + type +
+/// full function name/arguments — since a buffered provider has no token-level
+/// granularity). `None` when there are none, so a content-only delta stays
+/// byte-identical.
+fn tool_calls_to_chunks(calls: &[ToolCall]) -> Option<Vec<ToolCallChunk>> {
+    if calls.is_empty() {
+        return None;
+    }
+    Some(
+        calls
+            .iter()
+            .enumerate()
+            .map(|(i, tc)| ToolCallChunk {
+                index: i as u32,
+                id: Some(tc.id.clone()),
+                tool_type: Some(tc.tool_type.clone()),
+                function: Some(FunctionCallChunk {
+                    name: Some(tc.function.name.clone()),
+                    arguments: Some(tc.function.arguments.clone()),
+                }),
+            })
+            .collect(),
+    )
+}
+
+/// The opening delta for one response choice: role + content + any tool_calls /
+/// refusal / reasoning_content, with the choice's index and logprobs preserved.
+/// This is what stops the trait default from silently dropping tool calls (which
+/// left clients a `finish_reason:"tool_calls"` with NO tool_calls), extra
+/// choices, and logprobs.
+fn opening_chunk_choice(c: &Choice) -> ChunkChoice {
+    let content = c.message.content.as_text();
+    let has_tool_calls = c.message.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
+    ChunkChoice {
+        index: c.index,
+        delta: Delta {
+            role: Some("assistant".to_string()),
+            // Omit an empty content string when the turn is a tool call / refusal
+            // (that is how a native stream renders it), else pass the text.
+            content: if content.is_empty() && has_tool_calls {
+                None
+            } else {
+                Some(content)
+            },
+            tool_calls: c
+                .message
+                .tool_calls
+                .as_deref()
+                .and_then(tool_calls_to_chunks),
+            refusal: c.message.refusal.clone(),
+            reasoning_content: c.message.reasoning_content.clone(),
+        },
+        finish_reason: None,
+        logprobs: c.logprobs.clone(),
+    }
+}
 
 /// Incrementally re-assembles SSE `data:` payloads from a byte stream.
 ///
@@ -72,45 +133,51 @@ pub fn buffered_response_as_stream(
     resp: ChatCompletionResponse,
 ) -> impl Stream<Item = Result<ChatCompletionChunk, crate::ProviderError>> + Send + 'static {
     async_stream::stream! {
-        let (content, finish) = resp
-            .choices
-            .first()
-            .map(|c| (c.message.content.as_text(), c.finish_reason.clone()))
-            .unwrap_or_default();
-
-        // First chunk: role + full content (we have no token-level granularity
-        // for a buffered provider, so the "stream" is one content chunk).
+        // First chunk: ONE ChunkChoice per response choice (not just the first),
+        // each carrying its full delta — content, tool_calls, refusal,
+        // reasoning_content, logprobs. A buffered provider has no token-level
+        // granularity, so each choice's whole delta arrives in this one chunk.
+        let opening: Vec<ChunkChoice> = if resp.choices.is_empty() {
+            vec![ChunkChoice {
+                index: 0,
+                delta: Delta { role: Some("assistant".to_string()), content: Some(String::new()), ..Delta::default() },
+                finish_reason: None,
+                logprobs: None,
+            }]
+        } else {
+            resp.choices.iter().map(opening_chunk_choice).collect()
+        };
         yield Ok(ChatCompletionChunk {
             id: resp.id.clone(),
             object: "chat.completion.chunk".to_string(),
             created: resp.created,
             model: resp.model.clone(),
-            choices: vec![ChunkChoice {
-                index: 0,
-                delta: Delta { role: Some("assistant".to_string()), content: Some(content), ..Delta::default() },
-                finish_reason: None,
-                logprobs: None,
-            }],
+            choices: opening,
             usage: None,
-            system_fingerprint: None,
-            service_tier: None,
+            system_fingerprint: resp.system_fingerprint.clone(),
+            service_tier: resp.service_tier.clone(),
         });
 
-        // Final chunk: finish_reason + usage (mirrors include_usage behavior).
+        // Final chunk: per-choice finish_reason + usage (mirrors include_usage).
+        let closing: Vec<ChunkChoice> = if resp.choices.is_empty() {
+            vec![ChunkChoice { index: 0, delta: Delta::default(), finish_reason: Some("stop".to_string()), logprobs: None }]
+        } else {
+            resp.choices.iter().map(|c| ChunkChoice {
+                index: c.index,
+                delta: Delta::default(),
+                finish_reason: Some(if c.finish_reason.is_empty() { "stop".to_string() } else { c.finish_reason.clone() }),
+                logprobs: None,
+            }).collect()
+        };
         yield Ok(ChatCompletionChunk {
             id: resp.id,
             object: "chat.completion.chunk".to_string(),
             created: resp.created,
             model: resp.model,
-            choices: vec![ChunkChoice {
-                index: 0,
-                delta: Delta::default(),
-                finish_reason: Some(if finish.is_empty() { "stop".to_string() } else { finish }),
-                logprobs: None,
-            }],
+            choices: closing,
             usage: Some(resp.usage),
-            system_fingerprint: None,
-            service_tier: None,
+            system_fingerprint: resp.system_fingerprint,
+            service_tier: resp.service_tier,
         });
     }
 }
@@ -143,5 +210,131 @@ mod tests {
         let mut b = SseLineBuffer::new();
         b.push(b": keep-alive\n\nevent: message\ndata: payload\n");
         assert_eq!(b.next_payload().as_deref(), Some("payload"));
+    }
+
+    // --- buffered_response_as_stream: faithful translation (ledger #38) --------
+
+    use futures::StreamExt;
+    use routeplane_types::{Choice, FunctionCall, Message, ToolCall, Usage};
+
+    fn msg(content: &str, tool_calls: Option<Vec<ToolCall>>, refusal: Option<String>) -> Message {
+        Message {
+            role: "assistant".into(),
+            content: content.into(),
+            name: None,
+            cache_control: None,
+            tool_calls,
+            tool_call_id: None,
+            refusal,
+            reasoning_content: None,
+        }
+    }
+
+    fn resp(choices: Vec<Choice>) -> ChatCompletionResponse {
+        ChatCompletionResponse {
+            id: "resp-1".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: "m".into(),
+            choices,
+            usage: Usage::default(),
+            system_fingerprint: None,
+            service_tier: None,
+        }
+    }
+
+    async fn chunks(r: ChatCompletionResponse) -> Vec<ChatCompletionChunk> {
+        buffered_response_as_stream(r)
+            .map(|c| c.expect("chunk ok"))
+            .collect()
+            .await
+    }
+
+    #[tokio::test]
+    async fn tool_calls_survive_the_buffered_stream() {
+        let tc = ToolCall {
+            id: "call_1".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "get_weather".into(),
+                arguments: "{\"city\":\"NYC\"}".into(),
+            },
+        };
+        let out = chunks(resp(vec![Choice {
+            index: 0,
+            message: msg("", Some(vec![tc]), None),
+            finish_reason: "tool_calls".into(),
+            logprobs: None,
+        }]))
+        .await;
+
+        // The opening delta carries the tool call (was silently dropped before).
+        let opening = &out[0].choices[0];
+        let tcs = opening
+            .delta
+            .tool_calls
+            .as_ref()
+            .expect("tool_calls must survive the default stream");
+        assert_eq!(tcs[0].id.as_deref(), Some("call_1"));
+        assert_eq!(
+            tcs[0].function.as_ref().and_then(|f| f.name.as_deref()),
+            Some("get_weather")
+        );
+        assert!(
+            opening.delta.content.is_none(),
+            "pure tool-call turn omits content"
+        );
+        // finish_reason:tool_calls is no longer orphaned (a delta with no calls).
+        assert_eq!(
+            out.last().unwrap().choices[0].finish_reason.as_deref(),
+            Some("tool_calls")
+        );
+    }
+
+    #[tokio::test]
+    async fn all_choices_and_logprobs_survive() {
+        let out = chunks(resp(vec![
+            Choice {
+                index: 0,
+                message: msg("hello", None, None),
+                finish_reason: "stop".into(),
+                logprobs: Some(serde_json::json!({"content": []})),
+            },
+            Choice {
+                index: 1,
+                message: msg("world", None, None),
+                finish_reason: "length".into(),
+                logprobs: None,
+            },
+        ]))
+        .await;
+
+        // Both choices stream (index 0 AND 1) — not just the first.
+        assert_eq!(out[0].choices.len(), 2);
+        assert_eq!(out[0].choices[0].index, 0);
+        assert_eq!(out[0].choices[1].index, 1);
+        assert_eq!(out[0].choices[0].delta.content.as_deref(), Some("hello"));
+        assert_eq!(out[0].choices[1].delta.content.as_deref(), Some("world"));
+        assert!(out[0].choices[0].logprobs.is_some(), "logprobs preserved");
+        // Per-choice finish_reason on the closing chunk.
+        let closing = out.last().unwrap();
+        assert_eq!(closing.choices.len(), 2);
+        assert_eq!(closing.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(closing.choices[1].finish_reason.as_deref(), Some("length"));
+    }
+
+    #[tokio::test]
+    async fn refusal_delta_is_carried() {
+        let out = chunks(resp(vec![Choice {
+            index: 0,
+            message: msg("", None, Some("I can't help with that".into())),
+            finish_reason: "stop".into(),
+            logprobs: None,
+        }]))
+        .await;
+        assert_eq!(
+            out[0].choices[0].delta.refusal.as_deref(),
+            Some("I can't help with that")
+        );
     }
 }
