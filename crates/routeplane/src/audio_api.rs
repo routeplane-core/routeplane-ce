@@ -265,15 +265,7 @@ async fn run_audio_text(
                     UsageTotals::default(),
                 )
             });
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!(
-                    "Sovereign routing: a {}-resident provider is required but none is configured for {}",
-                    region.as_str(),
-                    op.label()
-                ),
-            )
-                .into_response();
+            return crate::api_error::sovereign_block(region.as_str());
         }
         tracing::info!(
             "Sovereign routing enforced ({}s): region={} eligible={:?}",

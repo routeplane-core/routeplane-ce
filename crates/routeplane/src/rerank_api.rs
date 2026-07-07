@@ -156,14 +156,7 @@ pub async fn rerank(
                     UsageTotals::default(),
                 )
             });
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!(
-                    "Sovereign routing: request contains personal data but no {}-resident provider is configured",
-                    region.as_str()
-                ),
-            )
-                .into_response();
+            return crate::api_error::sovereign_block(region.as_str());
         }
         tracing::info!(
             "Sovereign routing enforced (rerank): region={} eligible={:?}",
