@@ -250,6 +250,29 @@ impl ProviderError {
         }
     }
 
+    /// The requested `model` maps to no Azure deployment when an authoritative
+    /// deployment map (`AZURE_OPENAI_DEPLOYMENTS`) is configured. Modelled as a
+    /// non-retryable `BadRequest` (422) — refusing SILENT model substitution is
+    /// the whole point for model-pinned compliance workloads, so we never fall
+    /// back to a different deployment. The body is prefixed
+    /// `azure_deployment_unmapped` so the route can recognise it without parsing.
+    pub fn azure_deployment_unmapped(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        let provider = provider.into();
+        let model = model.into();
+        let body = format!(
+            "azure_deployment_unmapped: model '{model}' maps to no configured Azure \
+             deployment (set it in AZURE_OPENAI_DEPLOYMENTS)"
+        );
+        ProviderError::BadRequest {
+            provider,
+            status: 422,
+            body,
+        }
+    }
+
     /// The upstream HTTP status, when the error carries one.
     pub fn status(&self) -> Option<u16> {
         match self {
