@@ -20,6 +20,22 @@
 //!
 //!   * `ROUTEPLANE_PROVIDER_CONNECT_TIMEOUT_MS` (default 5_000)
 //!   * `ROUTEPLANE_PROVIDER_REQUEST_TIMEOUT_MS` (default 120_000)
+//!
+//! ## Redirects are refused (SSRF defense-in-depth)
+//!
+//! Both clients set `redirect::Policy::none()`. An operator-supplied endpoint
+//! (a custom provider or a `self_hosted` `base_url`) is SSRF-guarded at
+//! *registration* (`custom_providers::ssrf_check`), but that check resolves the
+//! host once — a benign endpoint can still return a `30x` to
+//! `http://169.254.169.254/...` (cloud metadata) or an internal host at
+//! *request* time and defeat it. Following such a redirect would also forward
+//! the provider `Authorization: Bearer` header to an attacker-chosen host —
+//! precisely how a gateway key leaks. LLM completion APIs answer a `POST`
+//! directly and never legitimately redirect, so refusing is free: a `30x`
+//! surfaces as a `BadRequest` (via `error_from_response`) the operator can see
+//! and fix, instead of being silently chased. DNS-rebinding between
+//! registration and dispatch remains a documented limitation (see
+//! `custom_providers::ssrf_check`).
 
 use crate::ProviderError;
 use reqwest::Client;
@@ -53,6 +69,7 @@ pub fn build_provider_client() -> Client {
     Client::builder()
         .connect_timeout(Duration::from_millis(connect_ms))
         .timeout(Duration::from_millis(request_ms))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_default()
 }
@@ -74,6 +91,7 @@ pub fn streaming_client() -> Client {
             );
             Client::builder()
                 .connect_timeout(Duration::from_millis(connect_ms))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default()
         })
@@ -187,6 +205,50 @@ fn classify_status(
 mod tests {
     use super::*;
     use crate::RetryClass;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // A `30x` to the cloud-metadata endpoint must NOT be followed: the SSRF
+    // guard only vets the registered host, and a followed redirect both reaches
+    // an internal target and forwards the provider bearer token to it.
+    async fn assert_no_redirect_follow(client: Client) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/start"))
+            .respond_with(ResponseTemplate::new(302).insert_header(
+                "location",
+                "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            ))
+            .mount(&server)
+            .await;
+
+        let resp = client
+            .get(format!("{}/start", server.uri()))
+            .send()
+            .await
+            .expect("request itself completes");
+        assert_eq!(
+            resp.status().as_u16(),
+            302,
+            "the 30x must be returned as-is, not chased"
+        );
+        let reqs = server.received_requests().await.expect("recorded requests");
+        assert_eq!(
+            reqs.len(),
+            1,
+            "exactly the initial request; no follow-up hop to metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_client_does_not_follow_redirects() {
+        assert_no_redirect_follow(build_provider_client()).await;
+    }
+
+    #[tokio::test]
+    async fn streaming_client_does_not_follow_redirects() {
+        assert_no_redirect_follow(streaming_client()).await;
+    }
 
     #[test]
     fn classifies_statuses_into_retry_classes() {

@@ -95,6 +95,10 @@ pub async fn upsert_provider(
     // (a dropped handler future must not leave disk and memory out of step).
     match tokio::spawn(async move { store.upsert(cfg).await }).await {
         Ok(Ok((view, created))) => {
+            // Register a circuit breaker + latency EWMA + in-flight gauge for the
+            // provider so it is fast-failed and latency-ordered like a built-in
+            // (ADR-113). Idempotent: an update never resets an existing breaker.
+            state.health.register(&name);
             tracing::info!(
                 "custom provider {}: name={name} base_url={base_url} models={model_count}",
                 if created { "created" } else { "updated" },

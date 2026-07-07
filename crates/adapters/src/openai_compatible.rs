@@ -28,6 +28,24 @@ pub struct SelfHostedProvider {
     base_url: String,
     /// Residency jurisdiction this deployment serves (e.g. "IN"); empty ⇒ none.
     region: String,
+    /// Whether a streaming request asks for `stream_options.include_usage`.
+    /// Default true (OpenAI/vLLM honour it and it gives real token counts); a
+    /// strict older OpenAI-ish runtime that 400s on the unknown field can opt
+    /// out via [`without_stream_usage`], so it doesn't lose ALL streaming (#35).
+    stream_include_usage: bool,
+}
+
+/// Whether `SELF_HOSTED_STREAM_INCLUDE_USAGE` explicitly opts OUT of
+/// `stream_options.include_usage`. Default (unset/anything else) keeps it ON.
+/// Pure so it is unit-testable without mutating the process environment.
+fn stream_usage_disabled(val: Option<String>) -> bool {
+    val.map(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        )
+    })
+    .unwrap_or(false)
 }
 
 impl SelfHostedProvider {
@@ -36,17 +54,35 @@ impl SelfHostedProvider {
             client: crate::client::build_provider_client(),
             base_url,
             region,
+            stream_include_usage: true,
         }
+    }
+
+    /// Opt out of `stream_options.include_usage` for a strict upstream that
+    /// rejects the field (loses per-request token accounting on that provider,
+    /// but keeps streaming working).
+    #[must_use]
+    pub fn without_stream_usage(mut self) -> Self {
+        self.stream_include_usage = false;
+        self
     }
 
     /// Build from environment:
     ///   SELF_HOSTED_BASE_URL (e.g. http://vllm.internal:8000),
-    ///   SELF_HOSTED_REGION   (residency jurisdiction; default empty = none).
+    ///   SELF_HOSTED_REGION   (residency jurisdiction; default empty = none),
+    ///   SELF_HOSTED_STREAM_INCLUDE_USAGE=off  (opt out of
+    ///     `stream_options.include_usage` for a strict runtime that 400s on it,
+    ///     mirroring the custom-provider config field — #35).
     pub fn from_env() -> Self {
-        Self::new(
+        let p = Self::new(
             std::env::var("SELF_HOSTED_BASE_URL").unwrap_or_default(),
             std::env::var("SELF_HOSTED_REGION").unwrap_or_default(),
-        )
+        );
+        if stream_usage_disabled(std::env::var("SELF_HOSTED_STREAM_INCLUDE_USAGE").ok()) {
+            p.without_stream_usage()
+        } else {
+            p
+        }
     }
 
     /// Test constructor pointing at a custom base URL (e.g. a wiremock server),
@@ -117,7 +153,9 @@ impl Provider for SelfHostedProvider {
         // final chunk so observability records real token counts.
         let mut body = serde_json::to_value(&request)?;
         body["stream"] = json!(true);
-        body["stream_options"] = json!({ "include_usage": true });
+        if self.stream_include_usage {
+            body["stream_options"] = json!({ "include_usage": true });
+        }
         // Strip the Anthropic-only cache marker before egress.
         crate::openai::strip_cache_control_for_openai(&mut body);
 
@@ -291,6 +329,23 @@ mod tests {
     }
 
     #[test]
+    fn stream_usage_disabled_only_on_explicit_off_values() {
+        for v in ["off", "OFF", "0", "false", "No", " off "] {
+            assert!(
+                stream_usage_disabled(Some(v.to_string())),
+                "{v:?} should disable"
+            );
+        }
+        for v in ["on", "1", "true", "yes", "", "banana"] {
+            assert!(
+                !stream_usage_disabled(Some(v.to_string())),
+                "{v:?} should keep default-on"
+            );
+        }
+        assert!(!stream_usage_disabled(None), "unset keeps default-on");
+    }
+
+    #[test]
     fn name_is_self_hosted_and_region_drives_residency() {
         let p = SelfHostedProvider::new("http://vllm.internal:8000".into(), "IN".into());
         assert_eq!(p.name(), "self_hosted");
@@ -390,6 +445,65 @@ mod tests {
             .expect("embeddings passthrough succeeds");
         assert_eq!(out.data.len(), 1);
         assert_eq!(out.model, "nomic-embed-text");
+    }
+
+    #[tokio::test]
+    async fn streaming_default_requests_usage_in_final_chunk() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: [DONE]\n\n"),
+            )
+            .mount(&server)
+            .await;
+
+        let p = SelfHostedProvider::with_base_url(server.uri());
+        let _stream = p
+            .chat_completion_stream(req("llama3"), "sk-local".into())
+            .await
+            .expect("stream call succeeds");
+
+        let reqs = server.received_requests().await.expect("recorded requests");
+        let body: serde_json::Value =
+            serde_json::from_slice(&reqs[0].body).expect("outbound body is json");
+        assert_eq!(body["stream"], serde_json::json!(true));
+        assert_eq!(
+            body["stream_options"],
+            serde_json::json!({ "include_usage": true }),
+            "the default must ask for usage on the final chunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_stream_usage_omits_stream_options() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: [DONE]\n\n"),
+            )
+            .mount(&server)
+            .await;
+
+        let p = SelfHostedProvider::with_base_url(server.uri()).without_stream_usage();
+        let _stream = p
+            .chat_completion_stream(req("llama3"), "sk-local".into())
+            .await
+            .expect("stream call succeeds");
+
+        let reqs = server.received_requests().await.expect("recorded requests");
+        let body: serde_json::Value =
+            serde_json::from_slice(&reqs[0].body).expect("outbound body is json");
+        assert_eq!(body["stream"], serde_json::json!(true));
+        assert!(
+            body.get("stream_options").is_none(),
+            "a strict runtime 400s on the unknown field; the opt-out must omit it entirely"
+        );
     }
 
     #[tokio::test]

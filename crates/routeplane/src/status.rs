@@ -38,8 +38,13 @@ pub fn status_snapshot_json(
 ) -> Value {
     let mut names = health.provider_names();
     names.sort_unstable();
+    // Runtime custom providers (ADR-099) are now IN the circuit registry too
+    // (ADR-113 registers a breaker/EWMA/gauge on upsert so they are fast-failed
+    // and latency-ordered). They are rendered by the dedicated loop below
+    // (flagged `custom: true`), so exclude them here to avoid listing them twice.
     let mut providers: Vec<Value> = names
         .iter()
+        .filter(|p| !custom_providers.iter().any(|c| c == *p))
         .map(|p| {
             json!({
                 "provider": p,
@@ -51,8 +56,8 @@ pub fn status_snapshot_json(
     for name in custom_providers {
         providers.push(json!({
             "provider": name,
-            "circuit": "closed", // untracked ⇒ always admitted (fail-open)
-            "latency_ewma_ms": Value::Null,
+            "circuit": circuit_str(health.state(name)), // real state (ADR-113)
+            "latency_ewma_ms": health.latency_ms(name),  // null until first sample
             "custom": true,
         }));
     }
