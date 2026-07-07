@@ -77,6 +77,18 @@ struct AnthropicRequest {
     /// string/object `tool_choice`). `None` ⇒ omitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<Value>,
+    /// Anthropic request metadata — carries the canonical `user` as
+    /// `metadata.user_id` instead of dropping it. `None` ⇒ omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<AnthropicMetadata>,
+}
+
+/// Anthropic's `metadata` object. Only `user_id` is mapped (from the canonical
+/// `user`); other keys are Anthropic-internal.
+#[derive(Debug, Serialize)]
+struct AnthropicMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<String>,
 }
 
 /// The top-level `system` of an Anthropic request: a bare string (no caching) or
@@ -106,6 +118,23 @@ const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 1024;
 /// breakpoint. A request with NO `cache_control` anywhere produces a wire body
 /// byte-identical to before (system stays a bare string, text-only messages stay
 /// bare strings).
+/// Anthropic's `/v1/messages` returns a SINGLE completion — `n>1` cannot be
+/// honored. Reject it explicitly with a non-retryable 422 rather than silently
+/// returning one choice when the caller asked for several. `n` unset or `1` ⇒ Ok.
+fn reject_multi_completion(request: &ChatCompletionRequest) -> Result<(), ProviderError> {
+    match request.n {
+        Some(n) if n > 1 => Err(ProviderError::BadRequest {
+            provider: "anthropic".to_string(),
+            status: 422,
+            body: format!(
+                "n_not_supported: anthropic /v1/messages returns a single completion, so n={n} \
+                 cannot be honored — request n=1 or route to a provider that supports n>1"
+            ),
+        }),
+        _ => Ok(()),
+    }
+}
+
 fn build_anthropic_request(request: &ChatCompletionRequest) -> AnthropicRequest {
     // System messages: collect (text, optional cache_control). We keep the
     // per-message marker so a caller can cache a large system preamble.
@@ -180,11 +209,20 @@ fn build_anthropic_request(request: &ChatCompletionRequest) -> AnthropicRequest 
             .or(request.max_tokens)
             .unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS),
         system,
-        temperature: request.temperature,
+        // Canonical `temperature` is OpenAI's 0..=2 domain; Anthropic accepts
+        // only 0..=1 and 400s above 1. CLAMP so an otherwise-valid request still
+        // succeeds on Anthropic (critical on a failover from an OpenAI-domain
+        // provider, where a hard 400 mid-incident is what the chain must avoid).
+        temperature: request.temperature.map(|t| t.clamp(0.0, 1.0)),
         top_p: request.top_p,
         stop_sequences: request.stop.clone(),
         tools: build_anthropic_tools(request.tools.as_deref()),
         tool_choice: request.tool_choice.as_ref().map(map_anthropic_tool_choice),
+        // Map the canonical `user` → Anthropic `metadata.user_id` (was dropped).
+        metadata: request
+            .user
+            .clone()
+            .map(|u| AnthropicMetadata { user_id: Some(u) }),
     }
 }
 
@@ -480,6 +518,7 @@ impl Provider for AnthropicProvider {
         request: ChatCompletionRequest,
         api_key: String,
     ) -> Result<ChatCompletionResponse, ProviderError> {
+        reject_multi_completion(&request)?;
         let url = format!("{}/v1/messages", self.base_url);
 
         let anthropic_req = build_anthropic_request(&request);
@@ -608,6 +647,7 @@ impl Provider for AnthropicProvider {
         request: ChatCompletionRequest,
         api_key: String,
     ) -> Result<ChunkStream, ProviderError> {
+        reject_multi_completion(&request)?;
         let url = format!("{}/v1/messages", self.base_url);
 
         // max_tokens, system-role lifting and stop sequences are threaded through
@@ -1153,6 +1193,43 @@ mod tests {
     fn max_tokens_defaults_when_absent() {
         let a = build_anthropic_request(&req(vec![msg("user", "hi")]));
         assert_eq!(a.max_tokens, ANTHROPIC_DEFAULT_MAX_TOKENS);
+    }
+
+    #[test]
+    fn temperature_is_clamped_into_anthropics_domain() {
+        let mut r = req(vec![msg("user", "hi")]);
+        r.temperature = Some(1.5);
+        assert_eq!(build_anthropic_request(&r).temperature, Some(1.0));
+        r.temperature = Some(0.5);
+        assert_eq!(build_anthropic_request(&r).temperature, Some(0.5));
+        r.temperature = None;
+        assert_eq!(build_anthropic_request(&r).temperature, None);
+    }
+
+    #[test]
+    fn user_maps_to_metadata_user_id() {
+        let mut r = req(vec![msg("user", "hi")]);
+        r.user = Some("end-user-42".into());
+        let a = build_anthropic_request(&r);
+        assert_eq!(
+            a.metadata.as_ref().and_then(|m| m.user_id.as_deref()),
+            Some("end-user-42")
+        );
+        r.user = None;
+        assert!(build_anthropic_request(&r).metadata.is_none());
+    }
+
+    #[test]
+    fn n_greater_than_one_is_rejected_422() {
+        let mut r = req(vec![msg("user", "hi")]);
+        r.n = Some(2);
+        let err = reject_multi_completion(&r).expect_err("n>1 must be rejected");
+        assert_eq!(err.status(), Some(422));
+        assert!(err.to_string().contains("n_not_supported"));
+        r.n = Some(1);
+        assert!(reject_multi_completion(&r).is_ok());
+        r.n = None;
+        assert!(reject_multi_completion(&r).is_ok());
     }
 
     // --- vision passthrough (native Anthropic image blocks) -------------------
