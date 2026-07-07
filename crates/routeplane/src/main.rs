@@ -920,6 +920,7 @@ async fn main() {
         ]),
         router: routeplane_router::Router::with_defaults(),
         deadline_config,
+        server_limits: limits_server,
         #[cfg(feature = "enterprise")]
         guardrail_webhooks: ReqwestWebhookClient::new(webhook_limits),
         limits,

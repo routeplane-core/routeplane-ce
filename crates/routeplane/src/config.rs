@@ -62,6 +62,16 @@ pub struct ServerLimits {
     /// audio route via its own `RequestBodyLimitLayer` — the global limit is
     /// unchanged for every other route.
     pub audio_max_body_bytes: usize,
+    /// **Semantic** input caps, enforced on the PARSED request before the
+    /// residency / guardrail / embeddings fan-out. The byte-level
+    /// `max_body_bytes` does not stop a well-formed 2 MiB body carrying tens of
+    /// thousands of tiny messages (or embedding inputs) — each of which is fanned
+    /// out over the classifier + masker, amplifying CPU. These bound the element
+    /// COUNT / total content size. Generous defaults (a real chat is well under
+    /// them); tune per deployment via env.
+    pub max_messages: usize,
+    pub max_message_chars: usize,
+    pub max_embedding_inputs: usize,
 }
 
 impl Default for ServerLimits {
@@ -78,6 +88,13 @@ impl Default for ServerLimits {
             // 26 MiB: matches OpenAI's 25 MB STT cap with multipart overhead
             // headroom. Applied ONLY to /v1/audio/transcriptions.
             audio_max_body_bytes: 26 * 1024 * 1024,
+            // Generous semantic caps: a real chat has a handful of messages;
+            // 2048 is well above any legitimate conversation. 1.5M chars sits
+            // under the 2 MiB body cap. 2048 embedding inputs matches OpenAI's
+            // per-request input ceiling.
+            max_messages: 2048,
+            max_message_chars: 1_500_000,
+            max_embedding_inputs: 2048,
         }
     }
 }
@@ -90,7 +107,54 @@ impl ServerLimits {
             request_timeout: env_duration_ms("ROUTEPLANE_REQUEST_TIMEOUT_MS", d.request_timeout),
             max_body_bytes: env_usize("ROUTEPLANE_MAX_BODY_BYTES", d.max_body_bytes),
             audio_max_body_bytes: env_usize("RP_AUDIO_MAX_BODY_BYTES", d.audio_max_body_bytes),
+            max_messages: env_usize("RP_MAX_MESSAGES", d.max_messages),
+            max_message_chars: env_usize("RP_MAX_MESSAGE_CHARS", d.max_message_chars),
+            max_embedding_inputs: env_usize("RP_MAX_EMBEDDING_INPUTS", d.max_embedding_inputs),
         }
+    }
+
+    /// Reject a chat request whose message COUNT or total content size exceeds
+    /// the semantic caps — called on the parsed request BEFORE the residency /
+    /// guardrail fan-out. `Err((param, message))` maps to an OpenAI-shaped 400.
+    pub fn check_chat_input(
+        &self,
+        message_count: usize,
+        total_chars: usize,
+    ) -> Result<(), (&'static str, String)> {
+        if message_count > self.max_messages {
+            return Err((
+                "messages",
+                format!(
+                    "too many messages: {message_count} exceeds the per-request limit of {}",
+                    self.max_messages
+                ),
+            ));
+        }
+        if total_chars > self.max_message_chars {
+            return Err((
+                "messages",
+                format!(
+                    "message content too large: {total_chars} characters exceeds the per-request limit of {}",
+                    self.max_message_chars
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reject an embeddings request with too many inputs (the array is fanned out
+    /// to the provider and metered per element). `Err((param, message))` → 400.
+    pub fn check_embedding_input(&self, input_count: usize) -> Result<(), (&'static str, String)> {
+        if input_count > self.max_embedding_inputs {
+            return Err((
+                "input",
+                format!(
+                    "too many inputs: {input_count} exceeds the per-request limit of {}",
+                    self.max_embedding_inputs
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -174,4 +238,62 @@ fn env_usize(var: &str, default: usize) -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limits(
+        max_messages: usize,
+        max_message_chars: usize,
+        max_embedding_inputs: usize,
+    ) -> ServerLimits {
+        ServerLimits {
+            max_messages,
+            max_message_chars,
+            max_embedding_inputs,
+            ..ServerLimits::default()
+        }
+    }
+
+    #[test]
+    fn chat_input_within_caps_is_ok() {
+        let l = limits(10, 1000, 10);
+        assert!(l.check_chat_input(5, 500).is_ok());
+        assert!(l.check_chat_input(10, 1000).is_ok()); // boundary
+    }
+
+    #[test]
+    fn chat_input_rejects_too_many_messages() {
+        let l = limits(10, 1_000_000, 10);
+        let (param, msg) = l.check_chat_input(11, 100).unwrap_err();
+        assert_eq!(param, "messages");
+        assert!(msg.contains("too many messages"));
+    }
+
+    #[test]
+    fn chat_input_rejects_oversized_content() {
+        let l = limits(10_000, 1000, 10);
+        let (param, msg) = l.check_chat_input(3, 1001).unwrap_err();
+        assert_eq!(param, "messages");
+        assert!(msg.contains("content too large"));
+    }
+
+    #[test]
+    fn embedding_input_cap_enforced() {
+        let l = limits(10, 1000, 4);
+        assert!(l.check_embedding_input(4).is_ok());
+        let (param, msg) = l.check_embedding_input(5).unwrap_err();
+        assert_eq!(param, "input");
+        assert!(msg.contains("too many inputs"));
+    }
+
+    #[test]
+    fn default_caps_are_generous() {
+        let d = ServerLimits::default();
+        // A normal conversation and a normal embedding batch clear the defaults.
+        assert!(d.check_chat_input(50, 40_000).is_ok());
+        assert!(d.check_embedding_input(256).is_ok());
+    }
 }

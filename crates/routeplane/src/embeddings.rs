@@ -59,6 +59,35 @@ pub async fn embeddings(
         .limits
         .resolve(&virtual_key.routeplane_key, &tenant_ctx.tenant_id);
 
+    // #31/#352 input validation before the per-element residency/mask/provider
+    // fan-out: an EMPTY input is a malformed request (422, matching the sibling
+    // surfaces — without it an empty array falls through to a 500); an OVERSIZED
+    // input array is a semantic cap (400) the byte-level body limit misses.
+    {
+        let (input_count, input_is_empty) = match &payload.input {
+            EmbeddingInput::Single(s) => (1, s.is_empty()),
+            EmbeddingInput::Batch(v) => (v.len(), v.is_empty()),
+        };
+        if input_is_empty {
+            return crate::api_error::error_response(
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_request_error",
+                "`input` must contain at least one non-empty string.",
+                "invalid_request_error",
+                Some("input"),
+            );
+        }
+        if let Err((param, message)) = state.server_limits.check_embedding_input(input_count) {
+            return crate::api_error::error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "routeplane_input_limit_exceeded",
+                message,
+                "invalid_request_error",
+                Some(param),
+            );
+        }
+    }
+
     // 1. Residency: classify the joined input text(s) BEFORE masking — masking
     //    would hide the very PII the classifier looks for (the same invariant as
     //    chat). FR-4/FR-5.
