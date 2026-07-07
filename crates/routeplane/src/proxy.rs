@@ -1075,6 +1075,32 @@ fn provider_resident(registry: &ProviderRegistry, name: &str, region: &Region) -
         .unwrap_or(false)
 }
 
+/// The text the sovereign classifier + prompt-injection adjudicator inspect for
+/// one request: every message's content PLUS every `tool_calls[].function` name
+/// and arguments. Tool-call arguments are a real carrier of regulated PII (a
+/// replayed assistant turn in an agentic multi-turn flow) and of injection
+/// payloads, yet `MessageContent::as_text` reads only content — so classifying
+/// content alone silently bypassed the region-lock (and the injection gate) for
+/// tool-argument data. This closes that blind spot.
+fn residency_classifier_text(messages: &[routeplane_types::Message]) -> String {
+    messages
+        .iter()
+        .map(|m| {
+            let mut t = m.content.as_text();
+            if let Some(tool_calls) = &m.tool_calls {
+                for tc in tool_calls {
+                    t.push('\n');
+                    t.push_str(&tc.function.name);
+                    t.push('\n');
+                    t.push_str(&tc.function.arguments);
+                }
+            }
+            t
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Reassemble the router-ordered names back into an ordered `Vec<TargetPlan>`,
 /// consuming each plan by first match. Names dropped by the router (circuit-OPEN)
 /// simply don't appear → their plans are discarded.
@@ -1120,10 +1146,17 @@ fn is_retryable(e: &ProviderError, retry: &RetryPolicy) -> bool {
 /// F12 (ADR-021 amendment A1): a 429 (`RateLimited`) reflects the caller's
 /// key/quota throttle, NOT provider health — recording it as a circuit-breaker
 /// failure would let a single hot key trip an otherwise-healthy provider OPEN.
-/// Every other error class (transport, 5xx, timeout, translation) is a real
-/// health fault. Shared by the buffered + streaming chat paths and embeddings.
+/// A client-class 4xx (`BadRequest` — context length exceeded, invalid parameter,
+/// unknown model) is likewise the CALLER's fault, not provider health: one tenant
+/// spraying oversized/invalid prompts at a healthy provider must not open the
+/// SHARED breaker for every other tenant. Every other class (transport, 5xx,
+/// timeout, translation) is a real health fault. Shared by the buffered +
+/// streaming chat paths and embeddings.
 pub(crate) fn counts_as_health_failure(e: &ProviderError) -> bool {
-    !matches!(e, ProviderError::RateLimited { .. })
+    !matches!(
+        e,
+        ProviderError::RateLimited { .. } | ProviderError::BadRequest { .. }
+    )
 }
 
 // Bounds the accumulated streamed output kept for the enterprise-only post-stream
@@ -2647,12 +2680,14 @@ async fn chat_completions_pipeline(
     let registry = &state.providers;
 
     // --- Sovereign routing: classify BEFORE masking. ---
-    let original_text: String = payload
-        .messages
-        .iter()
-        .map(|m| m.content.as_text())
-        .collect::<Vec<_>>()
-        .join("\n");
+    // `residency_classifier_text` includes tool_call arguments (+ the function
+    // name), not just message content: regulated PII can live ONLY in a replayed
+    // assistant turn's `tool_calls[].function.arguments` in an agentic multi-turn
+    // flow (which `content.as_text()` never reads), so classifying content alone
+    // silently bypassed the region-lock for tool-argument PII. The same text feeds
+    // the prompt-injection adjudicator below, so tool-argument injection payloads
+    // are now inspected too.
+    let original_text: String = residency_classifier_text(&payload.messages);
     let classification = state.residency_engine.classify(&original_text);
     let header_region = headers
         .get("x-routeplane-residency")
@@ -3626,6 +3661,9 @@ async fn chat_completions_pipeline(
     }
 
     let mut last_error = "No providers available".to_string();
+    // The upstream 4xx status of the terminal client-class failure (if any), so a
+    // provider-rejected request surfaces its real 4xx instead of a blanket 500.
+    let mut last_client_status: Option<u16> = None;
 
     // Pre-resolve each ordered target's api key + shaped request ONCE. Targets
     // with no usable key (or an unknown provider) are filtered here so neither
@@ -3756,9 +3794,15 @@ async fn chat_completions_pipeline(
                         TargetOutcome::Exhausted {
                             last_error: e,
                             health_failure,
+                            terminal_client_status,
                         } => {
                             last_error = e;
                             pool_health_failure |= health_failure;
+                            // Sticky client-4xx: a deterministic client error wins
+                            // over transient failures from a later target.
+                            if terminal_client_status.is_some() {
+                                last_client_status = terminal_client_status;
+                            }
                         }
                     }
                 }
@@ -3786,6 +3830,7 @@ async fn chat_completions_pipeline(
                 config_ref_label,
                 config_matched_label.as_deref(),
                 &mut last_error,
+                &mut last_client_status,
             )
             .await
         }
@@ -4454,7 +4499,9 @@ async fn chat_completions_pipeline(
         request_id,
         last_error
     );
-    crate::api_error::upstream_all_failed()
+    // Surface a terminal client-class 4xx as its real status so an OpenAI SDK
+    // doesn't blind-retry a 500; infra-class exhaustion stays the generic 500.
+    crate::api_error::upstream_failed(last_client_status)
 }
 
 /// The result of driving ONE target's full attempt sequence (initial try +
@@ -4477,7 +4524,24 @@ enum TargetOutcome {
     Exhausted {
         last_error: String,
         health_failure: bool,
+        /// The upstream 4xx status to surface to the client when this was the
+        /// TERMINAL target, set ONLY for a client-class `BadRequest` (context
+        /// length, invalid parameter, unknown model — a `400/404/422` the CALLER
+        /// can fix). `None` for infra-class exhaustion (skip / timeout / budget /
+        /// 5xx / network / 429 / auth), which keeps the generic 500.
+        terminal_client_status: Option<u16>,
     },
+}
+
+/// The upstream 4xx status to surface to the client, but ONLY for a client-class
+/// `BadRequest` (context length exceeded, invalid parameter, unknown model). Auth
+/// (401/403 — a gateway-key/config fault) and 429/5xx/network are deliberately
+/// excluded: those are not the caller's to fix, so they keep the infra-class 500.
+fn upstream_client_status(e: &ProviderError) -> Option<u16> {
+    match e {
+        ProviderError::BadRequest { status, .. } if (400..500).contains(status) => Some(*status),
+        _ => None,
+    }
 }
 
 /// Drive ONE target end-to-end: breaker re-checks, the per-attempt timeout
@@ -4519,6 +4583,7 @@ async fn attempt_target(
             return TargetOutcome::Exhausted {
                 last_error: format!("Unsupported provider: {provider_name}"),
                 health_failure: false,
+                terminal_client_status: None,
             }
         }
     };
@@ -4539,6 +4604,7 @@ async fn attempt_target(
                         "request deadline exceeded before retrying {provider_name}"
                     ),
                     health_failure: false,
+                    terminal_client_status: None,
                 };
             }
             if !delay.is_zero() {
@@ -4552,6 +4618,7 @@ async fn attempt_target(
             return TargetOutcome::Exhausted {
                 last_error: format!("circuit breaker open for {provider_name}"),
                 health_failure: false,
+                terminal_client_status: None,
             };
         }
 
@@ -4562,6 +4629,7 @@ async fn attempt_target(
                     last_error: "request deadline exceeded before all providers were tried"
                         .to_string(),
                     health_failure: false,
+                    terminal_client_status: None,
                 }
             }
         };
@@ -4598,6 +4666,7 @@ async fn attempt_target(
                 return TargetOutcome::Exhausted {
                     last_error: format!("half-open probe cap saturated for {provider_name}"),
                     health_failure: false,
+                    terminal_client_status: None,
                 };
             }
         };
@@ -4707,9 +4776,11 @@ async fn attempt_target(
                     provider_name,
                     last_error
                 );
+                let terminal_client_status = upstream_client_status(&e);
                 return TargetOutcome::Exhausted {
                     last_error,
                     health_failure,
+                    terminal_client_status,
                 };
             }
         }
@@ -4756,6 +4827,8 @@ async fn run_hedged_targets(
     config_ref_label: Option<&'static str>,
     config_matched_label: Option<&str>,
     last_error: &mut String,
+    // Sticky client-4xx status across the hedged race (see the sequential path).
+    last_client_status: &mut Option<u16>,
 ) -> Option<(
     usize,
     Box<routeplane_types::ChatCompletionResponse>,
@@ -4844,8 +4917,15 @@ async fn run_hedged_targets(
                         // ADR-087: the hedge path passes `key_index: None`, so the
                         // breaker is fed inside `attempt_target` as before —
                         // `health_failure` is unused here.
-                        TargetOutcome::Exhausted { last_error: e, .. } => {
+                        TargetOutcome::Exhausted {
+                            last_error: e,
+                            terminal_client_status,
+                            ..
+                        } => {
                             *last_error = e;
+                            if terminal_client_status.is_some() {
+                                *last_client_status = terminal_client_status;
+                            }
                             // Failure-fallback: immediately start the next target
                             // (not a `delay`-gated hedge) if any remain.
                             if next < ready.len() {
@@ -4872,8 +4952,15 @@ async fn run_hedged_targets(
                     } => {
                         return Some((idx, response, elapsed_ms, was_hedge));
                     }
-                    TargetOutcome::Exhausted { last_error: e, .. } => {
+                    TargetOutcome::Exhausted {
+                        last_error: e,
+                        terminal_client_status,
+                        ..
+                    } => {
                         *last_error = e;
+                        if terminal_client_status.is_some() {
+                            *last_client_status = terminal_client_status;
+                        }
                         if next < ready.len() {
                             launch!(false);
                         }
@@ -5114,6 +5201,8 @@ async fn stream_chat_completions(
     let _ = &plan;
     let mut rng = PolicyRng::seeded(backoff_seed());
     let mut last_error = "No providers available".to_string();
+    // Terminal client-class 4xx status (streaming), mirroring the buffered path.
+    let mut last_client_status: Option<u16> = None;
     // FR-16 annotation for the streaming usage event (bypass when a cache
     // config was present; nothing when there was none — FR-2).
     let stream_cache_status: Option<&'static str> = cache_namespace
@@ -5294,6 +5383,10 @@ async fn stream_chat_completions(
                             state.health.record_failure(provider_name);
                         }
                         last_error = e.to_string();
+                        // Sticky client-4xx (see the buffered path).
+                        if let Some(s) = upstream_client_status(&e) {
+                            last_client_status = Some(s);
+                        }
                         record_stream_attempt_failure(
                             &state,
                             &virtual_key,
@@ -6045,7 +6138,9 @@ async fn stream_chat_completions(
         request_id,
         last_error
     );
-    crate::api_error::upstream_all_failed()
+    // Surface a terminal client-class 4xx as its real status so an OpenAI SDK
+    // doesn't blind-retry a 500; infra-class exhaustion stays the generic 500.
+    crate::api_error::upstream_failed(last_client_status)
 }
 
 #[cfg(test)]
@@ -6053,6 +6148,86 @@ mod tests {
     use super::*;
     use routeplane_entitlements::Tier;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn classifier_text_includes_tool_call_arguments_so_region_lock_is_not_bypassed() {
+        // PII (Aadhaar) present ONLY in tool_call arguments — content is PII-free.
+        // The classifier text must include the tool-call name + arguments, and the
+        // ResidencyEngine must then detect regulated personal data (else the hard
+        // region-lock is silently bypassed for tool-argument PII).
+        let payload: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                { "role": "user", "content": "please continue the kyc flow" },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "verify_kyc",
+                            "arguments": "{\"aadhaar\":\"2341 2341 2346\",\"pan\":\"ABCDE1234F\"}"
+                        }
+                    }]
+                }
+            ]
+        }))
+        .expect("request parses");
+
+        let content_only: String = payload
+            .messages
+            .iter()
+            .map(|m| m.content.as_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!content_only.contains("2341 2341 2346"));
+
+        let text = residency_classifier_text(&payload.messages);
+        assert!(text.contains("verify_kyc"));
+        assert!(text.contains("2341 2341 2346"));
+
+        let engine = ResidencyEngine::new();
+        assert!(
+            engine.classify(&text).contains_personal_data,
+            "tool-argument Aadhaar must be classified as personal data"
+        );
+        assert!(
+            !engine.classify(&content_only).contains_personal_data,
+            "control: content alone carries no personal data"
+        );
+    }
+
+    #[test]
+    fn client_4xx_and_429_do_not_cool_the_shared_breaker() {
+        let p = || "openai".to_string();
+        assert!(!counts_as_health_failure(&ProviderError::RateLimited {
+            provider: p(),
+            retry_after: None,
+            body: String::new(),
+        }));
+        assert!(!counts_as_health_failure(&ProviderError::BadRequest {
+            provider: p(),
+            status: 400,
+            body: String::new(),
+        }));
+        assert!(counts_as_health_failure(&ProviderError::Upstream5xx {
+            provider: p(),
+            status: 503,
+            body: String::new(),
+        }));
+        assert!(counts_as_health_failure(&ProviderError::Timeout {
+            provider: p(),
+            detail: String::new(),
+        }));
+        assert!(counts_as_health_failure(&ProviderError::Network {
+            provider: p(),
+            detail: String::new(),
+        }));
+        assert!(counts_as_health_failure(&ProviderError::Translation {
+            detail: String::new(),
+        }));
+    }
 
     // --- ADR-087 multi-account pool helpers -----------------------------------
 

@@ -94,6 +94,38 @@ pub fn upstream_all_failed() -> Response {
     )
 }
 
+/// 4xx — the terminal upstream failure was a CLIENT-class error (a real
+/// `400/404/422` from the provider: context length exceeded, unsupported
+/// parameter, unknown model — something the CALLER can fix), not an infra-class
+/// fault. Surface the error CLASS with the upstream's 4xx status and an
+/// OpenAI-shaped `invalid_request_error` envelope so that (a) an OpenAI SDK does
+/// NOT blindly back-off-retry it (SDKs retry on `>=500`, so the old blanket 500
+/// caused retry storms against a permanently-failing request), and (b) the
+/// caller's error-handling branch fires on a 4xx. The provider's raw body and
+/// identity are STILL never echoed — only the status class crosses the boundary.
+pub fn upstream_client_error(status: StatusCode) -> Response {
+    error_response(
+        status,
+        "upstream_invalid_request",
+        "The upstream provider rejected the request as invalid \
+         (e.g. context length exceeded, an unsupported parameter, or an unknown model). \
+         Check the request parameters.",
+        "invalid_request_error",
+        None,
+    )
+}
+
+/// Render the terminal all-failed response, choosing the status by the terminal
+/// error CLASS. A client-class 4xx (`terminal_client_status`) → the real status
+/// via [`upstream_client_error`]; otherwise the infra-class 500 via
+/// [`upstream_all_failed`]. The single seam the chat + streaming paths share.
+pub fn upstream_failed(terminal_client_status: Option<u16>) -> Response {
+    match terminal_client_status.and_then(|s| StatusCode::from_u16(s).ok()) {
+        Some(status) if status.is_client_error() => upstream_client_error(status),
+        _ => upstream_all_failed(),
+    }
+}
+
 /// 501 — a deliberately-unsupported endpoint (FR-13, PRD-011). Rather than the
 /// bare unknown-route 404, the gateway returns an OpenAI-shaped decline that
 /// NAMES `endpoint_not_supported` and POINTS the caller at the supported
@@ -303,6 +335,38 @@ mod tests {
         assert!(!msg.contains("api key"));
         assert!(!msg.contains("openai"));
         assert!(!msg.contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn upstream_client_4xx_is_surfaced_not_collapsed_to_500() {
+        // A terminal upstream 400 (context_length_exceeded etc.) must surface as a
+        // 4xx invalid_request_error, so an OpenAI SDK does not blind-retry and the
+        // caller's error branch fires.
+        let resp = upstream_failed(Some(400));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["code"], "upstream_invalid_request");
+        let msg = v["error"]["message"].as_str().unwrap().to_lowercase();
+        assert!(!msg.contains("openai"));
+        assert!(!msg.contains("anthropic"));
+        assert_eq!(upstream_failed(Some(404)).status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            upstream_failed(Some(422)).status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_non_client_terminal_stays_500() {
+        assert_eq!(
+            upstream_failed(None).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            upstream_failed(Some(503)).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[tokio::test]
