@@ -2013,6 +2013,9 @@ dependencies = [
 [[package]]
 name = "routeplane-router"
 version = "0.1.0"
+dependencies = [
+ "arc-swap",
+]
 
 [[package]]
 name = "routeplane-rtk"

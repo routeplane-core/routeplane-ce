@@ -61,6 +61,7 @@ fn provider_cfg(name: &str, base_url: &str, models: &[&str]) -> CustomProviderCo
         base_url: base_url.into(),
         api_key: CUSTOM_KEY.into(),
         models: models.iter().map(|m| m.to_string()).collect(),
+        stream_include_usage: None,
         created_at: None,
     }
 }

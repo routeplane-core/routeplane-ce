@@ -963,6 +963,13 @@ async fn main() {
         custom_providers,
     });
 
+    // Register health cells for custom providers loaded from disk at boot (ADR-113),
+    // so a restart doesn't leave a persisted custom provider without a circuit
+    // breaker until its next upsert. Idempotent; no-op when none are configured.
+    for name in state.custom_providers.names() {
+        state.health.register(&name);
+    }
+
     // ADR-064: CP→DP rate-limit distributor — spawned ONLY when RP_CP_CONFIG_URL is
     // set (the same gate as the model-enablement poller). Off ⇒ never runs ⇒ the
     // boot `keys.json` registry is untouched ⇒ byte-identical. When on, it polls CP

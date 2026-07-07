@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -305,14 +306,36 @@ pub enum ProbeAdmission {
     Untracked,
 }
 
+/// The three per-provider health cells, bundled so the whole set for one
+/// provider lives behind a single `Arc` in the registry map. The atomics inside
+/// each cell do all the mutation, so a live `Arc<ProviderHealth>` is safely
+/// shared and mutated without a lock — a registry swap that clones the map keeps
+/// these same `Arc`s, so a provider's accumulated state survives it (ADR-113).
+struct ProviderHealth {
+    breaker: CircuitBreaker,
+    latency: LatencyEwma,
+    in_flight: Arc<InFlightGauge>,
+}
+
+impl ProviderHealth {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            breaker: CircuitBreaker::new(),
+            latency: LatencyEwma::new(),
+            in_flight: Arc::new(InFlightGauge::default()),
+        })
+    }
+}
+
 /// Per-provider health: one circuit breaker plus one latency EWMA plus one
-/// in-flight gauge per provider, pre-registered at startup so the map is
-/// read-only (the atomics do all the mutation, so no lock is needed on the
-/// request path).
+/// in-flight gauge per provider. Built-ins are registered at startup; custom
+/// providers (ADR-099) are registered at runtime via [`register`](Self::register).
+/// The provider map is held behind an [`ArcSwap`] so registration is an RCU swap
+/// — every read on the request path is a single lock-free atomic load, never a
+/// mutex (ADR-113). The atomics inside each `ProviderHealth` do all per-provider
+/// mutation, so an in-flight record is never lost to a concurrent registration.
 pub struct HealthTracker {
-    breakers: HashMap<String, CircuitBreaker>,
-    latency: HashMap<String, LatencyEwma>,
-    in_flight: HashMap<String, Arc<InFlightGauge>>,
+    providers: ArcSwap<HashMap<String, Arc<ProviderHealth>>>,
     /// ADR-087 multi-account: per-key rate-limit **cooldown** cells (`cooled_until`
     /// epoch-millis; `0` = not cooled). A fixed-size array indexed by
     /// `hash(tenant, provider, key_index)`, allocated once — lock-free reads/writes
@@ -336,29 +359,60 @@ impl HealthTracker {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let mut breakers = HashMap::new();
-        let mut latency = HashMap::new();
-        let mut in_flight = HashMap::new();
+        let mut map: HashMap<String, Arc<ProviderHealth>> = HashMap::new();
         for p in providers {
-            let name: String = p.into();
-            breakers.insert(name.clone(), CircuitBreaker::new());
-            latency.insert(name.clone(), LatencyEwma::new());
-            in_flight.insert(name, Arc::new(InFlightGauge::default()));
+            map.insert(p.into(), ProviderHealth::new());
         }
         let key_cooldowns = (0..KEY_COOLDOWN_CELLS)
             .map(|_| AtomicU64::new(0))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
-            breakers,
-            latency,
-            in_flight,
+            providers: ArcSwap::from_pointee(map),
             key_cooldowns,
         }
     }
 
-    pub fn breaker(&self, provider: &str) -> Option<&CircuitBreaker> {
-        self.breakers.get(provider)
+    /// Register a provider's health cells if absent (idempotent). Built-ins are
+    /// registered at construction; this is how a runtime custom provider
+    /// (ADR-099) gets a circuit breaker + latency EWMA + in-flight gauge so it is
+    /// fast-failed and latency-ordered like any built-in (ADR-113).
+    ///
+    /// Additive-only: an existing provider is left **untouched**, so a breaker an
+    /// operator just watched open is never reset by re-registering it (or by
+    /// registering a different provider). The RCU closure clones the map — which
+    /// clones the `Arc`s, preserving every provider's accumulated state — and
+    /// swaps in the extended copy. Off the hot path (called on registry upsert).
+    pub fn register(&self, provider: impl Into<String>) {
+        let name = provider.into();
+        // Fast path: already present ⇒ no allocation, no swap (and never a reset).
+        if self.providers.load().contains_key(&name) {
+            return;
+        }
+        self.providers.rcu(|cur| {
+            let mut next = HashMap::clone(cur);
+            next.entry(name.clone()).or_insert_with(ProviderHealth::new);
+            next
+        });
+    }
+
+    /// Test-only: replace `provider`'s breaker with a clock-injectable one (fresh
+    /// latency/gauge), so cooldown→half-open transitions are deterministic. Uses a
+    /// single `store` (not `rcu`): `CircuitBreaker` holds a `Box<dyn Fn>` clock and
+    /// is not `Clone`, so it cannot be moved into an `FnMut` retry closure — and
+    /// tests are single-threaded here, so there is no swap to contend with.
+    #[cfg(test)]
+    fn set_breaker_for_test(&self, provider: &str, breaker: CircuitBreaker) {
+        let mut next = (**self.providers.load()).clone();
+        next.insert(
+            provider.to_string(),
+            Arc::new(ProviderHealth {
+                breaker,
+                latency: LatencyEwma::new(),
+                in_flight: Arc::new(InFlightGauge::default()),
+            }),
+        );
+        self.providers.store(Arc::new(next));
     }
 
     /// The per-key cooldown cell for `(tenant, provider, key_index)` (ADR-087).
@@ -416,8 +470,8 @@ impl HealthTracker {
     /// Record an observed latency sample (milliseconds) for `provider`, folding
     /// it into that provider's EWMA. Unknown providers are ignored.
     pub fn record_latency(&self, provider: &str, ms: u64) {
-        if let Some(l) = self.latency.get(provider) {
-            l.record(ms);
+        if let Some(h) = self.providers.load().get(provider) {
+            h.latency.record(ms);
         }
     }
 
@@ -425,7 +479,10 @@ impl HealthTracker {
     /// recorded yet (or the provider is unknown). Used by the `Latency` strategy
     /// to order providers and to treat untried ones optimistically.
     pub fn latency_ms(&self, provider: &str) -> Option<u64> {
-        self.latency.get(provider).and_then(|l| l.read())
+        self.providers
+            .load()
+            .get(provider)
+            .and_then(|h| h.latency.read())
     }
 
     /// Current number of outstanding (in-flight) requests for `provider`. Read by
@@ -433,9 +490,10 @@ impl HealthTracker {
     /// registered) reports the maximum so it sorts LAST — least-busy never
     /// prefers a provider it cannot meter.
     pub fn in_flight(&self, provider: &str) -> u64 {
-        self.in_flight
+        self.providers
+            .load()
             .get(provider)
-            .map(|g| g.count.load(Ordering::Relaxed))
+            .map(|h| h.in_flight.count.load(Ordering::Relaxed))
             .unwrap_or(u64::MAX)
     }
 
@@ -446,7 +504,9 @@ impl HealthTracker {
     /// provider (no gauge to track) — the caller proceeds untracked, exactly as
     /// before the gauge existed.
     pub fn enter_in_flight(&self, provider: &str) -> Option<InFlightGuard> {
-        let gauge = self.in_flight.get(provider)?.clone();
+        // Clone only the gauge Arc (it must outlive the load guard, inside the
+        // returned InFlightGuard) — not the whole ProviderHealth.
+        let gauge = self.providers.load().get(provider)?.in_flight.clone();
         gauge.count.fetch_add(1, Ordering::Relaxed);
         Some(InFlightGuard { gauge })
     }
@@ -459,9 +519,10 @@ impl HealthTracker {
     /// permit bookkeeping and can never leak. Unknown providers (no breaker
     /// registered) are treated as available.
     pub fn is_available(&self, provider: &str) -> bool {
-        self.breakers
+        self.providers
+            .load()
             .get(provider)
-            .map(|b| b.admits(self.in_flight(provider)))
+            .map(|h| h.breaker.admits(h.in_flight.count.load(Ordering::Relaxed)))
             .unwrap_or(true)
     }
 
@@ -478,13 +539,15 @@ impl HealthTracker {
     /// and self-correcting (a HalfOpen→Closed race admits one extra; a Closed→HalfOpen
     /// race is the same one-instant softness the gauge always had).
     pub fn try_enter_probe(&self, provider: &str) -> ProbeAdmission {
-        let Some(breaker) = self.breakers.get(provider) else {
+        // Hold the load guard for the whole method: `breaker` borrows through it;
+        // only the gauge Arc is cloned (it outlives the guard in the returned
+        // InFlightGuard).
+        let providers = self.providers.load();
+        let Some(health) = providers.get(provider) else {
             return ProbeAdmission::Untracked;
         };
-        let gauge = match self.in_flight.get(provider) {
-            Some(g) => g.clone(),
-            None => return ProbeAdmission::Untracked,
-        };
+        let breaker = &health.breaker;
+        let gauge = health.in_flight.clone();
         match breaker.state() {
             CircuitState::Open => ProbeAdmission::Rejected,
             // Closed: admit unconditionally — the probe cap is half-open-only. One
@@ -516,31 +579,32 @@ impl HealthTracker {
     }
 
     pub fn record_success(&self, provider: &str) {
-        if let Some(b) = self.breakers.get(provider) {
-            b.record_success();
+        if let Some(h) = self.providers.load().get(provider) {
+            h.breaker.record_success();
         }
     }
 
     pub fn record_failure(&self, provider: &str) {
-        if let Some(b) = self.breakers.get(provider) {
-            b.record_failure();
+        if let Some(h) = self.providers.load().get(provider) {
+            h.breaker.record_failure();
         }
     }
 
     pub fn state(&self, provider: &str) -> CircuitState {
-        self.breakers
+        self.providers
+            .load()
             .get(provider)
-            .map(|b| b.state())
+            .map(|h| h.breaker.state())
             .unwrap_or(CircuitState::Closed)
     }
 
-    /// The registered provider names. The breaker map is built once at startup
-    /// and never mutated (the atomics do all per-provider mutation), so this is
-    /// a lock-free read over an immutable structure — safe to call off the hot
-    /// path (e.g. the read-only `/status` surface). Order is unspecified; the
-    /// caller sorts for a stable view.
-    pub fn provider_names(&self) -> Vec<&str> {
-        self.breakers.keys().map(String::as_str).collect()
+    /// The registered provider names (built-ins plus any runtime-registered
+    /// custom providers). A lock-free load of the current registry snapshot —
+    /// safe to call off the hot path (e.g. the read-only `/status` surface).
+    /// Returns owned `String`s (the snapshot guard does not outlive the call);
+    /// order is unspecified, so the caller sorts for a stable view.
+    pub fn provider_names(&self) -> Vec<String> {
+        self.providers.load().keys().cloned().collect()
     }
 }
 
@@ -561,6 +625,81 @@ mod tests {
         let mut names = h.provider_names();
         names.sort_unstable();
         assert_eq!(names, vec!["anthropic", "gemini", "openai"]);
+    }
+
+    // --- ADR-113 dynamic registration (custom providers) ----------------------
+
+    #[test]
+    fn unregistered_custom_provider_is_available_but_untracked() {
+        let h = HealthTracker::new(["openai"]);
+        // Fail-open: an unknown provider is available and its records no-op.
+        assert!(h.is_available("vllm_local"));
+        assert_eq!(h.state("vllm_local"), CircuitState::Closed);
+        for _ in 0..DEFAULT_FAILURE_THRESHOLD {
+            h.record_failure("vllm_local"); // no breaker ⇒ silently ignored
+        }
+        assert!(h.is_available("vllm_local"), "still untracked, never trips");
+        assert!(matches!(
+            h.try_enter_probe("vllm_local"),
+            ProbeAdmission::Untracked
+        ));
+    }
+
+    #[test]
+    fn register_gives_a_custom_provider_a_breaker_that_trips() {
+        let h = HealthTracker::new(["openai"]);
+        h.register("vllm_local");
+        assert!(h.is_available("vllm_local"));
+        assert!(h.provider_names().iter().any(|n| n == "vllm_local"));
+        // Now it is tracked: DEFAULT_FAILURE_THRESHOLD failures open the circuit,
+        // and order-time `is_available` will drop it (closing ledger #11).
+        for _ in 0..DEFAULT_FAILURE_THRESHOLD {
+            h.record_failure("vllm_local");
+        }
+        assert_eq!(h.state("vllm_local"), CircuitState::Open);
+        assert!(!h.is_available("vllm_local"));
+    }
+
+    #[test]
+    fn register_is_idempotent_and_never_resets_an_open_breaker() {
+        let h = HealthTracker::new(["openai"]);
+        h.register("vllm_local");
+        for _ in 0..DEFAULT_FAILURE_THRESHOLD {
+            h.record_failure("vllm_local");
+        }
+        assert_eq!(h.state("vllm_local"), CircuitState::Open);
+        // Re-registering (an update upsert) must NOT reset the breaker an operator
+        // just watched open.
+        h.register("vllm_local");
+        assert_eq!(h.state("vllm_local"), CircuitState::Open);
+        assert!(!h.is_available("vllm_local"));
+    }
+
+    #[test]
+    fn registering_one_provider_preserves_anothers_state() {
+        let h = HealthTracker::new(["openai"]);
+        h.register("vllm_a");
+        for _ in 0..DEFAULT_FAILURE_THRESHOLD {
+            h.record_failure("vllm_a");
+        }
+        assert_eq!(h.state("vllm_a"), CircuitState::Open);
+        // Registering a DIFFERENT provider swaps the map; the clone preserves
+        // vllm_a's live breaker Arc, so its Open state survives.
+        h.register("vllm_b");
+        assert_eq!(h.state("vllm_a"), CircuitState::Open);
+        assert!(h.is_available("vllm_b"));
+    }
+
+    #[test]
+    fn register_is_a_noop_for_a_builtin() {
+        let h = HealthTracker::new(["openai"]);
+        for _ in 0..DEFAULT_FAILURE_THRESHOLD {
+            h.record_failure("openai");
+        }
+        assert_eq!(h.state("openai"), CircuitState::Open);
+        // Re-registering a built-in must not reset its breaker either.
+        h.register("openai");
+        assert_eq!(h.state("openai"), CircuitState::Open);
     }
 
     // --- ADR-087 per-key cooldown cells ---------------------------------------
@@ -701,12 +840,12 @@ mod tests {
         // clock-injectable one so the cooldown → half-open transition is
         // deterministic (the default breaker uses the wall clock). The latency
         // and in-flight gauges from `new` stay intact.
-        let mut h = HealthTracker::new(["openai"]);
+        let h = HealthTracker::new(["openai"]);
         let clock = Arc::new(AtomicU64::new(0));
         let c = clock.clone();
         // failure_threshold=2, success_threshold=3, cooldown=100ms.
-        h.breakers.insert(
-            "openai".to_string(),
+        h.set_breaker_for_test(
+            "openai",
             CircuitBreaker::with_clock(2, 3, 100, Box::new(move || c.load(Ordering::Relaxed))),
         );
 
@@ -736,12 +875,12 @@ mod tests {
     fn try_enter_probe_hard_caps_half_open_concurrency() {
         use std::sync::Arc;
         // Deterministic clock for the cooldown → half-open transition.
-        let mut h = HealthTracker::new(["openai"]);
+        let h = HealthTracker::new(["openai"]);
         let clock = Arc::new(AtomicU64::new(0));
         let c = clock.clone();
         // failure_threshold=2, success_threshold=2, cooldown=100ms.
-        h.breakers.insert(
-            "openai".to_string(),
+        h.set_breaker_for_test(
+            "openai",
             CircuitBreaker::with_clock(2, 2, 100, Box::new(move || c.load(Ordering::Relaxed))),
         );
 

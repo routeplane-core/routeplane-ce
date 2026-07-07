@@ -53,6 +53,12 @@ pub struct CustomProviderConfig {
     /// Model ids this provider serves. A chat request whose `model` matches one
     /// (and names no provider/config explicitly) routes here.
     pub models: Vec<String>,
+    /// Whether streaming requests to this upstream ask for
+    /// `stream_options.include_usage`. Absent/`true` (the default) keeps token
+    /// accounting; set `false` for a strict older OpenAI-ish runtime that 400s
+    /// on the field and would otherwise lose ALL streaming (#35).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_include_usage: Option<bool>,
     /// RFC-3339 creation stamp; set server-side at create, preserved on update.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
@@ -341,8 +347,15 @@ impl RuntimeProviders {
             // pointed at this provider's base_url. No residency region: a
             // custom provider is never eligible for sovereign routing unless a
             // future pass adds an explicit region field (conservative default).
-            let adapter: Arc<dyn Provider> =
-                Arc::new(SelfHostedProvider::new(cfg.base_url.clone(), String::new()));
+            // Default true (matches the built-in self_hosted behavior); a
+            // strict upstream opts out via the config flag (#35).
+            let self_hosted = SelfHostedProvider::new(cfg.base_url.clone(), String::new());
+            let self_hosted = if cfg.stream_include_usage == Some(false) {
+                self_hosted.without_stream_usage()
+            } else {
+                self_hosted
+            };
+            let adapter: Arc<dyn Provider> = Arc::new(self_hosted);
             by_name.insert(
                 cfg.name.clone(),
                 Arc::new(CustomProviderEntry {
@@ -631,6 +644,7 @@ mod tests {
             base_url: "http://vllm.internal:8000".into(),
             api_key: "sk-custom-abcdef1234".into(),
             models: models.iter().map(|m| m.to_string()).collect(),
+            stream_include_usage: None,
             created_at: None,
         }
     }

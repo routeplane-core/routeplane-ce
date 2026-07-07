@@ -6,11 +6,15 @@ rust-version.workspace = true
 publish.workspace = true
 
 # Routing + health: a lock-free per-provider circuit breaker + latency EWMA,
-# and candidate-ordering strategies (priority/cost/latency/weighted). std-only
-# (no deps) so the hot path stays lean — weighted uses an injectable seedable
-# RNG (SplitMix64) rather than the `rand` crate to stay dependency-free and
-# keep ordering deterministic under test.
+# and candidate-ordering strategies (priority/cost/latency/weighted). Nearly
+# std-only so the hot path stays lean — weighted uses an injectable seedable
+# RNG (SplitMix64) rather than the `rand` crate to stay lean and keep ordering
+# deterministic under test. The single dependency is `arc-swap`: the health
+# registry must accept custom providers at runtime (ADR-113) while keeping every
+# read lock-free — an RCU swap std cannot express without an `RwLock` on the hot
+# path. Same primitive the policy hot-reload (ADR-021) already uses.
 [dependencies]
+arc-swap = { workspace = true }
 
 # Opt in to the workspace lint policy (deny warnings) — see root Cargo.toml.
 [lints]
