@@ -83,6 +83,14 @@ struct CohereChatRequest {
     /// `tool_choice`; unmappable shapes are omitted rather than sent invalid.
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    /// Cohere v2 structured-output toggle, mapped from the canonical OpenAI
+    /// `response_format`. Both `{"type":"json_object"}` and
+    /// `{"type":"json_schema",…}` map to Cohere's JSON-object mode. Previously the
+    /// field was silently dropped, so a structured-output request got free-form
+    /// prose that then failed the caller's `JSON.parse`. `None` ⇒ omitted ⇒
+    /// byte-identical to a plain request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<serde_json::Value>,
     stream: bool,
 }
 
@@ -241,7 +249,23 @@ fn build_cohere_request(request: &ChatCompletionRequest, stream: bool) -> Cohere
             .tool_choice
             .as_ref()
             .and_then(map_cohere_tool_choice),
+        response_format: map_cohere_response_format(request.response_format.as_ref()),
         stream,
+    }
+}
+
+/// Map the canonical OpenAI `response_format` to Cohere v2's `response_format`.
+/// Both `{"type":"json_object"}` and `{"type":"json_schema",…}` map to Cohere's
+/// JSON-object mode (`{"type":"json_object"}`) — this forces valid JSON output
+/// (the essential fix: the field was previously dropped, yielding prose). Any
+/// other (or absent) shape yields `None` so a non-JSON request stays
+/// byte-identical and no invalid field is ever sent.
+fn map_cohere_response_format(rf: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    match rf?.get("type").and_then(|t| t.as_str()) {
+        Some("json_object") | Some("json_schema") => {
+            Some(serde_json::json!({ "type": "json_object" }))
+        }
+        _ => None,
     }
 }
 
@@ -1326,6 +1350,35 @@ mod tests {
         }));
         let v = serde_json::to_value(build_cohere_request(&r, false)).unwrap();
         assert!(v.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn request_maps_response_format_to_cohere_json_object_mode() {
+        // Previously dropped → structured-output requests got prose. Both
+        // json_object and json_schema map to Cohere's JSON-object mode.
+        let mut r = req("command-r");
+        assert!(
+            serde_json::to_value(build_cohere_request(&r, false))
+                .unwrap()
+                .get("response_format")
+                .is_none(),
+            "absent response_format stays omitted (byte-identical)"
+        );
+
+        r.response_format = Some(serde_json::json!({"type": "json_object"}));
+        let v = serde_json::to_value(build_cohere_request(&r, false)).unwrap();
+        assert_eq!(v["response_format"]["type"], "json_object");
+
+        r.response_format = Some(serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {"schema": {"type": "object"}}
+        }));
+        let v = serde_json::to_value(build_cohere_request(&r, false)).unwrap();
+        assert_eq!(v["response_format"]["type"], "json_object");
+
+        r.response_format = Some(serde_json::json!({"type": "weird"}));
+        let v = serde_json::to_value(build_cohere_request(&r, false)).unwrap();
+        assert!(v.get("response_format").is_none());
     }
 
     #[test]

@@ -368,9 +368,17 @@ pub trait Provider: Send + Sync {
         Vec::new()
     }
 
-    /// Whether this provider is resident in the given jurisdiction.
+    /// Whether this provider is resident in the given jurisdiction. The match is
+    /// **case-insensitive** (ASCII): adapters declare regions uppercase (e.g.
+    /// Azure `"IN"`) while the org layer and the ISO-3166 alpha-2 convention use
+    /// lowercase (`"in"`), and the `x-routeplane-residency` header is passed
+    /// through verbatim. A case-sensitive `==` here 422'd legitimate sovereign
+    /// traffic sent with a lowercase region code, fail-closing in the wrong
+    /// direction.
     fn is_resident_in(&self, region: &str) -> bool {
-        self.resident_regions().iter().any(|r| r == region)
+        self.resident_regions()
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(region))
     }
 
     async fn chat_completion(
@@ -516,5 +524,49 @@ pub trait Provider: Send + Sync {
         _api_key: String,
     ) -> Result<SpeechAudio, ProviderError> {
         Err(ProviderError::speech_not_supported(self.name()))
+    }
+}
+
+#[cfg(test)]
+mod residency_match_tests {
+    use super::*;
+
+    /// Minimal `Provider` whose only meaningful behaviour is its declared
+    /// resident regions — enough to exercise the default `is_resident_in`.
+    struct StubProvider(Vec<String>);
+
+    #[async_trait]
+    impl Provider for StubProvider {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+        fn resident_regions(&self) -> Vec<String> {
+            self.0.clone()
+        }
+        async fn chat_completion(
+            &self,
+            _request: ChatCompletionRequest,
+            _api_key: String,
+        ) -> Result<ChatCompletionResponse, ProviderError> {
+            Err(ProviderError::translation("stub: not used in this test"))
+        }
+    }
+
+    #[test]
+    fn is_resident_in_is_case_insensitive() {
+        // Adapters declare regions UPPERCASE (Azure "IN"); the header / org layer
+        // use the lowercase ISO-3166 code. A lowercase `in` MUST match `IN`, else
+        // legitimate India-resident sovereign traffic 422s.
+        let p = StubProvider(vec!["IN".to_string()]);
+        assert!(p.is_resident_in("IN"));
+        assert!(
+            p.is_resident_in("in"),
+            "lowercase must match uppercase declaration"
+        );
+        assert!(p.is_resident_in("In"));
+        assert!(!p.is_resident_in("eu"));
+        assert!(!p.is_resident_in("us"));
+        let none = StubProvider(vec![]);
+        assert!(!none.is_resident_in("in"));
     }
 }

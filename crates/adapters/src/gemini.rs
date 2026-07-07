@@ -221,6 +221,14 @@ struct GeminiUsage {
     /// that didn't hit a cached prefix ⇒ `None`. Lifted to `Usage.cached_tokens`.
     #[serde(default)]
     cachedContentTokenCount: Option<u32>,
+    /// Gemini 2.5 thinking-model reasoning tokens. Gemini reports these SEPARATELY
+    /// from `candidatesTokenCount` (which EXCLUDES them) but INCLUDES them in
+    /// `totalTokenCount`. Absent on non-thinking responses ⇒ `None`. Folded into
+    /// `completion_tokens` (OpenAI counts reasoning as completion) so the
+    /// `total == prompt + completion` invariant holds and output-token cost is
+    /// attributed correctly.
+    #[serde(default)]
+    thoughtsTokenCount: Option<u32>,
 }
 
 /// A unique response id per Gemini call (Gemini's generateContent gives no
@@ -400,6 +408,7 @@ impl Provider for GeminiProvider {
             candidatesTokenCount: 0,
             totalTokenCount: 0,
             cachedContentTokenCount: None,
+            thoughtsTokenCount: None,
         });
 
         Ok(ChatCompletionResponse {
@@ -410,7 +419,11 @@ impl Provider for GeminiProvider {
             choices,
             usage: Usage {
                 prompt_tokens: usage.promptTokenCount,
-                completion_tokens: usage.candidatesTokenCount,
+                // Fold thinking tokens into completion (OpenAI counts reasoning as
+                // completion; Gemini excludes them from candidatesTokenCount). None
+                // on non-thinking responses ⇒ byte-identical to the old mapping.
+                completion_tokens: usage.candidatesTokenCount
+                    + usage.thoughtsTokenCount.unwrap_or(0),
                 total_tokens: usage.totalTokenCount,
                 // Gemini context-cache read tokens (upstream fidelity fix) — was silently dropped.
                 cached_tokens: usage.cachedContentTokenCount,
@@ -709,6 +722,27 @@ fn translate_gemini_chunk(
         format!("Gemini stream parse error: {e}: {payload}").into()
     })?;
 
+    // A mid-stream error frame (`data: {"error":{"code":…,"status":…,"message":…}}`)
+    // carries no `candidates`, so without this guard it fell into the
+    // `None => Ok(())` arm below and was SWALLOWED — the graceful socket close then
+    // made the proxy emit `data: [DONE]` and report a clean success for a
+    // provider-failed, truncated stream. Surface it as an `Err` so the proxy
+    // terminates WITHOUT `[DONE]`. Only the stable status/code is carried (never
+    // the free-form message).
+    if let Some(err) = v.get("error").filter(|e| e.is_object()) {
+        let status = err
+            .get("status")
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                err.get("code")
+                    .and_then(|c| c.as_u64())
+                    .map(|c| c.to_string())
+            })
+            .unwrap_or_else(|| "error".to_string());
+        return Err(format!("gemini stream error: {status}").into());
+    }
+
     let candidate = match v["candidates"].get(0) {
         Some(c) => c,
         None => return Ok(()), // usage-only or empty payload
@@ -780,7 +814,11 @@ fn translate_gemini_chunk(
     if let Some(finish) = candidate["finishReason"].as_str() {
         let usage = v.get("usageMetadata").map(|u| Usage {
             prompt_tokens: u["promptTokenCount"].as_u64().unwrap_or(0) as u32,
-            completion_tokens: u["candidatesTokenCount"].as_u64().unwrap_or(0) as u32,
+            // Fold thinking tokens into completion (see the buffered path). Absent
+            // on non-thinking responses ⇒ byte-identical to the old mapping.
+            completion_tokens: (u["candidatesTokenCount"].as_u64().unwrap_or(0)
+                + u["thoughtsTokenCount"].as_u64().unwrap_or(0))
+                as u32,
             total_tokens: u["totalTokenCount"].as_u64().unwrap_or(0) as u32,
             // Gemini context-cache read tokens (upstream fidelity fix) — was silently dropped.
             cached_tokens: u["cachedContentTokenCount"].as_u64().map(|c| c as u32),
@@ -1133,6 +1171,48 @@ mod tests {
         assert_eq!(out[0].choices[0].delta.content.as_deref(), Some("!"));
         assert_eq!(out[1].choices[0].finish_reason.as_deref(), Some("stop"));
         assert_eq!(out[1].usage.as_ref().unwrap().total_tokens, 7);
+    }
+
+    #[test]
+    fn stream_error_frame_is_surfaced_not_swallowed() {
+        // A mid-stream error frame (no `candidates`) must become a stream Err — so
+        // the proxy terminates WITHOUT [DONE] — not fall into the `None => Ok(())`
+        // arm that silently ended a truncated stream as a clean success.
+        let mut out = Vec::new();
+        let mut state = GeminiStreamState::default();
+        let payload =
+            r#"{"error":{"code":503,"status":"UNAVAILABLE","message":"The model is overloaded."}}"#;
+        let err = translate_gemini_chunk(
+            payload,
+            1,
+            "gemini-1.5-flash",
+            "test-id",
+            &mut state,
+            &mut out,
+        )
+        .expect_err("an error frame must surface as Err");
+        assert!(err.to_string().contains("UNAVAILABLE"));
+        assert!(!err.to_string().contains("overloaded"));
+        assert!(out.is_empty(), "an error frame emits no content chunk");
+    }
+
+    #[test]
+    fn thinking_tokens_fold_into_completion_and_preserve_the_total_invariant() {
+        // gemini-2.5 thinking: candidatesTokenCount EXCLUDES thoughtsTokenCount,
+        // which is in totalTokenCount. completion must be candidates + thoughts so
+        // total == prompt + completion and reasoning is attributed to output.
+        let mut out = Vec::new();
+        let mut state = GeminiStreamState::default();
+        let payload = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":264,"candidatesTokenCount":104,"thoughtsTokenCount":989,"totalTokenCount":1357}}"#;
+        translate_gemini_chunk(payload, 1, "gemini-2.5-pro", "id", &mut state, &mut out).unwrap();
+        let usage = out.last().unwrap().usage.as_ref().unwrap();
+        assert_eq!(usage.prompt_tokens, 264);
+        assert_eq!(usage.completion_tokens, 104 + 989);
+        assert_eq!(usage.total_tokens, 1357);
+        assert_eq!(
+            usage.total_tokens,
+            usage.prompt_tokens + usage.completion_tokens
+        );
     }
 
     #[test]

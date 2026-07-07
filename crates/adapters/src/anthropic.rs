@@ -879,6 +879,19 @@ fn translate_anthropic_event(
             Ok(false)
         }
         "message_stop" => Ok(true),
+        "error" => {
+            // Anthropic emits a mid-stream error frame
+            // (`event: error` / `data: {"type":"error","error":{"type":…}}`) and
+            // then closes the socket. Without this arm it fell into `_ => Ok(false)`
+            // and was swallowed: no chunk, stream not ended → the graceful socket
+            // close made the proxy emit `data: [DONE]` and record a clean success,
+            // so a provider-failed, TRUNCATED stream was reported as complete.
+            // Surface it as an `Err` so the proxy terminates with an error frame
+            // (NOT `[DONE]`). Only the stable error TYPE is carried (never the
+            // free-form message) to keep provider internals out of the client frame.
+            let etype = v["error"]["type"].as_str().unwrap_or("error");
+            Err(format!("anthropic stream error: {etype}").into())
+        }
         _ => Ok(false), // ping, content_block_start/stop, etc.
     }
 }
@@ -999,6 +1012,24 @@ mod tests {
         let done =
             translate_anthropic_event(r#"{"type":"message_stop"}"#, &mut state, &mut out).unwrap();
         assert!(done);
+    }
+
+    #[test]
+    fn mid_stream_error_frame_is_surfaced_not_swallowed() {
+        // Anthropic's documented mid-stream error frame must become a stream Err
+        // (so the proxy terminates WITHOUT [DONE]) — not fall into the no-op
+        // default arm that silently ended a truncated stream as a clean success.
+        let mut state = AnthropicStreamState::default();
+        let mut out = Vec::new();
+        let res = translate_anthropic_event(
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            &mut state,
+            &mut out,
+        );
+        let err = res.expect_err("an error frame must surface as Err");
+        assert!(err.to_string().contains("overloaded_error"));
+        assert!(!err.to_string().contains("Overloaded"));
+        assert!(out.is_empty(), "an error frame emits no content chunk");
     }
 
     // --- request translation (Task #4) ---------------------------------------
