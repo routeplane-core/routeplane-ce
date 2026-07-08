@@ -149,8 +149,11 @@ Stated as bets, not victories — you should check each one against your workloa
    agents re-send tool output every turn; RTK strips the redundant parts with 11
    deterministic filters — ~76% tool-message token reduction on our committed corpus,
    56% per-trace median, ~31% on a mixed session
-   ([methodology + per-trace breakdown](benchmarks/rtk-eval/RESULTS.md)). Nothing else
-   in this table does this in the gateway.
+   ([methodology + per-trace breakdown](benchmarks/rtk-eval/RESULTS.md)). Those are
+   input-token reductions to verify on your own workload, not a quality guarantee —
+   code editing is the most compression-sensitive task, so it's opt-out per key, and
+   request-time quality verification is the Enterprise layer. Nothing else in this
+   table does deterministic tool-output compression in the gateway.
 3. **Worst-case-honest performance publishing.** Our overhead numbers were measured at
    saturation with default logging on, raw load-generator output committed
    ([RESULTS.md](benchmarks/perf/RESULTS.md)) — and we don't quote competitor numbers
