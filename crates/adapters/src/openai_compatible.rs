@@ -408,6 +408,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn buffered_trailing_slash_base_url_and_lifts_cached_tokens() {
+        // Two regressions in one: (1) a TRAILING-SLASH base URL must still hit the
+        // clean `/v1/chat/completions` path — the mock only matches that exact path,
+        // so a doubled `//v1/...` would 404 and fail; (2) vLLM prefix caching reports
+        // `usage.prompt_tokens_details.cached_tokens`, which the buffered path must
+        // lift into canonical `usage.cached_tokens`.
+        let server = MockServer::start().await;
+        let resp = serde_json::json!({
+            "id": "chatcmpl-cache",
+            "object": "chat.completion",
+            "created": 1700000000u64,
+            "model": "llama3",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "cached"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 50,
+                "completion_tokens": 2,
+                "total_tokens": 52,
+                "prompt_tokens_details": {"cached_tokens": 40}
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(resp))
+            .mount(&server)
+            .await;
+
+        // Trailing slash on the base URL — must be normalized, not doubled.
+        let p = SelfHostedProvider::with_base_url(format!("{}/", server.uri()));
+        let out = p
+            .chat_completion(req("llama3"), "sk-local".into())
+            .await
+            .expect("trailing-slash base URL still hits /v1/chat/completions");
+        assert_eq!(out.usage.cached_tokens, Some(40));
+    }
+
+    #[tokio::test]
     async fn upstream_429_is_typed_rate_limited_without_leaking_key() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))

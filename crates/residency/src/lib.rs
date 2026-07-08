@@ -526,6 +526,24 @@ mod tests {
     }
 
     #[test]
+    fn invisible_unicode_smuggled_identifier_is_still_classified() {
+        // ADR-118: a zero-width space (U+200B) or soft hyphen (U+00AD) interleaved
+        // in a valid identifier must NOT evade classification — a bypass here means
+        // regulated data routes cross-border unclassified. classify() normalizes an
+        // invisible-stripped detection copy before matching.
+        let zwsp = ResidencyEngine::new().classify("My Aadhaar is 4321\u{200B}4321\u{200B}4321");
+        assert!(zwsp.contains_personal_data);
+        assert!(zwsp.entities.contains(&EntityType::Aadhaar));
+
+        let soft_hyphen = ResidencyEngine::new().classify("PAN ABCDE\u{00AD}1234F");
+        assert!(soft_hyphen.entities.contains(&EntityType::Pan));
+
+        // The broadened set also covers bidi controls + the Tags block.
+        let bidi = ResidencyEngine::new().classify("Aadhaar 4321\u{202E}4321\u{202E}4321");
+        assert!(bidi.entities.contains(&EntityType::Aadhaar));
+    }
+
+    #[test]
     fn detects_email() {
         let c = ResidencyEngine::new().classify("reach me at user@example.com please");
         assert!(c.contains_personal_data);

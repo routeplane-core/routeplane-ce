@@ -246,6 +246,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn buffered_lifts_cached_tokens_from_prompt_tokens_details() {
+        // Bedrock's OpenAI-compat endpoint reports prompt caching under the nested
+        // `usage.prompt_tokens_details.cached_tokens`; the buffered path must lift
+        // it into the canonical flat `usage.cached_tokens` (it previously dropped
+        // it — the streaming path already lifted it).
+        let server = MockServer::start().await;
+        let resp = serde_json::json!({
+            "id": "br-cache",
+            "object": "chat.completion",
+            "created": 1700000000u64,
+            "model": "anthropic.claude-3-sonnet-20240229-v1:0",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "cached"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 4,
+                "total_tokens": 104,
+                "prompt_tokens_details": {"cached_tokens": 80}
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(resp))
+            .mount(&server)
+            .await;
+
+        let p = BedrockProvider::with_base_url(server.uri(), "US");
+        let out = p
+            .chat_completion(req("anthropic.claude-3-sonnet-20240229-v1:0"), "k".into())
+            .await
+            .expect("mock call succeeds");
+        assert_eq!(out.usage.prompt_tokens, 100);
+        assert_eq!(out.usage.cached_tokens, Some(80));
+    }
+
+    #[tokio::test]
     async fn buffered_strips_anthropic_cache_control_before_egress() {
         let server = MockServer::start().await;
         let resp = serde_json::json!({

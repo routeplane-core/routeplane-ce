@@ -19,6 +19,9 @@ publish.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 regex = { workspace = true }
+# The shared invisible/zero-width-Unicode set (PRD-036 M31) — one definition, also
+# consumed by routeplane-residency. `detect` re-exports it so consumers see no diff.
+routeplane-unicode = { path = "../unicode" }
 
 # Opt in to the workspace lint policy (deny warnings) — see root Cargo.toml.
 [lints]
