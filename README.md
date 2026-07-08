@@ -343,6 +343,14 @@ the measured numbers, never the reverse.
 
 The honest fine print:
 
+- **These are input-token reductions, not a quality guarantee.** The percentages count tokens
+  removed, not a promise your agent's output is unchanged — and tool-output compression bites
+  hardest on the workload most sensitive to it, code editing. Treat the number as potential
+  savings to *verify on your own traffic*, not a free lunch: keep RTK on where quality holds,
+  opt a key out where it doesn't (below). Request-time quality checking with in-request repair —
+  keeping the savings only when the response still holds up — is the
+  [Enterprise](https://routeplane.ai) layer; CE ships the fast deterministic engine and the
+  reproducible numbers to judge it for yourself.
 - **It's deterministic filtering, not summarization** — pure string processing, no ML, no
   network calls, well under a millisecond added.
 - **It's fail-safe**: unrecognized content passes through untouched, output is never empty, and
@@ -535,9 +543,10 @@ and participates in chains, combos, and circuit breaking like any hosted provide
 **Is RTK lossy? Will it break my agent?**
 It's lossy by design — it drops repeated/unchanged filler in tool output (unchanged diff context,
 duplicate log lines, the middle of huge file reads) and it's fail-safe (unrecognized content
-passes through untouched). Most agents don't notice; if one of yours re-reads exact bytes from a
-prior tool result, opt that key out with `rollout_holdbacks`. The full behavior is measured and
-documented in
+passes through untouched). Whether it affects your agent's output depends on the workload —
+code-editing tasks are the most sensitive to tool-output compression — so measure it on your own
+traffic: keep it on where quality holds, and opt a key out with `rollout_holdbacks` where it
+doesn't. The full behavior is measured and documented in
 [benchmarks/rtk-eval/RESULTS.md](https://github.com/routeplane-core/routeplane-ce/blob/main/benchmarks/rtk-eval/RESULTS.md).
 
 **Is it production-ready?**
