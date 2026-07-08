@@ -52,7 +52,9 @@ impl SelfHostedProvider {
     pub fn new(base_url: String, region: String) -> Self {
         Self {
             client: crate::client::build_provider_client(),
-            base_url,
+            // Normalize a trailing slash so `{base}/v1/...` never doubles it — the
+            // env/from_env path previously skipped this (only test ctors trimmed).
+            base_url: base_url.trim_end_matches('/').to_string(),
             region,
             stream_include_usage: true,
         }
@@ -134,10 +136,18 @@ impl Provider for SelfHostedProvider {
             return Err(crate::client::error_from_response("self_hosted", response).await);
         }
 
-        response
-            .json::<ChatCompletionResponse>()
+        // Lift OpenAI's nested `usage.prompt_tokens_details.cached_tokens` into the
+        // canonical flat `usage.cached_tokens`, like the OpenAI-wire adapters — the
+        // direct typed deserialize dropped it (FinOps undercount vs the streaming
+        // path; vLLM prefix caching reports it). No-op when the block is absent.
+        let mut v: serde_json::Value = response
+            .json()
             .await
-            .map_err(|e| crate::client::sanitize_transport_error("self_hosted", e))
+            .map_err(|e| crate::client::sanitize_transport_error("self_hosted", e))?;
+        crate::openai::lift_openai_cached_tokens(&mut v);
+        serde_json::from_value::<ChatCompletionResponse>(v).map_err(|e| -> ProviderError {
+            format!("self_hosted response parse error: {e}").into()
+        })
     }
 
     async fn chat_completion_stream(

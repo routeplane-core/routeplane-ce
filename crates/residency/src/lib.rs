@@ -1,6 +1,9 @@
 use lazy_static::lazy_static;
 use regex::Regex;
 use routeplane_types::Region;
+// The invisible/zero-width-Unicode set (PRD-036 M31) — one definition, shared with
+// routeplane-guardrails (ADR-118 / PRD-058).
+use routeplane_unicode::strip_invisible;
 
 mod verhoeff;
 
@@ -403,6 +406,15 @@ impl ResidencyEngine {
 
     /// Scan text for regulated personal-data entities.
     pub fn classify(&self, text: &str) -> Classification {
+        // ADR-118: invisible/zero-width Unicode (ZWSP, soft hyphen, word joiner,
+        // BOM, …) interleaved in a regulated identifier evades every recognizer
+        // below, so a smuggled Aadhaar/PAN would route cross-border unclassified.
+        // Detect on a normalized copy; the proxy forwards the ORIGINAL text
+        // untouched (classification returns a region decision, not mutated text),
+        // so legitimate Indic/emoji ZWJ/ZWNJ is never corrupted. Zero-copy on the
+        // clean path.
+        let normalized = strip_invisible(text);
+        let text: &str = &normalized;
         let mut entities = Vec::new();
         // Aadhaar: shape match THEN Verhoeff checksum — a random 12-digit string
         // is not flagged (Task #6).

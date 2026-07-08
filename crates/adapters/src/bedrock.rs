@@ -28,7 +28,10 @@ impl BedrockProvider {
     pub fn new() -> Self {
         Self {
             client: crate::client::build_provider_client(),
-            base_url: std::env::var("BEDROCK_BASE_URL").unwrap_or_default(),
+            base_url: std::env::var("BEDROCK_BASE_URL")
+                .unwrap_or_default()
+                .trim_end_matches('/')
+                .to_string(),
             region: std::env::var("BEDROCK_REGION").unwrap_or_default(),
         }
     }
@@ -93,10 +96,19 @@ impl Provider for BedrockProvider {
             return Err(crate::client::error_from_response("bedrock", response).await);
         }
 
-        response
-            .json::<ChatCompletionResponse>()
+        // Parse via a Value first to lift OpenAI's nested
+        // `usage.prompt_tokens_details.cached_tokens` into the canonical flat
+        // `usage.cached_tokens`. Bedrock's OpenAI-compat endpoint reports prompt
+        // caching, but the direct typed deserialize dropped it — a FinOps
+        // undercount vs the streaming path, which already lifts it (ADR-118/PRD-058
+        // re-run finding). No-op / byte-identical when the block is absent.
+        let mut v: serde_json::Value = response
+            .json()
             .await
-            .map_err(|e| crate::client::sanitize_transport_error("bedrock", e))
+            .map_err(|e| crate::client::sanitize_transport_error("bedrock", e))?;
+        crate::openai::lift_openai_cached_tokens(&mut v);
+        serde_json::from_value::<ChatCompletionResponse>(v)
+            .map_err(|e| -> ProviderError { format!("bedrock response parse error: {e}").into() })
     }
 
     async fn chat_completion_stream(
