@@ -10,6 +10,9 @@ publish.workspace = true
 # first profile; the same engine generalizes to GDPR/CCPA/etc.
 [dependencies]
 routeplane-types = { path = "../types" }
+# The shared invisible/zero-width-Unicode set (PRD-036 M31) — one definition, also
+# consumed by routeplane-guardrails (ADR-118 / PRD-058).
+routeplane-unicode = { path = "../unicode" }
 regex = { workspace = true }
 lazy_static = { workspace = true }
 

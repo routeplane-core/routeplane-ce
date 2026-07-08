@@ -28,7 +28,10 @@ impl BedrockProvider {
     pub fn new() -> Self {
         Self {
             client: crate::client::build_provider_client(),
-            base_url: std::env::var("BEDROCK_BASE_URL").unwrap_or_default(),
+            base_url: std::env::var("BEDROCK_BASE_URL")
+                .unwrap_or_default()
+                .trim_end_matches('/')
+                .to_string(),
             region: std::env::var("BEDROCK_REGION").unwrap_or_default(),
         }
     }
@@ -93,10 +96,19 @@ impl Provider for BedrockProvider {
             return Err(crate::client::error_from_response("bedrock", response).await);
         }
 
-        response
-            .json::<ChatCompletionResponse>()
+        // Parse via a Value first to lift OpenAI's nested
+        // `usage.prompt_tokens_details.cached_tokens` into the canonical flat
+        // `usage.cached_tokens`. Bedrock's OpenAI-compat endpoint reports prompt
+        // caching, but the direct typed deserialize dropped it — a FinOps
+        // undercount vs the streaming path, which already lifts it (ADR-118/PRD-058
+        // re-run finding). No-op / byte-identical when the block is absent.
+        let mut v: serde_json::Value = response
+            .json()
             .await
-            .map_err(|e| crate::client::sanitize_transport_error("bedrock", e))
+            .map_err(|e| crate::client::sanitize_transport_error("bedrock", e))?;
+        crate::openai::lift_openai_cached_tokens(&mut v);
+        serde_json::from_value::<ChatCompletionResponse>(v)
+            .map_err(|e| -> ProviderError { format!("bedrock response parse error: {e}").into() })
     }
 
     async fn chat_completion_stream(
@@ -231,6 +243,45 @@ mod tests {
             "Hello from Bedrock"
         );
         assert_eq!(out.usage.total_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn buffered_lifts_cached_tokens_from_prompt_tokens_details() {
+        // Bedrock's OpenAI-compat endpoint reports prompt caching under the nested
+        // `usage.prompt_tokens_details.cached_tokens`; the buffered path must lift
+        // it into the canonical flat `usage.cached_tokens` (it previously dropped
+        // it — the streaming path already lifted it).
+        let server = MockServer::start().await;
+        let resp = serde_json::json!({
+            "id": "br-cache",
+            "object": "chat.completion",
+            "created": 1700000000u64,
+            "model": "anthropic.claude-3-sonnet-20240229-v1:0",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "cached"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 4,
+                "total_tokens": 104,
+                "prompt_tokens_details": {"cached_tokens": 80}
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(resp))
+            .mount(&server)
+            .await;
+
+        let p = BedrockProvider::with_base_url(server.uri(), "US");
+        let out = p
+            .chat_completion(req("anthropic.claude-3-sonnet-20240229-v1:0"), "k".into())
+            .await
+            .expect("mock call succeeds");
+        assert_eq!(out.usage.prompt_tokens, 100);
+        assert_eq!(out.usage.cached_tokens, Some(80));
     }
 
     #[tokio::test]

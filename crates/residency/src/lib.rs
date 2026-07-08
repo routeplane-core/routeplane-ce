@@ -1,6 +1,9 @@
 use lazy_static::lazy_static;
 use regex::Regex;
 use routeplane_types::Region;
+// The invisible/zero-width-Unicode set (PRD-036 M31) — one definition, shared with
+// routeplane-guardrails (ADR-118 / PRD-058).
+use routeplane_unicode::strip_invisible;
 
 mod verhoeff;
 
@@ -403,6 +406,15 @@ impl ResidencyEngine {
 
     /// Scan text for regulated personal-data entities.
     pub fn classify(&self, text: &str) -> Classification {
+        // ADR-118: invisible/zero-width Unicode (ZWSP, soft hyphen, word joiner,
+        // BOM, …) interleaved in a regulated identifier evades every recognizer
+        // below, so a smuggled Aadhaar/PAN would route cross-border unclassified.
+        // Detect on a normalized copy; the proxy forwards the ORIGINAL text
+        // untouched (classification returns a region decision, not mutated text),
+        // so legitimate Indic/emoji ZWJ/ZWNJ is never corrupted. Zero-copy on the
+        // clean path.
+        let normalized = strip_invisible(text);
+        let text: &str = &normalized;
         let mut entities = Vec::new();
         // Aadhaar: shape match THEN Verhoeff checksum — a random 12-digit string
         // is not flagged (Task #6).
@@ -511,6 +523,24 @@ mod tests {
         let c = ResidencyEngine::new().classify("PAN: ABCDE1234F");
         assert!(c.contains_personal_data);
         assert!(c.entities.contains(&EntityType::Pan));
+    }
+
+    #[test]
+    fn invisible_unicode_smuggled_identifier_is_still_classified() {
+        // ADR-118: a zero-width space (U+200B) or soft hyphen (U+00AD) interleaved
+        // in a valid identifier must NOT evade classification — a bypass here means
+        // regulated data routes cross-border unclassified. classify() normalizes an
+        // invisible-stripped detection copy before matching.
+        let zwsp = ResidencyEngine::new().classify("My Aadhaar is 4321\u{200B}4321\u{200B}4321");
+        assert!(zwsp.contains_personal_data);
+        assert!(zwsp.entities.contains(&EntityType::Aadhaar));
+
+        let soft_hyphen = ResidencyEngine::new().classify("PAN ABCDE\u{00AD}1234F");
+        assert!(soft_hyphen.entities.contains(&EntityType::Pan));
+
+        // The broadened set also covers bidi controls + the Tags block.
+        let bidi = ResidencyEngine::new().classify("Aadhaar 4321\u{202E}4321\u{202E}4321");
+        assert!(bidi.entities.contains(&EntityType::Aadhaar));
     }
 
     #[test]

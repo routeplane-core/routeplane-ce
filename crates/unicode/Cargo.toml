@@ -1,0 +1,19 @@
+[package]
+name = "routeplane-unicode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Invisible / zero-width Unicode smuggling-normalization primitives (PRD-036 M31),
+# shared by the guardrails masker (`routeplane-guardrails`) and the sovereign
+# residency classifier (`routeplane-residency`) so the "invisible" character set
+# has exactly ONE definition. Extracted after the set drifted between two hand-kept
+# copies (ADR-118 / PRD-058) — a char stripped by one but not the other silently
+# reopens a PII-smuggling bypass. Pure: std only, no dependencies, no I/O.
+
+[dependencies]
+
+# Opt in to the workspace lint policy (deny warnings) — see root Cargo.toml.
+[lints]
+workspace = true

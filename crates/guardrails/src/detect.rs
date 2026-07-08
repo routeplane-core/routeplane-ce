@@ -281,12 +281,19 @@ static INJECTION: LazyLock<RegexSet> = LazyLock::new(|| {
 /// specific one.
 #[must_use]
 pub fn redact(text: &str) -> Cow<'_, str> {
-    if !ANY_PII_OR_SECRET.is_match(text) {
-        return Cow::Borrowed(text);
+    // ADR-118 / PRD-058 FR-2: first mask any PII/secret SMUGGLED past the recognizers
+    // with interleaved invisible Unicode. `pre` borrows `text` (zero work) unless the
+    // text carries invisibles; when something WAS smuggled only that token is masked
+    // (spliced into the original), preserving every legitimate invisible elsewhere.
+    // The chain then masks all VISIBLE PII exactly as before; clean input is byte-identical.
+    let pre = mask_invisible_smuggled(text);
+    let working: &str = pre.as_ref();
+    if !ANY_PII_OR_SECRET.is_match(working) {
+        return pre;
     }
     // We are on the (rare) dirty path — allocation here is expected and bounded.
     let mut out = PRIVATE_KEY
-        .replace_all(text, "[PRIVATE_KEY_MASKED]")
+        .replace_all(working, "[PRIVATE_KEY_MASKED]")
         .into_owned();
     // Structured-data DLP first: these are the broadest containers (a whole
     // connection string / JSON secret value / resource id) — mask the container
@@ -413,13 +420,20 @@ pub fn redact_with_pii_tokens<F>(text: &str, mut tokenize: F) -> Cow<'_, str>
 where
     F: FnMut(&'static str, &str) -> Option<String>,
 {
-    if !ANY_PII_OR_SECRET.is_match(text) {
-        return Cow::Borrowed(text);
+    // ADR-118 / PRD-058 FR-2 (tokenize path): irreversibly MASK any PII/secret
+    // SMUGGLED past the recognizers with interleaved invisible Unicode BEFORE the
+    // tokenize chain. Smuggled input is adversarial → masked (fail-safe, the same
+    // posture the None→mask fallback takes), NOT reversibly tokenized; a legitimate
+    // (visible) token still round-trips. Clean input → byte-identical.
+    let pre = mask_invisible_smuggled(text);
+    let working: &str = pre.as_ref();
+    if !ANY_PII_OR_SECRET.is_match(working) {
+        return pre;
     }
     // Identical secret / structured-DLP precedence to `redact` — these are never
     // reversibly tokenized (a secret must not be recoverable downstream).
     let mut out = PRIVATE_KEY
-        .replace_all(text, "[PRIVATE_KEY_MASKED]")
+        .replace_all(working, "[PRIVATE_KEY_MASKED]")
         .into_owned();
     out = JSON_SECRET
         .replace_all(&out, |c: &Captures| {
@@ -647,40 +661,118 @@ pub fn scan_pii(text: &str) -> Vec<&'static str> {
     found
 }
 
-/// True when `c` is an "invisible" / non-rendering control character that has
-/// no legitimate place in a prompt or response but is a known prompt-injection
-/// and data-exfiltration channel (PRD-036 M31): zero-width spaces/joiners, the
-/// BOM, soft hyphen, bidi overrides/isolates, and the Unicode **Tags** block
-/// (U+E0000–U+E007F) used to smuggle hidden ASCII instructions. Ordinary
-/// whitespace (space/tab/newline) is deliberately NOT included.
-#[must_use]
-pub fn is_invisible(c: char) -> bool {
-    matches!(c,
-        '\u{00AD}'                  // soft hyphen
-        | '\u{180E}'                // Mongolian vowel separator (deprecated)
-        | '\u{200B}'..='\u{200F}'   // zero-width space/non-joiner/joiner + LRM/RLM
-        | '\u{202A}'..='\u{202E}'   // bidi embeddings / overrides
-        | '\u{2060}'..='\u{2064}'   // word joiner + invisible operators
-        | '\u{2066}'..='\u{2069}'   // bidi isolates
-        | '\u{FEFF}'                // BOM / zero-width no-break space
-        | '\u{E0000}'..='\u{E007F}' // Unicode Tags block (ASCII smuggling)
-    )
+// The invisible/zero-width-Unicode set (PRD-036 M31) lives in `routeplane-unicode`
+// so its ONE definition is shared with the sovereign residency classifier — the two
+// hand-kept copies had drifted (ADR-118 / PRD-058). Re-exported here so every
+// existing consumer (`routeplane_guardrails::detect::{is_invisible,
+// contains_invisible_unicode, strip_invisible}`) sees no diff.
+pub use routeplane_unicode::{contains_invisible_unicode, is_invisible, strip_invisible};
+
+/// Strip invisible characters AND return a byte-offset map back to the original:
+/// `map[i]` is the byte offset in `text` of the i-th byte of the returned stripped
+/// string, with `map[stripped.len()] == text.len()`. A match `[s, e)` found in the
+/// stripped copy therefore maps to the original span `[map[s], map[e])` — which
+/// re-includes the interleaved invisibles that were removed.
+fn strip_invisible_with_map(text: &str) -> (String, Vec<usize>) {
+    let mut stripped = String::with_capacity(text.len());
+    let mut map = Vec::with_capacity(text.len() + 1);
+    for (ob, ch) in text.char_indices() {
+        if is_invisible(ch) {
+            continue;
+        }
+        stripped.push(ch);
+        for j in 0..ch.len_utf8() {
+            map.push(ob + j);
+        }
+    }
+    map.push(text.len());
+    (stripped, map)
 }
 
-/// True when `text` contains any invisible/control smuggling character.
-#[must_use]
-pub fn contains_invisible_unicode(text: &str) -> bool {
-    text.chars().any(is_invisible)
-}
-
-/// Strip invisible/control smuggling characters. Zero-copy (`Cow::Borrowed`)
-/// when the text is clean — the common case.
-#[must_use]
-pub fn strip_invisible(text: &str) -> Cow<'_, str> {
+/// ADR-118 / PRD-058 FR-2: mask regulated PII/secrets SMUGGLED past the recognizers
+/// by interleaving invisible Unicode (ZWSP / soft hyphen / bidi controls / Tags …)
+/// between a token's characters. Only the smuggled tokens are masked — a token
+/// whose ORIGINAL span carries an invisible — by splicing the mask into the
+/// original, so every OTHER invisible (legitimate Indic ZWJ/ZWNJ, emoji ZWJ
+/// sequences, RTL bidi) is preserved verbatim. Fully-visible PII is left untouched
+/// here and masked by the normal chain exactly as before. Clean input (no
+/// invisibles) returns `Cow::Borrowed`.
+///
+/// Scope: the token recognizers, mirroring [`redact`]'s order + fail-safe floor.
+/// The structured-container DLP (JSON_SECRET / CONNECTION_STRING /
+/// CLOUD_RESOURCE_ID / SCHEMA_DUMP) is intentionally NOT residual-scanned — those
+/// match whole containers (not char-smuggleable tokens). (CE has no per-tenant
+/// RedactMask, so every category is always scanned.)
+fn mask_invisible_smuggled(text: &str) -> Cow<'_, str> {
     if !contains_invisible_unicode(text) {
         return Cow::Borrowed(text);
     }
-    Cow::Owned(text.chars().filter(|c| !is_invisible(*c)).collect())
+    let (stripped, map) = strip_invisible_with_map(text);
+    type V = fn(&str) -> bool;
+    let recognizers: [(&Regex, Option<V>, &'static str); 23] = [
+        (&PRIVATE_KEY, None, "[PRIVATE_KEY_MASKED]"),
+        (&JWT, None, "[JWT_MASKED]"),
+        (&OPENAI_KEY, None, "[OPENAI_KEY_MASKED]"),
+        (&AWS_KEY, None, "[AWS_KEY_MASKED]"),
+        (&GITHUB_TOKEN, None, "[GITHUB_TOKEN_MASKED]"),
+        (&SLACK_TOKEN, None, "[SLACK_TOKEN_MASKED]"),
+        (&STRIPE_KEY, None, "[STRIPE_KEY_MASKED]"),
+        (&GOOGLE_API_KEY, None, "[GOOGLE_API_KEY_MASKED]"),
+        (&ROUTEPLANE_KEY, None, "[ROUTEPLANE_KEY_MASKED]"),
+        (&AADHAAR, Some(is_aadhaar as V), "[AADHAAR_MASKED]"),
+        (&CARD, Some(is_card as V), "[CARD_MASKED]"),
+        (&IBAN, Some(is_iban as V), "[IBAN_MASKED]"),
+        (&CPF, Some(is_cpf as V), "[CPF_MASKED]"),
+        (&NRIC, Some(is_nric as V), "[NRIC_MASKED]"),
+        (
+            &EMIRATES_ID,
+            Some(is_emirates_id as V),
+            "[EMIRATES_ID_MASKED]",
+        ),
+        (&MY_NUMBER, Some(is_my_number as V), "[MY_NUMBER_MASKED]"),
+        (&SAUDI_ID, Some(is_saudi_id as V), "[SAUDI_ID_MASKED]"),
+        (&TFN, Some(is_tfn as V), "[TFN_MASKED]"),
+        (&SSN, None, "[SSN_MASKED]"),
+        (&PAN, None, "[PAN_MASKED]"),
+        (&IPV4, Some(is_ipv4 as V), "[IP_MASKED]"),
+        (&EMAIL, None, "[EMAIL_MASKED]"),
+        (&PHONE, None, "[PHONE_MASKED]"),
+    ];
+    let mut claims: Vec<(usize, usize, &'static str)> = Vec::new();
+    for (re, validator, token) in recognizers.iter() {
+        for m in re.find_iter(&stripped) {
+            if let Some(v) = validator {
+                if !v(m.as_str()) {
+                    continue;
+                }
+            }
+            let (os, oe) = (map[m.start()], map[m.end()]);
+            // The "stripping revealed NEW PII" gate: mask ONLY when the original
+            // token span actually carried an invisible (i.e. it was broken up).
+            if !text[os..oe].chars().any(is_invisible) {
+                continue;
+            }
+            // Drop a span overlapping one already claimed by a higher-priority
+            // recognizer (mirrors the chain's sequential order).
+            if claims.iter().any(|&(cs, ce, _)| os < ce && cs < oe) {
+                continue;
+            }
+            claims.push((os, oe, token));
+        }
+    }
+    if claims.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    claims.sort_by_key(|&(os, _, _)| os);
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for (os, oe, token) in claims {
+        out.push_str(&text[cursor..os]);
+        out.push_str(token);
+        cursor = oe;
+    }
+    out.push_str(&text[cursor..]);
+    Cow::Owned(out)
 }
 
 /// Categories of secrets present in `text`. Labels only (no-reflection, N5).
@@ -1606,6 +1698,62 @@ mod tests {
         let clean = "a normal\tline\nwith spaces";
         assert!(!contains_invisible_unicode(clean));
         assert!(matches!(strip_invisible(clean), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn invisible_smuggled_pii_is_masked_but_legit_invisibles_survive() {
+        // The bar (ADR-118): a legitimate email next to a family-emoji ZWJ sequence
+        // (U+1F468 U+200D U+1F469 U+200D U+1F467). The email must be masked and the
+        // emoji — including its ZWJ, an "invisible" — must be byte-identical.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        let input = format!("Email me at ravi@acme.in {family}");
+        let want = format!("Email me at [EMAIL_MASKED] {family}");
+        assert_eq!(redact(&input).as_ref(), want.as_str());
+
+        // A zero-width-space-smuggled (Verhoeff-valid) Aadhaar IS masked — bypass closed.
+        assert_eq!(
+            redact("Aadhaar 2341\u{200B}2341\u{200B}2346.").as_ref(),
+            "Aadhaar [AADHAAR_MASKED]."
+        );
+
+        // Smuggled PII AND a legit emoji together: only the smuggled span is spliced,
+        // so the Aadhaar is masked and the emoji's ZWJ survives.
+        let mixed_in = format!("id 2341\u{200B}2341\u{200B}2346 {family}");
+        let mixed_want = format!("id [AADHAAR_MASKED] {family}");
+        assert_eq!(redact(&mixed_in).as_ref(), mixed_want.as_str());
+    }
+
+    #[test]
+    fn residual_pass_leaves_clean_and_visible_pii_byte_identical() {
+        // No invisibles → zero-copy, untouched (the residual pass is a no-op).
+        assert!(matches!(
+            redact("what is the capital of France?"),
+            Cow::Borrowed(_)
+        ));
+        // A visible email with no invisibles is masked by the chain exactly as before.
+        assert_eq!(
+            redact("mail ravi@acme.in ok").as_ref(),
+            "mail [EMAIL_MASKED] ok"
+        );
+    }
+
+    #[test]
+    fn tokenize_path_masks_smuggled_but_still_surrogates_visible() {
+        // A VISIBLE (no-invisible) Verhoeff-valid Aadhaar still round-trips — it is
+        // reversibly tokenized to the surrogate, NOT masked (the FR-2 residual
+        // pre-step did not cannibalize normal tokenization).
+        let visible = redact_with_pii_tokens("Aadhaar 234123412346.", |_cat, _val| {
+            Some("<SURROGATE>".to_string())
+        });
+        assert_eq!(visible.as_ref(), "Aadhaar <SURROGATE>.");
+
+        // A ZWSP-SMUGGLED Aadhaar is irreversibly MASKED (fail-safe) — never a
+        // surrogate, never leaked. It does not round-trip, by design (adversarial).
+        let smuggled =
+            redact_with_pii_tokens("Aadhaar 2341\u{200B}2341\u{200B}2346.", |_cat, _val| {
+                Some("<SURROGATE>".to_string())
+            });
+        assert_eq!(smuggled.as_ref(), "Aadhaar [AADHAAR_MASKED].");
     }
 
     #[test]

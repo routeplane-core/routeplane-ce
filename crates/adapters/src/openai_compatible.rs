@@ -52,7 +52,9 @@ impl SelfHostedProvider {
     pub fn new(base_url: String, region: String) -> Self {
         Self {
             client: crate::client::build_provider_client(),
-            base_url,
+            // Normalize a trailing slash so `{base}/v1/...` never doubles it — the
+            // env/from_env path previously skipped this (only test ctors trimmed).
+            base_url: base_url.trim_end_matches('/').to_string(),
             region,
             stream_include_usage: true,
         }
@@ -134,10 +136,18 @@ impl Provider for SelfHostedProvider {
             return Err(crate::client::error_from_response("self_hosted", response).await);
         }
 
-        response
-            .json::<ChatCompletionResponse>()
+        // Lift OpenAI's nested `usage.prompt_tokens_details.cached_tokens` into the
+        // canonical flat `usage.cached_tokens`, like the OpenAI-wire adapters — the
+        // direct typed deserialize dropped it (FinOps undercount vs the streaming
+        // path; vLLM prefix caching reports it). No-op when the block is absent.
+        let mut v: serde_json::Value = response
+            .json()
             .await
-            .map_err(|e| crate::client::sanitize_transport_error("self_hosted", e))
+            .map_err(|e| crate::client::sanitize_transport_error("self_hosted", e))?;
+        crate::openai::lift_openai_cached_tokens(&mut v);
+        serde_json::from_value::<ChatCompletionResponse>(v).map_err(|e| -> ProviderError {
+            format!("self_hosted response parse error: {e}").into()
+        })
     }
 
     async fn chat_completion_stream(
@@ -395,6 +405,46 @@ mod tests {
             .expect("mock call succeeds");
         assert_eq!(out.choices[0].message.content.as_text(), "hello from vllm");
         assert_eq!(out.usage.total_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn buffered_trailing_slash_base_url_and_lifts_cached_tokens() {
+        // Two regressions in one: (1) a TRAILING-SLASH base URL must still hit the
+        // clean `/v1/chat/completions` path — the mock only matches that exact path,
+        // so a doubled `//v1/...` would 404 and fail; (2) vLLM prefix caching reports
+        // `usage.prompt_tokens_details.cached_tokens`, which the buffered path must
+        // lift into canonical `usage.cached_tokens`.
+        let server = MockServer::start().await;
+        let resp = serde_json::json!({
+            "id": "chatcmpl-cache",
+            "object": "chat.completion",
+            "created": 1700000000u64,
+            "model": "llama3",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "cached"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 50,
+                "completion_tokens": 2,
+                "total_tokens": 52,
+                "prompt_tokens_details": {"cached_tokens": 40}
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(resp))
+            .mount(&server)
+            .await;
+
+        // Trailing slash on the base URL — must be normalized, not doubled.
+        let p = SelfHostedProvider::with_base_url(format!("{}/", server.uri()));
+        let out = p
+            .chat_completion(req("llama3"), "sk-local".into())
+            .await
+            .expect("trailing-slash base URL still hits /v1/chat/completions");
+        assert_eq!(out.usage.cached_tokens, Some(40));
     }
 
     #[tokio::test]
