@@ -1170,6 +1170,14 @@ const STREAM_OBSERVE_CAP_BYTES: usize = 256 * 1024;
 /// byte-identical when `hedge` is unconfigured.
 const HEDGED_HEADER: &str = "x-routeplane-hedged";
 
+/// Additive response header (ADR-126): the count of inbound message parts in which
+/// the always-on ingress PII/secret redaction actually fired. Stamped ONLY when
+/// ≥1 part changed, so a request carrying no regulated data is byte-identical (no
+/// header). The deterministic, per-request, client-visible proof that ingress
+/// masking ran — the ingress counterpart to the opt-in egress `output_masked`
+/// signal; its absence on PII traffic means masking is disabled in config.
+const PII_MASKED_HEADER: &str = "x-routeplane-pii-masked";
+
 // The provenance-header trio (provider/trace-id/request-id) — consts and the
 // shared `stamp_provenance` stamp live in `crate::provenance` and are imported
 // above, so every serving endpoint emits the same contract.
@@ -2385,6 +2393,12 @@ pub(crate) async fn chat_completions_core(
     // whatever response it produced (buffered, streamed, replayed, or error). On
     // the default/strict-pass path `compliance_warn` is `None`, so this is a no-op
     // and the response is byte-identical (the parity guarantee).
+    // ADR-126: a request-scoped counter of inbound parts the always-on ingress
+    // redact masked. Threaded into the pipeline (incremented in the mask loop),
+    // read back here, and stamped as the additive `x-routeplane-pii-masked` header
+    // on the single returned response — the deterministic, client-visible proof
+    // that ingress PII masking actually ran.
+    let pii_masked = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let mut resp = chat_completions_core_idem(
         state,
         virtual_key,
@@ -2393,12 +2407,22 @@ pub(crate) async fn chat_completions_core(
         headers,
         payload,
         combo_plan,
+        pii_masked.clone(),
     )
     .await;
     // A combo's warn-mode compliance hit (ADR-086) stamps the same header; on the
     // non-combo path `combo_compliance_warn` is `None`, so this is byte-identical.
     if let Some(value) = compliance_warn.or(combo_compliance_warn) {
         resp.headers_mut().insert(COMPLIANCE_WARNING_HEADER, value);
+    }
+    // Stamp the ingress-masking count (additive: only when ≥1 part was masked, so a
+    // no-PII request stays byte-identical). Stamped on whatever the pipeline
+    // returned (buffered / streamed / error), since masking runs before dispatch.
+    let masked_n = pii_masked.load(std::sync::atomic::Ordering::Relaxed);
+    if masked_n > 0 {
+        if let Ok(value) = HeaderValue::from_str(&masked_n.to_string()) {
+            resp.headers_mut().insert(PII_MASKED_HEADER, value);
+        }
     }
     resp
 }
@@ -2407,6 +2431,7 @@ pub(crate) async fn chat_completions_core(
 /// the compliance gate ([ADR-035] §4) can run first and the warn-mode header can be
 /// stamped on the single returned response. Behaviour is byte-identical to the
 /// pre-gate `chat_completions_core` for every request that the gate does not block.
+#[allow(clippy::too_many_arguments)]
 async fn chat_completions_core_idem(
     state: Arc<AppState>,
     virtual_key: VirtualKey,
@@ -2418,6 +2443,9 @@ async fn chat_completions_core_idem(
     // threaded to the pipeline as the ungated routing config. `None` on the legacy
     // path ⇒ byte-identical.
     combo_plan: Option<Arc<RoutingConfig>>,
+    // ADR-126: request-scoped ingress-masking counter, incremented in the pipeline's
+    // mask loop and read back by `chat_completions_core` to stamp the header.
+    pii_masked: Arc<std::sync::atomic::AtomicU32>,
 ) -> Response {
     // Resolve the optional idempotency key (case-insensitive `Idempotency-Key`,
     // also accepting the branded `x-routeplane-idempotency-key`). Absent, empty,
@@ -2447,6 +2475,7 @@ async fn chat_completions_core_idem(
             headers,
             payload,
             combo_plan,
+            pii_masked,
         )
         .await;
     };
@@ -2502,6 +2531,7 @@ async fn chat_completions_core_idem(
         headers,
         payload,
         combo_plan,
+        pii_masked,
     )
     .await;
 
@@ -2625,6 +2655,7 @@ fn idempotency_in_flight_response() -> Response {
 /// usage/ledger/export → cache → streaming). Wrapped by [`chat_completions_core`],
 /// which layers idempotency on top WITHOUT changing this body — so the no-key path
 /// is byte-identical.
+#[allow(clippy::too_many_arguments)]
 async fn chat_completions_pipeline(
     state: Arc<AppState>,
     virtual_key: VirtualKey,
@@ -2636,6 +2667,10 @@ async fn chat_completions_pipeline(
     // `model` field, or `None` (legacy). Used ungated as the routing config when no
     // explicit `x-routeplane-config` supersedes it.
     combo_plan: Option<Arc<RoutingConfig>>,
+    // ADR-126: request-scoped ingress-masking counter, incremented once per inbound
+    // message part the redact loop actually masks; read back by the caller to stamp
+    // `x-routeplane-pii-masked`.
+    pii_masked: Arc<std::sync::atomic::AtomicU32>,
 ) -> Response {
     let deadline = Deadline::start(&state.deadline_config);
     let request_id = format!("req_{}", uuid::Uuid::new_v4().simple());
@@ -3169,30 +3204,46 @@ async fn chat_completions_pipeline(
         message.content = message.content.map_text(|text| {
             // Enterprise: reversible-tokenize when a round-trip map is live,
             // else mask. CE: always the byte-identical masking path.
-            #[cfg(feature = "enterprise")]
-            {
-                match &round_trip {
-                    Some(rt) => rt.borrow_mut().tokenize_text(text),
-                    None => engine.process_text(text, &guard_config),
+            let out = {
+                #[cfg(feature = "enterprise")]
+                {
+                    match &round_trip {
+                        Some(rt) => rt.borrow_mut().tokenize_text(text),
+                        None => engine.process_text(text, &guard_config),
+                    }
                 }
+                #[cfg(not(feature = "enterprise"))]
+                {
+                    engine.process_text(text, &guard_config)
+                }
+            };
+            // ADR-126: count a part the ingress redact actually changed (masked or
+            // reversibly tokenized) — the auditable signal `chat_completions_core`
+            // stamps as `x-routeplane-pii-masked`.
+            if out != text {
+                pii_masked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            #[cfg(not(feature = "enterprise"))]
-            {
-                engine.process_text(text, &guard_config)
-            }
+            out
         });
         if let Some(name) = message.name.as_mut() {
-            #[cfg(feature = "enterprise")]
-            {
-                *name = match &round_trip {
-                    Some(rt) => rt.borrow_mut().tokenize_text(name),
-                    None => state.guardrail_engine.process_text(name, &guard_config),
-                };
+            let out = {
+                #[cfg(feature = "enterprise")]
+                {
+                    match &round_trip {
+                        Some(rt) => rt.borrow_mut().tokenize_text(name),
+                        None => state.guardrail_engine.process_text(name, &guard_config),
+                    }
+                }
+                #[cfg(not(feature = "enterprise"))]
+                {
+                    state.guardrail_engine.process_text(name, &guard_config)
+                }
+            };
+            // ADR-126: count a masked/tokenized name part.
+            if out != *name {
+                pii_masked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            #[cfg(not(feature = "enterprise"))]
-            {
-                *name = state.guardrail_engine.process_text(name, &guard_config);
-            }
+            *name = out;
         }
     }
 
@@ -7845,6 +7896,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_pii_request_stamps_pii_masked_header() {
+        // ADR-126 (streaming coverage): a stream:true request carrying an Aadhaar
+        // routes and establishes an SSE; the ingress redact fires BEFORE the stream
+        // establishes, so the response head still carries the audit header. A stream
+        // returns through the SAME `chat_completions_core` choke point as a buffered
+        // call (idempotency is bypassed for streams), so the stamp applies uniformly.
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let sse = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\
+                   \"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                   data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(sse.as_bytes().to_vec(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let state = ac8_state(&server).await;
+        // stream:true + PII, but NO residency header ⇒ routes + streams (not blocked).
+        let vk = ac8_vk();
+        let tenant_ctx = TenantContext::from_virtual_key(&vk, &BTreeSet::new());
+        let resp = chat_completions(
+            State(state),
+            Extension(vk),
+            Extension(tenant_ctx),
+            Extension(TenantGuardrails(None)),
+            HeaderMap::new(),
+            crate::api_error::OpenAiJson(ac8_payload(true)),
+        )
+        .await
+        .into_response();
+        let masked = resp.headers().get("x-routeplane-pii-masked");
+        assert!(
+            masked.is_some(),
+            "a streamed PII request must carry x-routeplane-pii-masked; status={}",
+            resp.status()
+        );
+        assert_eq!(masked.unwrap(), "1");
+    }
+
+    #[tokio::test]
     async fn ac8_same_config_routes_normally_without_regulated_data() {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -9064,6 +9158,58 @@ mod tests {
         assert_eq!(
             resp.headers().get(COMPLIANCE_WARNING_HEADER).unwrap(),
             "DPDP"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingress_masking_stamps_pii_masked_header() {
+        // ADR-126: a request carrying a zero-width-smuggled Aadhaar is redacted by
+        // the always-on ingress mask, and `chat_completions_core` stamps
+        // `x-routeplane-pii-masked` on the response — the auditable proof masking
+        // fired. Stamped even though dispatch fails (no providers), because masking
+        // runs BEFORE eligibility/dispatch.
+        let state = compliance_state();
+        let vk = offpath_vk(Tier::Standard);
+        let ctx = compliance_ctx(&[], crate::auth::ComplianceMode::Strict);
+        let mut payload = compliance_payload("gpt-4o");
+        payload.messages[0].content = "My Aadhaar is 4321\u{200B}4321\u{200B}4321".into();
+        let resp = chat_completions_core(
+            state,
+            vk,
+            ctx,
+            TenantGuardrails(None),
+            HeaderMap::new(),
+            payload,
+        )
+        .await;
+        let masked = resp
+            .headers()
+            .get(PII_MASKED_HEADER)
+            .expect("x-routeplane-pii-masked must be stamped when ingress masking fires");
+        let n: u32 = masked.to_str().unwrap().parse().unwrap();
+        assert!(n >= 1, "expected >=1 masked part, got {n}");
+    }
+
+    #[tokio::test]
+    async fn clean_request_omits_pii_masked_header() {
+        // Additive invariant: a request with no regulated data emits NO
+        // `x-routeplane-pii-masked` header, so clean traffic stays byte-identical.
+        let state = compliance_state();
+        let vk = offpath_vk(Tier::Standard);
+        let ctx = compliance_ctx(&[], crate::auth::ComplianceMode::Strict);
+        let payload = compliance_payload("gpt-4o"); // content "hi" — no PII
+        let resp = chat_completions_core(
+            state,
+            vk,
+            ctx,
+            TenantGuardrails(None),
+            HeaderMap::new(),
+            payload,
+        )
+        .await;
+        assert!(
+            resp.headers().get(PII_MASKED_HEADER).is_none(),
+            "no PII ⇒ no masking header (additive)"
         );
     }
 
