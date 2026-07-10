@@ -1956,6 +1956,7 @@ name = "routeplane-guardrails"
 version = "0.1.0"
 dependencies = [
  "regex",
+ "routeplane-unicode",
  "serde",
  "serde_json",
 ]
@@ -2008,6 +2009,7 @@ dependencies = [
  "lazy_static",
  "regex",
  "routeplane-types",
+ "routeplane-unicode",
 ]
 
 [[package]]
@@ -2033,6 +2035,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "routeplane-unicode"
+version = "0.1.0"
 
 [[package]]
 name = "rustc-hash"
