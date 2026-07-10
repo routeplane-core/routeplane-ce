@@ -42,13 +42,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (warnings denied)
-        run: cargo clippy -p routeplane --no-default-features --all-targets -- -D warnings
+        run: cargo clippy --locked -p routeplane --no-default-features --all-targets -- -D warnings
 
       - name: Build (Community Edition)
-        run: cargo build -p routeplane --no-default-features
+        run: cargo build --locked -p routeplane --no-default-features
 
       - name: Test (Community Edition)
-        run: cargo test -p routeplane --no-default-features
+        run: cargo test --locked -p routeplane --no-default-features
 
 # The identity/content gate runs as its own required workflow
 # (.github/workflows/identity-guard.yml) on the same pull_request / push events.
