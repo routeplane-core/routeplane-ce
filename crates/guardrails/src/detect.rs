@@ -404,9 +404,16 @@ pub fn redact(text: &str) -> Cow<'_, str> {
         .into_owned();
     out = mask_isolated(&out, &TFN, is_tfn, "[TFN_MASKED]");
     out = SSN.replace_all(&out, "[SSN_MASKED]").into_owned();
+    let pan_cue = PAN_CUE.is_match(&out);
     out = PAN
         .replace_all(&out, |c: &regex::Captures<'_>| {
-            mask_if(&c[0], is_pan, "[PAN_MASKED]")
+            let hit = &c[0];
+            let accept = is_pan(hit) && (!hit.chars().any(|ch| ch.is_ascii_lowercase()) || pan_cue);
+            if accept {
+                "[PAN_MASKED]".to_string()
+            } else {
+                hit.to_string()
+            }
         })
         .into_owned();
     out = IPV4
@@ -577,9 +584,16 @@ where
             tok_or_mask(&c[0], |_| true, CAT_SSN, "[SSN_MASKED]", &mut tokenize)
         })
         .into_owned();
+    let pan_cue = PAN_CUE.is_match(&out);
     out = PAN
         .replace_all(&out, |c: &regex::Captures<'_>| {
-            mask_if(&c[0], is_pan, "[PAN_MASKED]")
+            let hit = &c[0];
+            let accept = is_pan(hit) && (!hit.chars().any(|ch| ch.is_ascii_lowercase()) || pan_cue);
+            if accept {
+                "[PAN_MASKED]".to_string()
+            } else {
+                hit.to_string()
+            }
         })
         .into_owned();
     out = IPV4
@@ -1196,6 +1210,12 @@ fn digits(s: &str) -> impl Iterator<Item = u8> + '_ {
 /// A PAN's 4th character encodes holder type; only these codes are issued.
 /// Mirrors `routeplane_residency::is_valid_pan` — the masker had NO such gate
 /// (routeplane#414), so it masked any token of the right shape.
+/// Cue required for the lowercase PAN form — see `pan_in_context` rationale in
+/// the residency crate. `abcde1234f` is an eval-corpus NEGATIVE whose 4th char
+/// is a REAL holder-type code, so `is_pan` alone does not separate it.
+static PAN_CUE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bpan\b").expect("pan cue regex is valid"));
+
 fn is_pan(s: &str) -> bool {
     let b = s.as_bytes();
     if b.len() != 10 {

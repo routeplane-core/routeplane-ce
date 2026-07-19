@@ -53,6 +53,11 @@ lazy_static! {
     // a random 12-digit string is NOT flagged.
     static ref AADHAAR: Regex = Regex::new(r"\b[2-9]\d{3}[\s.-]{0,2}\d{4}[\s.-]{0,2}\d{4}\b").unwrap();
     static ref PAN: Regex = Regex::new(r"(?i)\b[a-z]{5}[0-9]{4}[a-z]\b").unwrap();
+    // routeplane#414 follow-up: an UPPERCASE PAN is distinctive enough to stand
+    // alone, but the lowercase form is shape-identical to an ordinary promo code
+    // or order reference — `abcde1234f` is a corpus NEGATIVE, and its 4th char
+    // `d` is a REAL holder-type code, so the entity gate does not separate them.
+    static ref PAN_CUE: Regex = Regex::new(r"(?i)\bpan\b").unwrap();
 
     // US SSN — HIPAA / US profile. Separators REQUIRED (3-2-4) so a bare
     // 9-digit run is not a false positive (same discipline as PHONE/AADHAAR);
@@ -129,6 +134,20 @@ fn is_valid_aadhaar(candidate: &str) -> bool {
 
 /// True if `candidate` is a structurally valid PAN: 5 letters, 4 digits, 1
 /// letter, where the 4th character (entity type) is one of the allowed codes.
+/// Whether a PAN-shaped `candidate` found in `text` should be treated as a PAN.
+/// Uppercase matches unconditionally; a lowercase/mixed match ALSO needs a `PAN`
+/// cue nearby. Over-masking is not the safe direction: in the classifier a false
+/// positive HARD-LOCKS routing, and in the masker it redacts legitimate text.
+fn pan_in_context(candidate: &str, text: &str) -> bool {
+    if !is_valid_pan(candidate) {
+        return false;
+    }
+    if !candidate.chars().any(|c| c.is_ascii_lowercase()) {
+        return true;
+    }
+    PAN_CUE.is_match(text)
+}
+
 fn is_valid_pan(candidate: &str) -> bool {
     let b = candidate.as_bytes();
     if b.len() != 10 {
@@ -432,7 +451,10 @@ impl ResidencyEngine {
             entities.push(EntityType::Aadhaar);
         }
         // PAN: shape match THEN entity-code validation.
-        if PAN.find_iter(text).any(|m| is_valid_pan(m.as_str())) {
+        if PAN
+            .find_iter(text)
+            .any(|m| pan_in_context(m.as_str(), text))
+        {
             entities.push(EntityType::Pan);
         }
         // US SSN: shape (with required separators) THEN SSA structural rules.
@@ -557,6 +579,25 @@ mod tests {
             .classify("pan abcpd1234e")
             .entities
             .contains(&EntityType::Pan));
+    }
+
+    /// The FP this port surfaced: making PAN case-insensitive masked ordinary
+    /// promo codes. `abcde1234f` is an eval-corpus NEGATIVE and its 4th char `d`
+    /// IS a real holder-type code, so the entity gate does not separate it — the
+    /// lowercase form needs an explicit PAN cue. CE's 6-record negative corpus
+    /// caught this (precision 0.833 < 0.95) where the larger upstream corpus
+    /// diluted it below the floor.
+    #[test]
+    fn lowercase_pan_shape_without_a_pan_cue_is_not_classified() {
+        let e = ResidencyEngine::new();
+        assert!(
+            !e.classify("Promo code abcde1234f applies a flat 10% discount at checkout.")
+                .entities
+                .contains(&EntityType::Pan),
+            "a promo code must not classify as a PAN"
+        );
+        // An UPPERCASE PAN still stands alone, with no cue at all.
+        assert!(e.classify("ABCPD1234E").entities.contains(&EntityType::Pan));
     }
 
     /// Recall must not cost precision: the holder-type code still gates, and
