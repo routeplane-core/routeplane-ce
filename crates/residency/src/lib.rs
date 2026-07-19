@@ -3,7 +3,7 @@ use regex::Regex;
 use routeplane_types::Region;
 // The invisible/zero-width-Unicode set (PRD-036 M31) — one definition, shared with
 // routeplane-guardrails (ADR-118 / PRD-058).
-use routeplane_unicode::strip_invisible;
+use routeplane_unicode::normalize_for_recognition;
 
 mod verhoeff;
 
@@ -51,8 +51,8 @@ lazy_static! {
     // separator-tolerant recognizers (Emirates ID / TFN / My Number). The match is
     // then validated with the Verhoeff checksum (which strips separators first), so
     // a random 12-digit string is NOT flagged.
-    static ref AADHAAR: Regex = Regex::new(r"\b[2-9]\d{3}[\s-]{0,2}\d{4}[\s-]{0,2}\d{4}\b").unwrap();
-    static ref PAN: Regex = Regex::new(r"\b[A-Z]{5}[0-9]{4}[A-Z]\b").unwrap();
+    static ref AADHAAR: Regex = Regex::new(r"\b[2-9]\d{3}[\s.-]{0,2}\d{4}[\s.-]{0,2}\d{4}\b").unwrap();
+    static ref PAN: Regex = Regex::new(r"(?i)\b[a-z]{5}[0-9]{4}[a-z]\b").unwrap();
 
     // US SSN — HIPAA / US profile. Separators REQUIRED (3-2-4) so a bare
     // 9-digit run is not a false positive (same discipline as PHONE/AADHAAR);
@@ -139,7 +139,9 @@ fn is_valid_pan(candidate: &str) -> bool {
     // entity codes — rejects sequences that match the shape but can't be a PAN.
     // Standard PAN 4th-character entity codes (P,C,H,F,A,T,B,L,J,G,E,D,K).
     const VALID_ENTITY: &[u8] = b"PCHFATBLJGEDK";
-    VALID_ENTITY.contains(&b[3])
+    // The regex is case-insensitive (routeplane#414: real PANs are pasted
+    // lowercase), so fold before comparing against the uppercase code set.
+    VALID_ENTITY.contains(&b[3].to_ascii_uppercase())
 }
 
 /// True if `candidate` is a structurally valid US SSN (`AAA-GG-SSSS`) per the
@@ -413,7 +415,12 @@ impl ResidencyEngine {
         // untouched (classification returns a region decision, not mutated text),
         // so legitimate Indic/emoji ZWJ/ZWNJ is never corrupted. Zero-copy on the
         // clean path.
-        let normalized = strip_invisible(text);
+        // routeplane#488: fold confusables/non-ASCII digits too. A Cyrillic `A`
+        // homoglyph evades `PAN = [A-Z]{5}[0-9]{4}[A-Z]`, and a Devanagari
+        // Aadhaar never matches the ASCII lead class `[2-9]` — so both would
+        // route unclassified. Same copy-only discipline as the strip: the proxy
+        // forwards the ORIGINAL text, so genuine non-Latin prose is untouched.
+        let normalized = normalize_for_recognition(text);
         let text: &str = &normalized;
         let mut entities = Vec::new();
         // Aadhaar: shape match THEN Verhoeff checksum — a random 12-digit string
@@ -523,6 +530,49 @@ mod tests {
         let c = ResidencyEngine::new().classify("PAN: ABCDE1234F");
         assert!(c.contains_personal_data);
         assert!(c.entities.contains(&EntityType::Pan));
+    }
+
+    /// routeplane#488 / #414: obfuscated and real-world identifier formats that
+    /// previously evaded BOTH masking and residency classification.
+    #[test]
+    fn obfuscated_and_real_world_identifiers_are_classified() {
+        let e = ResidencyEngine::new();
+        // Cyrillic homoglyphs in a PAN.
+        assert!(e
+            .classify("PAN \u{0410}\u{0412}\u{0421}DE1234F")
+            .entities
+            .contains(&EntityType::Pan));
+        // Devanagari-numeral Aadhaar.
+        assert!(e
+            .classify("आधार २३४१२३४१२३४६")
+            .entities
+            .contains(&EntityType::Aadhaar));
+        // Dot-separated Aadhaar.
+        assert!(e
+            .classify("Aadhaar 2341.2341.2346")
+            .entities
+            .contains(&EntityType::Aadhaar));
+        // Lowercase PAN (entity code 'p' = individual).
+        assert!(e
+            .classify("pan abcpd1234e")
+            .entities
+            .contains(&EntityType::Pan));
+    }
+
+    /// Recall must not cost precision: the holder-type code still gates, and
+    /// genuine non-Latin prose must not become a false positive — this
+    /// classifier HARD-LOCKS routing, so over-blocking is not the safer failure.
+    #[test]
+    fn widening_did_not_cost_precision() {
+        let e = ResidencyEngine::new();
+        assert!(!e
+            .classify("token abczd1234e")
+            .entities
+            .contains(&EntityType::Pan));
+        assert!(
+            !e.classify("Привет, как дела? Это обычный текст.")
+                .contains_personal_data
+        );
     }
 
     #[test]
