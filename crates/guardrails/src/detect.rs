@@ -79,19 +79,37 @@ static EMAIL: LazyLock<Regex> = LazyLock::new(|| {
     // Byte-compatible with the pre-existing always-on masking.
     Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").expect("email regex is valid")
 });
-static PHONE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b").expect("phone regex is valid"));
+// routeplane#414: the masker's PHONE was US 3-3-4 ONLY, so `+44 20 ...` and
+// `+91 98765 43210` egressed in cleartext. STRICTLY ADDITIVE — the US branch keeps
+// OPTIONAL separators, because a masker that stops masking something it used to
+// is a leak, not a tightening.
+static PHONE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?x)
+        (?:
+            \+\d[\d\ \-\.]{6,18}\d           # E.164-ish: +CC then 8-15 digits
+          | \b\d{3}[-.]?\d{3}[-.]?\d{4}\b    # US 3-3-4, separators OPTIONAL (unchanged)
+          | \b[6-9]\d{4}[\ \-]\d{5}\b        # India domestic mobile 5-5, lead 6-9
+        )",
+    )
+    .expect("phone regex is valid")
+});
 static SSN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b\d{3}[- ]\d{2}[- ]\d{4}\b").expect("ssn regex is valid"));
 static IPV4: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").expect("ipv4 regex is valid"));
 // India PAN: 5 letters, 4 digits, 1 letter (structural — the 4th char also
 // encodes holder type, but structure alone is a tight enough gate here).
-static PAN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b[A-Z]{5}[0-9]{4}[A-Z]\b").expect("pan regex is valid"));
+static PAN: LazyLock<Regex> = LazyLock::new(|| {
+    // routeplane#414: case-insensitive — real PANs are pasted lowercase and were
+    // egressing unmasked. Widening the shape alone would mask any
+    // 5-letter/4-digit/1-letter token, so `is_pan` gates on the holder-type
+    // entity code the residency classifier already checked: recall AND precision up.
+    Regex::new(r"(?i)\b[a-z]{5}[0-9]{4}[a-z]\b").expect("pan regex is valid")
+});
 // India Aadhaar: 12 digits, optionally space/dash grouped 4-4-4. Verhoeff-gated.
 static AADHAAR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b[2-9]\d{3}[ -]?\d{4}[ -]?\d{4}\b").expect("aadhaar regex is valid")
+    Regex::new(r"\b[2-9]\d{3}[ .-]?\d{4}[ .-]?\d{4}\b").expect("aadhaar regex is valid")
 });
 // Credit card: 13–19 digits, optional space/dash separators. Luhn-gated.
 static CARD: LazyLock<Regex> =
@@ -386,7 +404,18 @@ pub fn redact(text: &str) -> Cow<'_, str> {
         .into_owned();
     out = mask_isolated(&out, &TFN, is_tfn, "[TFN_MASKED]");
     out = SSN.replace_all(&out, "[SSN_MASKED]").into_owned();
-    out = PAN.replace_all(&out, "[PAN_MASKED]").into_owned();
+    let pan_cue = PAN_CUE.is_match(&out);
+    out = PAN
+        .replace_all(&out, |c: &regex::Captures<'_>| {
+            let hit = &c[0];
+            let accept = is_pan(hit) && (!hit.chars().any(|ch| ch.is_ascii_lowercase()) || pan_cue);
+            if accept {
+                "[PAN_MASKED]".to_string()
+            } else {
+                hit.to_string()
+            }
+        })
+        .into_owned();
     out = IPV4
         .replace_all(&out, |c: &Captures| mask_if(&c[0], is_ipv4, "[IP_MASKED]"))
         .into_owned();
@@ -555,7 +584,18 @@ where
             tok_or_mask(&c[0], |_| true, CAT_SSN, "[SSN_MASKED]", &mut tokenize)
         })
         .into_owned();
-    out = PAN.replace_all(&out, "[PAN_MASKED]").into_owned();
+    let pan_cue = PAN_CUE.is_match(&out);
+    out = PAN
+        .replace_all(&out, |c: &regex::Captures<'_>| {
+            let hit = &c[0];
+            let accept = is_pan(hit) && (!hit.chars().any(|ch| ch.is_ascii_lowercase()) || pan_cue);
+            if accept {
+                "[PAN_MASKED]".to_string()
+            } else {
+                hit.to_string()
+            }
+        })
+        .into_owned();
     out = IPV4
         .replace_all(&out, |c: &Captures| mask_if(&c[0], is_ipv4, "[IP_MASKED]"))
         .into_owned();
@@ -636,7 +676,16 @@ pub fn scan_pii(text: &str) -> Vec<&'static str> {
     push(EMAIL.is_match(text), CAT_EMAIL);
     push(PHONE.is_match(text), CAT_PHONE);
     push(SSN.is_match(text), CAT_SSN);
-    push(PAN.is_match(text), CAT_PAN);
+    // `scan_pii` had NO validator here at all — not even `is_pan` — so a promo
+    // code (`abcde1234f`) scored as a PAN. Apply the same rule the masker uses:
+    // uppercase stands alone, lowercase additionally needs a PAN cue.
+    push(
+        PAN.find_iter(text).any(|m| {
+            let hit = m.as_str();
+            is_pan(hit) && (!hit.chars().any(|c| c.is_ascii_lowercase()) || PAN_CUE.is_match(text))
+        }),
+        CAT_PAN,
+    );
     push(
         AADHAAR.find_iter(text).any(|m| is_aadhaar(m.as_str())),
         CAT_AADHAAR,
@@ -1167,6 +1216,24 @@ fn digits(s: &str) -> impl Iterator<Item = u8> + '_ {
 }
 
 /// Verhoeff checksum (UIDAI Aadhaar). Validates the trailing check digit.
+/// A PAN's 4th character encodes holder type; only these codes are issued.
+/// Mirrors `routeplane_residency::is_valid_pan` — the masker had NO such gate
+/// (routeplane#414), so it masked any token of the right shape.
+/// Cue required for the lowercase PAN form — see `pan_in_context` rationale in
+/// the residency crate. `abcde1234f` is an eval-corpus NEGATIVE whose 4th char
+/// is a REAL holder-type code, so `is_pan` alone does not separate it.
+static PAN_CUE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bpan\b").expect("pan cue regex is valid"));
+
+fn is_pan(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 10 {
+        return false;
+    }
+    const VALID_ENTITY: &[u8] = b"PCHFATBLJGEDK";
+    VALID_ENTITY.contains(&b[3].to_ascii_uppercase())
+}
+
 fn is_aadhaar(s: &str) -> bool {
     const D: [[u8; 10]; 10] = [
         [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],

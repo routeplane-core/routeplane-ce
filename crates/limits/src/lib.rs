@@ -368,8 +368,39 @@ const DEFAULT_RATE: (u64, u64) = (2_000_000, 6_000_000);
 pub fn price_for(model: &str) -> Option<(u64, u64)> {
     PRICE_BOOK
         .iter()
-        .find(|(pat, _, _)| model.contains(pat))
+        .find(|(pat, _, _)| pattern_matches(model, pat))
         .map(|(_, p, c)| (*p, *c))
+}
+
+/// Patterns at or below this length must match at a MODEL-ID BOUNDARY rather
+/// than anywhere in the string. Only `o1` (and `o3`, upstream) are this short.
+const SHORT_PATTERN_LEN: usize = 3;
+
+/// Does `pat` price `model`? (routeplane#500 — a BILLING-correctness fix.)
+///
+/// A bare `contains` let the 2-character `o1` row price any model id that merely
+/// CONTAINS those letters. The real collision: `sao10k/l3-lunaris-8b` (genuine
+/// rate ~$0.04/$0.05 per M) matched `o1` inside "sao10k" and was billed at o1's
+/// $15/$60 — roughly 375x over. It over-debits the budget (false 402 risk) and
+/// mis-attributes cost while still returning `Some`, so the unknown-model
+/// counter stays silent and nothing surfaces the error.
+///
+/// Deleting the short rows is NOT the fix — that yields a different wrong answer
+/// (the default rate) for genuine `o1` traffic. A short pattern instead matches
+/// only where a model id would actually carry it: at the start, or immediately
+/// after a `/` vendor separator, ending at the end or at a non-alphanumeric. So
+/// `o1`, `o1-preview` and `openai/o1-preview` price; `sao10k/...` does not.
+fn pattern_matches(model: &str, pat: &str) -> bool {
+    if pat.len() > SHORT_PATTERN_LEN {
+        return model.contains(pat);
+    }
+    let bytes = model.as_bytes();
+    model.match_indices(pat).any(|(start, _)| {
+        let starts_at_boundary = start == 0 || bytes[start - 1] == b'/';
+        let end = start + pat.len();
+        let ends_at_boundary = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        starts_at_boundary && ends_at_boundary
+    })
 }
 
 /// Estimate request cost in **integer micro-USD** from token counts, using the
@@ -1701,6 +1732,49 @@ impl LimitReconciler for InMemoryReconciler {
             .ok()
             .and_then(|g| g.get(&(scope, policy_id.to_string())).copied())
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod pricing_boundary_tests {
+    use super::{pattern_matches, price_for, PRICE_BOOK, SHORT_PATTERN_LEN};
+
+    /// routeplane#500: the 2-char `o1` row must not price a model that merely
+    /// CONTAINS those letters. `sao10k/l3-lunaris-8b` was billed at o1's
+    /// $15/$60 instead of its real ~$0.04/$0.05 — about 375x over.
+    #[test]
+    fn short_patterns_do_not_price_models_that_merely_contain_them() {
+        assert!(!pattern_matches("sao10k/l3-lunaris-8b", "o1"));
+        assert!(!pattern_matches("neversleep/noromaid-o3", "o3"));
+        assert!(!pattern_matches("xo1", "o1"));
+        assert!(!pattern_matches("o10", "o1"));
+    }
+
+    /// ...while genuine addressing still prices. Deleting the short rows was
+    /// never the fix — it just yields a different wrong answer.
+    #[test]
+    fn short_patterns_still_price_their_own_model() {
+        assert!(pattern_matches("o1", "o1"));
+        assert!(pattern_matches("o1-preview", "o1"));
+        assert!(pattern_matches("openai/o1-preview", "o1"));
+        assert_eq!(price_for("o1"), Some((15_000_000, 60_000_000)));
+    }
+
+    /// Guard the invariant, not the instance: any NEW short pattern added to the
+    /// book is boundary-anchored by construction.
+    #[test]
+    fn every_short_pattern_is_boundary_anchored() {
+        for (pat, _, _) in PRICE_BOOK.iter() {
+            if pat.len() > SHORT_PATTERN_LEN {
+                continue;
+            }
+            let embedded = format!("vendor/xx{pat}yy-model");
+            assert!(
+                !pattern_matches(&embedded, pat),
+                "short pattern '{pat}' matched mid-token in '{embedded}' — it would mis-bill"
+            );
+            assert!(pattern_matches(pat, pat), "'{pat}' must price itself");
+        }
     }
 }
 
