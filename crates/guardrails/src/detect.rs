@@ -676,7 +676,16 @@ pub fn scan_pii(text: &str) -> Vec<&'static str> {
     push(EMAIL.is_match(text), CAT_EMAIL);
     push(PHONE.is_match(text), CAT_PHONE);
     push(SSN.is_match(text), CAT_SSN);
-    push(PAN.is_match(text), CAT_PAN);
+    // `scan_pii` had NO validator here at all — not even `is_pan` — so a promo
+    // code (`abcde1234f`) scored as a PAN. Apply the same rule the masker uses:
+    // uppercase stands alone, lowercase additionally needs a PAN cue.
+    push(
+        PAN.find_iter(text).any(|m| {
+            let hit = m.as_str();
+            is_pan(hit) && (!hit.chars().any(|c| c.is_ascii_lowercase()) || PAN_CUE.is_match(text))
+        }),
+        CAT_PAN,
+    );
     push(
         AADHAAR.find_iter(text).any(|m| is_aadhaar(m.as_str())),
         CAT_AADHAAR,
