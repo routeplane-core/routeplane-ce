@@ -729,9 +729,20 @@ fn strip_invisible_with_map(text: &str) -> (String, Vec<usize>) {
         if is_invisible(ch) {
             continue;
         }
-        stripped.push(ch);
-        for j in 0..ch.len_utf8() {
-            map.push(ob + j);
+        // Also fold confusables/non-ASCII digits, so a homoglyph PAN (Cyrillic
+        // `А` for Latin `A`) or a Devanagari Aadhaar is recognized — the same
+        // evasion class as interleaved invisibles, and the same recognizers.
+        let folded = routeplane_unicode::fold_confusable(ch);
+        stripped.push(folded);
+        // The map is BYTE-indexed while the fold is 1:1 by CHAR, and the two
+        // encodings differ in width (`А` is 2 bytes, `A` is 1). So push one entry
+        // per byte of the FOLDED char — not the original — or `stripped` and
+        // `map` desynchronise and every later span is skewed. Every entry points
+        // at the original char's start: a match starting here maps to `ob`, and a
+        // match ending here lands on the NEXT char's first entry (its own `ob`),
+        // which is exactly the exclusive end of this char in the original.
+        for _ in 0..folded.len_utf8() {
+            map.push(ob);
         }
     }
     map.push(text.len());
@@ -739,13 +750,15 @@ fn strip_invisible_with_map(text: &str) -> (String, Vec<usize>) {
 }
 
 /// ADR-118 / PRD-058 FR-2: mask regulated PII/secrets SMUGGLED past the recognizers
-/// by interleaving invisible Unicode (ZWSP / soft hyphen / bidi controls / Tags …)
-/// between a token's characters. Only the smuggled tokens are masked — a token
-/// whose ORIGINAL span carries an invisible — by splicing the mask into the
-/// original, so every OTHER invisible (legitimate Indic ZWJ/ZWNJ, emoji ZWJ
-/// sequences, RTL bidi) is preserved verbatim. Fully-visible PII is left untouched
-/// here and masked by the normal chain exactly as before. Clean input (no
-/// invisibles) returns `Cow::Borrowed`.
+/// either by interleaving invisible Unicode (ZWSP / soft hyphen / bidi controls /
+/// Tags …) between a token's characters, or by writing the token in a
+/// confusable alphabet (Cyrillic homoglyphs, Devanagari/fullwidth digits).
+/// Only the smuggled tokens are masked — a token whose ORIGINAL span carries an
+/// invisible **or a confusable** — by splicing the mask into the original, so
+/// every OTHER invisible (legitimate Indic ZWJ/ZWNJ, emoji ZWJ sequences, RTL
+/// bidi) is preserved verbatim. Fully-visible ASCII PII is left untouched here and
+/// masked by the normal chain exactly as before. Clean input (neither invisible
+/// nor confusable) returns `Cow::Borrowed`.
 ///
 /// Scope: the token recognizers, mirroring [`redact`]'s order + fail-safe floor.
 /// The structured-container DLP (JSON_SECRET / CONNECTION_STRING /
@@ -753,7 +766,10 @@ fn strip_invisible_with_map(text: &str) -> (String, Vec<usize>) {
 /// match whole containers (not char-smuggleable tokens). (CE has no per-tenant
 /// RedactMask, so every category is always scanned.)
 fn mask_invisible_smuggled(text: &str) -> Cow<'_, str> {
-    if !contains_invisible_unicode(text) {
+    // Confusables are the same evasion with a different alphabet, so the residual
+    // pass must also run when the text carries NO invisible but does carry a
+    // homoglyph or a non-ASCII digit. Clean text still short-circuits.
+    if !contains_invisible_unicode(text) && !routeplane_unicode::contains_confusable(text) {
         return Cow::Borrowed(text);
     }
     let (stripped, map) = strip_invisible_with_map(text);
@@ -796,9 +812,24 @@ fn mask_invisible_smuggled(text: &str) -> Cow<'_, str> {
                 }
             }
             let (os, oe) = (map[m.start()], map[m.end()]);
-            // The "stripping revealed NEW PII" gate: mask ONLY when the original
-            // token span actually carried an invisible (i.e. it was broken up).
-            if !text[os..oe].chars().any(is_invisible) {
+            // The "normalization revealed NEW PII" gate: mask ONLY when the
+            // original span was actually obfuscated — it carried an invisible
+            // (broken up) OR a confusable/non-ASCII digit (written in another
+            // alphabet). A fully-visible ASCII token is neither, and is left to
+            // the unchanged chain, so visible PII stays byte-identical.
+            //
+            // Testing `is_invisible` alone here is what made the upstream fold
+            // inert: confusables are by definition VISIBLE, so every
+            // purely-confusable match was skipped and a Devanagari Aadhaar or
+            // homoglyph PAN was forwarded in cleartext — on a request the
+            // residency engine had already classified as personal data (it
+            // normalises unconditionally, so it never had this gate).
+            let span = &text[os..oe];
+            let obfuscated = span.chars().any(is_invisible)
+                || span
+                    .chars()
+                    .any(|c| routeplane_unicode::fold_confusable(c) != c);
+            if !obfuscated {
                 continue;
             }
             // Drop a span overlapping one already claimed by a higher-priority
@@ -1788,6 +1819,54 @@ mod tests {
         let mixed_in = format!("id 2341\u{200B}2341\u{200B}2346 {family}");
         let mixed_want = format!("id [AADHAAR_MASKED] {family}");
         assert_eq!(redact(&mixed_in).as_ref(), mixed_want.as_str());
+    }
+
+    /// A PURELY-confusable identifier — no invisible character anywhere — must be
+    /// masked.
+    ///
+    /// This is the assertion the residual pass needs and did not have. Every
+    /// smuggling test above pairs its evasion with a ZWSP, so a gate that tested
+    /// `is_invisible` alone passed all of them while skipping every
+    /// purely-confusable match. Confusables are by definition visible.
+    ///
+    /// The failure it guards is worse than a plain miss: `crates/residency`
+    /// normalises unconditionally and has no such gate, so the request WAS
+    /// classified as personal data and region-locked while the identifier itself
+    /// went to the provider in cleartext.
+    #[test]
+    fn purely_confusable_pii_is_masked_without_any_invisible() {
+        // Devanagari-digit Aadhaar — same Verhoeff-valid number as the ZWSP test
+        // above (234123412346). No invisible characters at all.
+        let devanagari = "२३४१२३४१२३४६";
+        assert!(
+            !devanagari.chars().any(is_invisible),
+            "precondition: the input carries NO invisible — that is the point"
+        );
+        assert_eq!(
+            redact(&format!("Aadhaar {devanagari}.")).as_ref(),
+            "Aadhaar [AADHAAR_MASKED]."
+        );
+
+        // Cyrillic-А homoglyph PAN (U+0410 for Latin A). Also no invisibles.
+        assert_eq!(
+            redact("PAN \u{0410}BCPD1234E ok").as_ref(),
+            "PAN [PAN_MASKED] ok"
+        );
+    }
+
+    /// The widened gate must not turn ordinary non-ASCII text into PII. A
+    /// confusable is only a *trigger* to re-examine; the recognizer and its
+    /// validator still decide, exactly as on the ASCII path.
+    #[test]
+    fn confusable_text_that_is_not_pii_is_left_byte_identical() {
+        // Devanagari prose with no identifier in it.
+        let prose = "मेरा नाम प्रिया है और मैं मदद चाहती हूँ";
+        assert_eq!(redact(prose).as_ref(), prose);
+
+        // Devanagari digits that are NOT a valid Aadhaar (fails Verhoeff) stay put
+        // — the validator still runs after the fold.
+        let not_aadhaar = "क्रमांक १२३४५६७८९०१२ है";
+        assert_eq!(redact(not_aadhaar).as_ref(), not_aadhaar);
     }
 
     #[test]
