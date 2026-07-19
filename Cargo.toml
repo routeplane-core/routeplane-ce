@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # MSRV — must match rust-toolchain.toml, the Dockerfile (rust:1.88-slim-bookworm)
 # and the explicit toolchain ci.yml passes to rust-quality (ADR-093 bump).
