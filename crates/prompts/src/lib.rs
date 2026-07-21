@@ -91,8 +91,8 @@ pub struct Version {
 }
 
 /// A registry prompt: id (`prompt_<slug>`), name, movable labels, immutable
-/// versions keyed by number, and (PRD-010, A/B testing) optional named
-/// experiments that resolve a version by WEIGHTED, sticky-by-cohort assignment.
+/// versions keyed by number, and ([ADR-152] D2, rung-0 FR-2/FR-3) optional
+/// first-class weighted VARIANTS — the prompt itself is the experiment.
 #[derive(Debug)]
 pub struct StoredPrompt {
     pub id: String,
@@ -100,83 +100,176 @@ pub struct StoredPrompt {
     pub description: Option<String>,
     pub latest_version: u32,
     pub labels: BTreeMap<String, u32>,
-    /// PRD-010 (A/B testing): named experiments. Resolved like a label
-    /// (`prompt_x@my_experiment`), but the selector yields a version by weighted
-    /// assignment over `variants` rather than a fixed mapping. Empty by default —
-    /// a prompt with no experiments behaves EXACTLY as before (byte-identical).
-    pub experiments: BTreeMap<String, Experiment>,
+    /// [ADR-152] D2: the prompt's weighted variant split. A `Vec`, not a map —
+    /// declaration order is load-bearing: the FIRST declared variant is the
+    /// control arm (served when no cohort is attributable). Empty (the
+    /// default) ⇒ no split declared ⇒ resolution behaves exactly as before
+    /// (byte-identical). Assignment is sticky by cohort and weight-STABLE
+    /// ([ADR-152] D3; [`assign_variant`]).
+    pub variants: Vec<Variant>,
     versions: BTreeMap<u32, Arc<Version>>,
 }
 
-/// PRD-010 (A/B testing): a named weighted experiment over existing immutable
-/// versions. Resolution is deterministic + replica-stable (a fixed-seed hash, not
-/// per-process `RandomState`) and sticky by cohort key.
-#[derive(Debug, Clone)]
-pub struct Experiment {
-    pub variants: Vec<Variant>,
-}
-
-/// One arm of an experiment: an existing version number and its integer weight.
-/// `label` is a human-readable arm name carried into analytics (the served
-/// variant), distinct from the resolved integer `version`.
+/// One first-class variant ([ADR-152] D2, the FR-2 fold): a labelled, weighted
+/// pointer at an existing immutable version, optionally layering its own
+/// `model`/`params` over that version's defaults at render — one addressable
+/// implementation, not just a pointer at a version.
 #[derive(Debug, Clone)]
 pub struct Variant {
+    /// Required, unique per prompt — the analytics identifier
+    /// (`UsageEvent.prompt_variant`) and the FR-2 binding name.
     pub label: String,
+    /// The version binding the template (+ the defaults `model`/`params`
+    /// layer over).
     pub version: u32,
+    /// Relative integer weight. Assignment normalizes, so `50/50` and `25/25`
+    /// are the SAME split ([ADR-152] D3).
     pub weight: u32,
+    /// FR-2: overrides the version's `default_model` when set.
+    pub model: Option<String>,
+    /// FR-2: layered over the version's `default_params` at render —
+    /// variant-key-wins SHALLOW merge for objects (see [`merge_params`]).
+    pub params: Option<serde_json::Value>,
 }
 
-/// Max variants per experiment (fail-closed bound; an experiment is a small A/B/n
-/// split, not an unbounded fan-out). Validated at load.
-pub const MAX_EXPERIMENT_VARIANTS: usize = 16;
+/// Max declared variants per prompt (fail-closed bound; a split is a small
+/// A/B/n, not an unbounded fan-out). Validated at load. (Renamed from
+/// `MAX_EXPERIMENT_VARIANTS` with the [ADR-152] D1 cutover.)
+pub const MAX_VARIANTS: usize = 16;
 
-impl Experiment {
-    /// Total weight across arms (sum is validated > 0 at load, so this is a
-    /// non-zero modulus base for assignment).
-    fn total_weight(&self) -> u64 {
-        self.variants.iter().map(|v| v.weight as u64).sum()
+/// Deterministic, replica-stable, sticky, WEIGHT-STABLE variant assignment
+/// ([ADR-152] D3).
+///
+/// `cohort_key`:
+///   * `Some(key)` — STICKY: the same `(prompt_id, key)` always maps to the
+///     same arm, identically on every replica (the fixed-seed FNV-1a
+///     [`stable_bucket`], never the per-process `RandomState`).
+///   * `None` — the CONTROL arm (the first declared variant): with no cohort
+///     we serve a stable control rather than splitting an unattributable
+///     request (no silent per-request flapping).
+///
+/// Mapping: `u = stable_bucket(prompt_id, key) / 2^64` (the cohort's fixed
+/// position in the unit interval), walked against CUMULATIVE NORMALIZED
+/// weights. This replaces the old `hash % total_weight` mapping, whose
+/// assignments reshuffled every cohort on ANY weight change (even a pure
+/// scaling like 50/50 → 25/25 — the FR-24 violation [ADR-152] D3 names):
+///
+///   * **Scaling-invariant, exactly.** Shares are `wᵢ/Σw`; scaling every
+///     weight by `k` yields the same real quotients, and IEEE-754 division is
+///     correctly rounded, so the f64 thresholds — and every assignment — are
+///     bit-identical.
+///   * **Minimal movement under shifts.** A cohort's `u` never moves; only
+///     the cumulative thresholds do, so the moved population is bounded by
+///     the total threshold shift. For a TWO-arm split (the expected shape)
+///     the guarantee is exact: a moved cohort lands only on the arm whose
+///     normalized share grew. For 3+ arms a middle arm's interval can shift
+///     even when its own share did not, so the destination guarantee is
+///     per-boundary rather than global — the property tests pin the exact
+///     two-arm law and the aggregate movement bound.
+///
+/// Empty `variants` ⇒ `None` (impossible post-load — validated non-empty when
+/// declared — but total on a hand-built registry).
+pub fn assign_variant<'a>(
+    prompt_id: &str,
+    variants: &'a [Variant],
+    cohort_key: Option<&str>,
+) -> Option<&'a Variant> {
+    let first = variants.first()?;
+    let Some(key) = cohort_key else {
+        return Some(first);
+    };
+    let total: u64 = variants.iter().map(|v| v.weight as u64).sum();
+    if total == 0 {
+        // Defensive: validated > 0 at load. Fall back to control.
+        return Some(first);
     }
-
-    /// Deterministic, replica-stable, sticky weighted assignment. Returns the
-    /// chosen `(version, variant_label)`.
-    ///
-    /// `cohort_key`:
-    ///   * `Some(key)` — STICKY: the same `(experiment_name, key)` always maps to
-    ///     the same arm, identically on every replica (a fixed-seed FNV-1a hash,
-    ///     never the per-process `RandomState`).
-    ///   * `None` — falls back to the CONTROL arm (the first declared variant).
-    ///     Sticky-by-cohort is the goal; with no cohort we serve a stable control
-    ///     rather than splitting an unattributable request (the safest default —
-    ///     no silent per-request flapping).
-    ///
-    /// Assignment: `bucket = stable_hash(name, key) % total_weight`, then the arm
-    /// whose cumulative weight first covers `bucket`. Empty `variants` is
-    /// impossible post-load (validated), but is handled fail-safe (`None`).
-    pub fn assign(&self, name: &str, cohort_key: Option<&str>) -> Option<(u32, String)> {
-        let first = self.variants.first()?;
-        let Some(key) = cohort_key else {
-            // No cohort ⇒ control (first declared arm). Documented default.
-            return Some((first.version, first.label.clone()));
-        };
-        let total = self.total_weight();
-        if total == 0 {
-            // Defensive: validated > 0 at load. Fall back to control.
-            return Some((first.version, first.label.clone()));
+    // The cohort's position in [0, 1): the full 64-bit hash as a fraction of
+    // 2^64. (`u64::MAX as f64 + 1.0` is exactly 2^64.)
+    let u = stable_bucket(prompt_id, key) as f64 / (u64::MAX as f64 + 1.0);
+    let total_f = total as f64;
+    let mut cumulative = 0.0f64;
+    for variant in variants {
+        cumulative += variant.weight as f64 / total_f;
+        if u < cumulative {
+            return Some(variant);
         }
-        let bucket = stable_bucket(name, key) % total;
-        let mut cumulative: u64 = 0;
-        for variant in &self.variants {
-            cumulative += variant.weight as u64;
-            if bucket < cumulative {
-                return Some((variant.version, variant.label.clone()));
+    }
+    // Floating-point tail: the cumulative sum can land a hair under 1.0; the
+    // remaining sliver belongs to the last arm.
+    variants.last()
+}
+
+/// FR-2 params layering ([ADR-152] D2): the variant's `params` over the
+/// version's `default_params`, VARIANT-KEY-WINS SHALLOW merge. Two JSON
+/// objects merge key-by-key (the variant's value replaces the version's
+/// wholesale — no deep merge: params are one level of OpenAI knobs, and a
+/// deep merge would make `{"response_format": ...}` overrides order-dependent
+/// surprises). Any non-object on either side ⇒ the variant's params win
+/// wholesale when present, else the version's.
+fn merge_params(
+    version: Option<&serde_json::Value>,
+    variant: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match (version, variant) {
+        (None, None) => None,
+        (Some(v), None) => Some(v.clone()),
+        (None, Some(o)) => Some(o.clone()),
+        (Some(serde_json::Value::Object(base)), Some(serde_json::Value::Object(over))) => {
+            let mut merged = base.clone();
+            for (k, v) in over {
+                merged.insert(k.clone(), v.clone());
             }
+            Some(serde_json::Value::Object(merged))
         }
-        // Unreachable (bucket < total == cumulative sum), but stay fail-safe.
-        Some((first.version, first.label.clone()))
+        // Non-object params on either side: the variant's override wins wholesale.
+        (_, Some(o)) => Some(o.clone()),
     }
 }
 
-/// FNV-1a (64-bit) over `experiment_name \0 cohort_key`. A FIXED-SEED, fully
+/// Variant-label sanity ([ADR-152] D2): non-empty, ≤ 64 bytes, ASCII
+/// `[A-Za-z0-9_-]` (the analytics-safe charset `prompt_variant` rides), and
+/// never the reserved `v<digits>` version-pin form — the reference grammar
+/// owns that shape, so a variant labelled `v3` could never be told apart from
+/// a version pin in tooling.
+fn variant_label_is_sane(label: &str) -> bool {
+    if label.is_empty() || label.len() > 64 {
+        return false;
+    }
+    if !label
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return false;
+    }
+    if let Some(digits) = label.strip_prefix('v') {
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// [ADR-152] D4: the durable ATTRIBUTION hash of a raw cohort key — FNV-1a
+/// (64-bit) over the key alone, as 16 lowercase hex chars. This is the JOIN
+/// key the telemetry plane persists, unreversed: the raw cohort value (often
+/// the OpenAI `user` field) NEVER lands durable (R16); two rows join on the
+/// hash. Deliberately keyless and prompt-independent, so an episode-level
+/// feedback fold can recompute it from its own target id and match the
+/// inference side. Same constants as [`stable_bucket`], different domain
+/// (the key alone — assignment hashes `(prompt_id, key)` and stays separate).
+pub fn cohort_hash_hex(cohort_key: &str) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for &b in cohort_key.as_bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+/// FNV-1a (64-bit) over `name \0 cohort_key` (the [ADR-152] D3 domain is
+/// `(prompt_id, cohort)` — the prompt IS the experiment). A FIXED-SEED, fully
 /// specified hash — deliberately NOT `std::hash::RandomState` (which is seeded
 /// per process and would assign the SAME cohort to different arms on different
 /// replicas). FNV-1a is stable across builds, processes, and architectures, so a
@@ -306,10 +399,11 @@ pub struct Resolved<'a> {
     pub prompt_id: String,
     pub version_number: u32,
     pub label: Option<String>,
-    /// PRD-010 (A/B testing): when the reference resolved via an experiment, the
-    /// `(experiment_name, served_variant_label)`. `None` for plain
-    /// latest/label/version resolution — so non-experiment paths are unchanged.
-    pub experiment: Option<(String, String)>,
+    /// [ADR-152] D2: the SERVED variant's label when the reference resolved via
+    /// the prompt's weighted split. `None` for explicit `@vN`/`@label`
+    /// resolution and for prompts with no declared variants — those paths are
+    /// unchanged.
+    pub variant: Option<String>,
     pub version: &'a Version,
     pub prompt: &'a StoredPrompt,
 }
@@ -321,11 +415,16 @@ pub struct Rendered {
     pub prompt_id: String,
     pub version: u32,
     pub label: Option<String>,
-    /// PRD-010 (A/B testing): `(experiment_name, served_variant_label)` when the
-    /// render resolved via an experiment, else `None`. Lets the binary annotate
-    /// the usage event with the served variant for variant analytics.
-    pub experiment: Option<(String, String)>,
+    /// [ADR-152] D2: the SERVED variant's label when the render resolved via
+    /// the weighted split, else `None`. Lets the binary annotate the usage
+    /// event (`UsageEvent.prompt_variant`) for variant analytics.
+    pub variant: Option<String>,
+    /// The effective model: the served variant's FR-2 `model` override when
+    /// one applies, else the version's `default_model`.
     pub model: Option<String>,
+    /// The effective params: the served variant's FR-2 `params` layered over
+    /// the version's `default_params` ([`merge_params`], variant-key-wins
+    /// shallow merge).
     pub params: Option<serde_json::Value>,
     pub text: String,
 }
@@ -360,11 +459,11 @@ impl PromptRegistry {
     /// server-controlled (the authenticated `TenantContext`) — the structural
     /// isolation guarantee (FR-15).
     ///
-    /// This is the cohort-FREE entry point: an `@name` selector that matches a
-    /// LABEL resolves to that label's version; one that matches an EXPERIMENT
-    /// resolves to the experiment's CONTROL arm (no cohort ⇒ control). Partial
-    /// includes and the `GET /v1/prompts/{ref}` surface use this path, so they are
-    /// stable + side-effect-free. Use `resolve_with_cohort` to apply a cohort.
+    /// This is the cohort-FREE entry point: a bare reference on a prompt with
+    /// declared variants resolves the CONTROL arm (no cohort ⇒ control).
+    /// Partial includes and the `GET /v1/prompts/{ref}` surface use this path,
+    /// so they are stable + side-effect-free. Use `resolve_with_cohort` to
+    /// apply a cohort.
     pub fn resolve<'a>(
         &'a self,
         tenant_id: &str,
@@ -373,16 +472,17 @@ impl PromptRegistry {
         self.resolve_with_cohort(tenant_id, reference, None)
     }
 
-    /// Resolve a `{ref}`, applying `cohort_key` when the selector names an
-    /// EXPERIMENT (PRD-010 A/B testing). For latest/label/`@vN` references the
-    /// cohort is ignored — those paths are byte-identical to before. For an
-    /// experiment reference the cohort drives the sticky weighted assignment;
-    /// `None` ⇒ the control arm.
+    /// Resolve a `{ref}` under the [ADR-152] D2 selection precedence:
     ///
-    /// Precedence on a name collision: a LABEL wins over an experiment of the same
-    /// name. This is unreachable in practice — `load_*` rejects any
-    /// label/experiment name collision fail-closed — but the precedence is fixed
-    /// and documented so the resolver is total even on a hand-built registry.
+    ///   explicit `@vN`  >  explicit `@label`  >  weighted-when-variants-declared
+    ///   (a BARE reference on a prompt with a declared split; `cohort_key`
+    ///   drives the sticky [`assign_variant`] mapping, `None` ⇒ the control
+    ///   arm)  >  `latest`.
+    ///
+    /// Explicit selectors pin exactly what they name and never split; the old
+    /// label-beats-experiment collision rule died with the `experiments` block
+    /// (variant labels are validated at load to never collide with label
+    /// names, so `@name` is unambiguous).
     pub fn resolve_with_cohort<'a>(
         &'a self,
         tenant_id: &str,
@@ -394,17 +494,19 @@ impl PromptRegistry {
             .lookup(tenant_id, id)
             .ok_or_else(|| PromptError::prompt_not_found(reference))?;
 
-        let (version_number, label, experiment) = match selector {
-            Selector::Latest => (prompt.latest_version, None, None),
+        let (version_number, label, variant) = match selector {
+            Selector::Latest => {
+                // The weighted leg: a bare reference on a prompt with a
+                // declared split serves the assigned variant; no split ⇒
+                // `latest`, byte-identical to before.
+                match assign_variant(&prompt.id, &prompt.variants, cohort_key) {
+                    Some(v) => (v.version, None, Some(v.label.clone())),
+                    None => (prompt.latest_version, None, None),
+                }
+            }
             Selector::Label(l) => {
-                // Label takes precedence over an experiment of the same name.
                 if let Some(v) = prompt.labels.get(l).copied() {
                     (v, Some(l.to_string()), None)
-                } else if let Some(exp) = prompt.experiments.get(l) {
-                    let (v, variant) = exp
-                        .assign(l, cohort_key)
-                        .ok_or_else(|| PromptError::version_not_found(reference))?;
-                    (v, None, Some((l.to_string(), variant)))
                 } else {
                     return Err(PromptError::version_not_found(reference));
                 }
@@ -427,7 +529,7 @@ impl PromptRegistry {
             prompt_id: prompt.id.clone(),
             version_number,
             label,
-            experiment,
+            variant,
             version,
             prompt,
         })
@@ -435,7 +537,7 @@ impl PromptRegistry {
 
     /// Resolve + render (FR-5/FR-6/FR-8). Side-effect-free and deterministic
     /// (NFR-3): the same snapshot + ref + variables yields byte-identical output.
-    /// Cohort-FREE: an experiment reference renders its control arm.
+    /// Cohort-FREE: a bare reference on a split prompt renders its control arm.
     pub fn render(
         &self,
         tenant_id: &str,
@@ -446,12 +548,13 @@ impl PromptRegistry {
         self.render_with_cohort(tenant_id, reference, vars, missing, None)
     }
 
-    /// Resolve + render with a cohort key for sticky A/B experiment assignment
-    /// (PRD-010). Identical to `render` for non-experiment references (and for
-    /// experiment references when `cohort_key` is `None` ⇒ the control arm), so a
-    /// prompt with no experiments is byte-identical. Determinism is preserved: the
-    /// SAME snapshot + ref + cohort + variables yields byte-identical output, and
-    /// the assignment is replica-stable (fixed-seed hash).
+    /// Resolve + render with a cohort key for sticky weighted variant
+    /// assignment ([ADR-152] D2/D3). Identical to `render` for explicit
+    /// `@vN`/`@label` references and for prompts with no declared split (and
+    /// for bare split references when `cohort_key` is `None` ⇒ the control
+    /// arm), so an unsplit prompt is byte-identical. Determinism is preserved:
+    /// the SAME snapshot + ref + cohort + variables yields byte-identical
+    /// output, and the assignment is replica-stable (fixed-seed hash).
     pub fn render_with_cohort(
         &self,
         tenant_id: &str,
@@ -482,13 +585,28 @@ impl PromptRegistry {
             &mut out,
         )?;
         check_output_cap(&out)?;
+        // FR-2 ([ADR-152] D2): when a variant served the render, its
+        // `model`/`params` layer over the version's defaults. Label-unique at
+        // load, so the lookup is unambiguous; an explicit `@vN`/`@label`
+        // resolution has no served variant and keeps the version's defaults.
+        let served = resolved
+            .variant
+            .as_deref()
+            .and_then(|label| resolved.prompt.variants.iter().find(|v| v.label == label));
+        let model = served
+            .and_then(|v| v.model.clone())
+            .or_else(|| resolved.version.default_model.clone());
+        let params = merge_params(
+            resolved.version.default_params.as_ref(),
+            served.and_then(|v| v.params.as_ref()),
+        );
         Ok(Rendered {
             prompt_id: resolved.prompt_id,
             version: resolved.version_number,
             label: resolved.label,
-            experiment: resolved.experiment,
-            model: resolved.version.default_model.clone(),
-            params: resolved.version.default_params.clone(),
+            variant: resolved.variant,
+            model,
+            params,
             text: out,
         })
     }
@@ -509,6 +627,13 @@ impl PromptRegistry {
         let mut tenants: HashMap<String, HashMap<String, StoredPrompt>> = HashMap::new();
 
         for rec in file.prompts {
+            // [ADR-152] D1: the pre-cutover `experiments` block is a dedicated,
+            // fail-closed load error — never silently ignored (serde would
+            // otherwise drop the unknown key and quietly serve an unsplit
+            // prompt where the operator declared a split).
+            if rec.experiments.is_some() {
+                return Err(PromptLoadError::LegacyExperimentsBlock { id: rec.id });
+            }
             if rec.versions.is_empty() {
                 return Err(PromptLoadError::NoVersions { id: rec.id });
             }
@@ -586,61 +711,60 @@ impl PromptRegistry {
                 }
             }
 
-            // PRD-010 (A/B testing): validate + build experiments, fail-closed.
-            let mut experiments: BTreeMap<String, Experiment> = BTreeMap::new();
-            for (exp_name, erec) in rec.experiments {
-                // (a) No collision with a label name — the `@name` selector must be
-                //     unambiguous (label-vs-experiment precedence is documented, but
-                //     a collision is a config bug, rejected fail-closed).
-                if rec.labels.contains_key(&exp_name) {
-                    return Err(PromptLoadError::ExperimentNameCollision {
+            // [ADR-152] D2: validate + build the first-class variant split,
+            // fail-closed. Declaration order is preserved (first = control).
+            let mut total_weight: u64 = 0;
+            let mut variants: Vec<Variant> = Vec::with_capacity(rec.variants.len());
+            if rec.variants.len() > MAX_VARIANTS {
+                return Err(PromptLoadError::TooManyVariants {
+                    id: rec.id,
+                    count: rec.variants.len(),
+                    max: MAX_VARIANTS,
+                });
+            }
+            for vrec in rec.variants {
+                // (a) Label sanity: required, non-empty, bounded, analytics-safe
+                //     charset. A `v<digits>` label is rejected — the reference
+                //     grammar reserves that form for version pins, so such a
+                //     label could never be told apart in tooling.
+                if !variant_label_is_sane(&vrec.label) {
+                    return Err(PromptLoadError::VariantLabelInvalid {
                         id: rec.id,
-                        name: exp_name,
+                        label: vrec.label,
                     });
                 }
-                // (b) Non-empty, bounded variant count.
-                if erec.variants.is_empty() {
-                    return Err(PromptLoadError::ExperimentNoVariants {
+                // (b) Unique per prompt, and never colliding with a label-map
+                //     name — `@name` must stay unambiguous (the D2 rule that
+                //     replaced the old label-beats-experiment precedence).
+                if variants.iter().any(|v: &Variant| v.label == vrec.label)
+                    || rec.labels.contains_key(&vrec.label)
+                {
+                    return Err(PromptLoadError::VariantLabelCollision {
                         id: rec.id,
-                        name: exp_name,
+                        label: vrec.label,
                     });
                 }
-                if erec.variants.len() > MAX_EXPERIMENT_VARIANTS {
-                    return Err(PromptLoadError::ExperimentTooManyVariants {
+                // (c) The bound version must exist.
+                if !versions.contains_key(&vrec.version) {
+                    return Err(PromptLoadError::VariantVersionMissing {
                         id: rec.id,
-                        name: exp_name,
-                        count: erec.variants.len(),
-                        max: MAX_EXPERIMENT_VARIANTS,
-                    });
-                }
-                // (c) Each arm points at an existing version; (d) weights sum > 0.
-                let mut total_weight: u64 = 0;
-                let mut variants: Vec<Variant> = Vec::with_capacity(erec.variants.len());
-                for vrec in erec.variants {
-                    if !versions.contains_key(&vrec.version) {
-                        return Err(PromptLoadError::ExperimentVariantMissing {
-                            id: rec.id,
-                            name: exp_name,
-                            version: vrec.version,
-                        });
-                    }
-                    total_weight += vrec.weight as u64;
-                    // A variant label defaults to `v<version>` when omitted, so the
-                    // served-variant analytics annotation is always populated.
-                    let label = vrec.label.unwrap_or_else(|| format!("v{}", vrec.version));
-                    variants.push(Variant {
-                        label,
+                        label: vrec.label,
                         version: vrec.version,
-                        weight: vrec.weight,
                     });
                 }
-                if total_weight == 0 {
-                    return Err(PromptLoadError::ExperimentZeroWeight {
-                        id: rec.id,
-                        name: exp_name,
-                    });
-                }
-                experiments.insert(exp_name, Experiment { variants });
+                total_weight += vrec.weight as u64;
+                variants.push(Variant {
+                    label: vrec.label,
+                    version: vrec.version,
+                    weight: vrec.weight,
+                    model: vrec.model,
+                    params: vrec.params,
+                });
+            }
+            // (d) A DECLARED split must carry weight (all-zero weights would
+            //     silently collapse every cohort onto the control arm).
+            if !variants.is_empty() && total_weight == 0 {
+                return Err(PromptLoadError::VariantsZeroWeight { id: rec.id });
             }
 
             let latest = match rec.latest_version {
@@ -681,7 +805,7 @@ impl PromptRegistry {
                     description: rec.description,
                     latest_version: latest,
                     labels: rec.labels,
-                    experiments,
+                    variants,
                     versions,
                 },
             );
@@ -1053,25 +1177,34 @@ struct PromptRecord {
     latest_version: Option<u32>,
     #[serde(default)]
     labels: BTreeMap<String, u32>,
-    /// PRD-010 (A/B testing): optional named experiments. Absent by default, so a
-    /// prompt config without experiments parses + behaves identically to before.
+    /// [ADR-152] D1: the RETIRED pre-cutover `experiments` block, kept only so
+    /// its presence can be detected. `Some(..)` — any shape, any content —
+    /// refuses the load with [`PromptLoadError::LegacyExperimentsBlock`]
+    /// naming the migration; without this field serde would silently drop the
+    /// unknown key and serve an unsplit prompt where the operator declared a
+    /// split.
     #[serde(default)]
-    experiments: BTreeMap<String, ExperimentRecord>,
+    experiments: Option<serde_json::Value>,
+    /// [ADR-152] D2: the first-class weighted variant split. Absent/empty ⇒
+    /// no split (byte-identical resolution); declaration order is
+    /// load-bearing — the FIRST declared variant is the control arm.
+    #[serde(default)]
+    variants: Vec<VariantRecord>,
     versions: Vec<VersionRecord>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ExperimentRecord {
-    variants: Vec<VariantRecord>,
-}
-
+/// Wire form of one [ADR-152] D2 variant: a required unique `label`, the
+/// version it binds, its relative `weight`, and the optional FR-2
+/// `model`/`params` overrides layered over that version's defaults.
 #[derive(Debug, Deserialize)]
 struct VariantRecord {
+    label: String,
     version: u32,
     weight: u32,
-    /// Human-readable arm name for analytics; defaults to `v<version>` if omitted.
     #[serde(default)]
-    label: Option<String>,
+    model: Option<String>,
+    #[serde(default)]
+    params: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1148,28 +1281,30 @@ pub enum PromptLoadError {
         id: String,
         version: u32,
     },
-    ExperimentNameCollision {
+    /// [ADR-152] D1: the file still carries the retired `experiments` block.
+    LegacyExperimentsBlock {
         id: String,
-        name: String,
     },
-    ExperimentNoVariants {
+    TooManyVariants {
         id: String,
-        name: String,
-    },
-    ExperimentTooManyVariants {
-        id: String,
-        name: String,
         count: usize,
         max: usize,
     },
-    ExperimentVariantMissing {
+    VariantLabelInvalid {
         id: String,
-        name: String,
+        label: String,
+    },
+    VariantLabelCollision {
+        id: String,
+        label: String,
+    },
+    VariantVersionMissing {
+        id: String,
+        label: String,
         version: u32,
     },
-    ExperimentZeroWeight {
+    VariantsZeroWeight {
         id: String,
-        name: String,
     },
 }
 
@@ -1234,28 +1369,31 @@ impl std::fmt::Display for PromptLoadError {
             Self::LatestVersionMissing { id, version } => {
                 write!(f, "prompt '{id}' latest_version {version} does not exist")
             }
-            Self::ExperimentNameCollision { id, name } => write!(
+            Self::LegacyExperimentsBlock { id } => write!(
                 f,
-                "prompt '{id}' experiment '{name}' collides with a label of the same name"
+                "prompt '{id}' uses the retired 'experiments' block: weights moved onto \
+                 first-class 'variants' (ADR-152 hard cutover) — migrate the config to the \
+                 new shape; see configs/prompts.example.json"
             ),
-            Self::ExperimentNoVariants { id, name } => {
-                write!(f, "prompt '{id}' experiment '{name}' has no variants")
+            Self::TooManyVariants { id, count, max } => {
+                write!(f, "prompt '{id}' declares {count} variants (max {max})")
             }
-            Self::ExperimentTooManyVariants {
-                id,
-                name,
-                count,
-                max,
-            } => write!(
+            Self::VariantLabelInvalid { id, label } => write!(
                 f,
-                "prompt '{id}' experiment '{name}' has {count} variants (max {max})"
+                "prompt '{id}' variant label '{label}' is invalid (non-empty ASCII \
+                 [A-Za-z0-9_-] up to 64 bytes, and never the reserved v<digits> form)"
             ),
-            Self::ExperimentVariantMissing { id, name, version } => write!(
+            Self::VariantLabelCollision { id, label } => write!(
                 f,
-                "prompt '{id}' experiment '{name}' references missing version {version}"
+                "prompt '{id}' variant label '{label}' is duplicated or collides with a \
+                 label of the same name"
             ),
-            Self::ExperimentZeroWeight { id, name } => {
-                write!(f, "prompt '{id}' experiment '{name}' has zero total weight")
+            Self::VariantVersionMissing { id, label, version } => write!(
+                f,
+                "prompt '{id}' variant '{label}' references missing version {version}"
+            ),
+            Self::VariantsZeroWeight { id } => {
+                write!(f, "prompt '{id}' declares variants with zero total weight")
             }
         }
     }
@@ -1534,15 +1672,15 @@ mod tests {
         assert_eq!(err.code(), "prompt_too_large");
     }
 
-    // --- PRD-010 (A/B testing): experiments ------------------------------------
+    // --- [ADR-152] D1/D2/D3: first-class weighted variants ---------------------
 
-    const EXP: &str = r#"{"prompts":[
+    const SPLIT: &str = r#"{"prompts":[
         {"tenant_id":"t","id":"prompt_x","name":"X","latest_version":3,
          "labels":{"prod":1},
-         "experiments":{"tone":{"variants":[
-            {"version":2,"weight":50,"label":"formal"},
-            {"version":3,"weight":50,"label":"casual"}
-         ]}},
+         "variants":[
+            {"label":"formal","version":2,"weight":50},
+            {"label":"casual","version":3,"weight":50}
+         ],
          "versions":[
            {"version":1,"template":"v1 {{name}}","variables":[{"name":"name"}]},
            {"version":2,"template":"formal {{name}}","variables":[{"name":"name"}]},
@@ -1550,102 +1688,100 @@ mod tests {
          ]}
     ]}"#;
 
-    #[test]
-    fn experiment_parses_and_resolves_a_variant() {
-        let r = reg(EXP);
-        let res = r
-            .resolve_with_cohort("t", "prompt_x@tone", Some("user-1"))
-            .unwrap();
-        // The resolved version is one of the two arms, label is None (experiment),
-        // and the experiment annotation carries (name, served_variant).
-        assert!(res.version_number == 2 || res.version_number == 3);
-        assert!(res.label.is_none());
-        let (exp_name, variant) = res.experiment.clone().unwrap();
-        assert_eq!(exp_name, "tone");
-        assert!(variant == "formal" || variant == "casual");
+    /// Build a variant list for direct [`assign_variant`] property tests.
+    fn arms(weights: &[u32]) -> Vec<Variant> {
+        weights
+            .iter()
+            .enumerate()
+            .map(|(i, &w)| Variant {
+                label: format!("arm-{i}"),
+                version: 1,
+                weight: w,
+                model: None,
+                params: None,
+            })
+            .collect()
     }
 
     #[test]
-    fn experiment_assignment_is_sticky_and_replica_stable() {
-        let r = reg(EXP);
+    fn bare_reference_on_a_split_prompt_serves_a_variant() {
+        let r = reg(SPLIT);
+        let res = r
+            .resolve_with_cohort("t", "prompt_x", Some("user-1"))
+            .unwrap();
+        // One of the two declared arms, label None, the served-variant
+        // annotation populated.
+        assert!(res.version_number == 2 || res.version_number == 3);
+        assert!(res.label.is_none());
+        let variant = res.variant.clone().unwrap();
+        assert!(variant == "formal" || variant == "casual");
+    }
+
+    /// [ADR-152] D2 precedence: explicit selectors PIN and never split.
+    #[test]
+    fn explicit_selectors_beat_the_weighted_split() {
+        let r = reg(SPLIT);
+        let pinned = r
+            .resolve_with_cohort("t", "prompt_x@v1", Some("user-1"))
+            .unwrap();
+        assert_eq!(pinned.version_number, 1);
+        assert!(pinned.variant.is_none());
+        let labelled = r
+            .resolve_with_cohort("t", "prompt_x@prod", Some("user-1"))
+            .unwrap();
+        assert_eq!(labelled.version_number, 1);
+        assert_eq!(labelled.label.as_deref(), Some("prod"));
+        assert!(labelled.variant.is_none());
+    }
+
+    #[test]
+    fn assignment_is_sticky_and_replica_stable() {
+        let r = reg(SPLIT);
         // Same cohort key ⇒ same variant, every call (sticky).
         let a = r
-            .resolve_with_cohort("t", "prompt_x@tone", Some("cohort-abc"))
+            .resolve_with_cohort("t", "prompt_x", Some("cohort-abc"))
             .unwrap();
         for _ in 0..50 {
             let b = r
-                .resolve_with_cohort("t", "prompt_x@tone", Some("cohort-abc"))
+                .resolve_with_cohort("t", "prompt_x", Some("cohort-abc"))
                 .unwrap();
             assert_eq!(a.version_number, b.version_number);
-            assert_eq!(a.experiment, b.experiment);
+            assert_eq!(a.variant, b.variant);
         }
-        // Replica-stability: the bucket is a fixed-seed hash, so a known cohort
-        // maps to a fixed bucket regardless of process. Assert the raw mapping is
-        // stable (not just self-consistent) by recomputing it directly.
-        let total: u64 = 100;
-        let bucket = super::stable_bucket("tone", "cohort-abc") % total;
-        let expected_version = if bucket < 50 { 2 } else { 3 };
+        // Replica-stability: recompute the D3 mapping directly from the
+        // fixed-seed hash (the domain is (prompt_id, cohort)) — the resolver
+        // must agree with the raw math, not merely with itself.
+        let u = super::stable_bucket("prompt_x", "cohort-abc") as f64 / (u64::MAX as f64 + 1.0);
+        let expected_version = if u < 0.5 { 2 } else { 3 };
         assert_eq!(a.version_number, expected_version);
     }
 
     #[test]
-    fn experiment_distribution_roughly_matches_weights() {
-        // 90/10 split over many distinct cohort keys lands near the weights.
-        let json = r#"{"prompts":[
-            {"tenant_id":"t","id":"prompt_x","name":"X","latest_version":2,
-             "experiments":{"split":{"variants":[
-                {"version":1,"weight":90,"label":"a"},
-                {"version":2,"weight":10,"label":"b"}
-             ]}},
-             "versions":[
-               {"version":1,"template":"a","variables":[]},
-               {"version":2,"template":"b","variables":[]}
-             ]}
-        ]}"#;
-        let r = reg(json);
-        let n = 10_000;
-        let mut a = 0u32;
-        for i in 0..n {
-            let key = format!("user-{i}");
-            let res = r
-                .resolve_with_cohort("t", "prompt_x@split", Some(&key))
-                .unwrap();
-            if res.version_number == 1 {
-                a += 1;
-            }
-        }
-        let frac = a as f64 / n as f64;
-        // Expect ~0.90; allow generous slack for the finite sample.
-        assert!(frac > 0.86 && frac < 0.94, "fraction was {frac}");
-    }
-
-    #[test]
-    fn experiment_no_cohort_falls_back_to_control() {
-        let r = reg(EXP);
+    fn no_cohort_serves_the_control_arm() {
+        let r = reg(SPLIT);
         // No cohort ⇒ the FIRST declared arm (control) = version 2 / "formal".
-        let res = r.resolve_with_cohort("t", "prompt_x@tone", None).unwrap();
+        let res = r.resolve_with_cohort("t", "prompt_x", None).unwrap();
         assert_eq!(res.version_number, 2);
-        assert_eq!(res.experiment.unwrap().1, "formal");
+        assert_eq!(res.variant.as_deref(), Some("formal"));
         // Plain resolve() is cohort-free and must also return the control.
-        let plain = r.resolve("t", "prompt_x@tone").unwrap();
+        let plain = r.resolve("t", "prompt_x").unwrap();
         assert_eq!(plain.version_number, 2);
     }
 
     #[test]
-    fn experiment_render_threads_annotation_and_uses_assigned_version() {
-        let r = reg(EXP);
+    fn render_threads_variant_and_uses_assigned_version() {
+        let r = reg(SPLIT);
         let v = vars(json!({ "name": "Ada" }));
         let out = r
             .render_with_cohort(
                 "t",
-                "prompt_x@tone",
+                "prompt_x",
                 &v,
                 MissingPolicy::Error,
                 Some("cohort-xyz"),
             )
             .unwrap();
-        // The rendered text matches the assigned version's template.
-        let (_, variant) = out.experiment.clone().unwrap();
+        let variant = out.variant.clone().unwrap();
         if out.version == 2 {
             assert_eq!(out.text, "formal Ada");
             assert_eq!(variant, "formal");
@@ -1655,109 +1791,322 @@ mod tests {
         }
     }
 
+    /// FR-2: a variant's `model` replaces the version default; its `params`
+    /// shallow-merge OVER the version's `default_params`, variant-key-wins.
     #[test]
-    fn experiment_label_default_is_v_prefixed_version() {
+    fn variant_model_and_params_layer_over_version_defaults() {
+        let json = r#"{"prompts":[
+            {"tenant_id":"t","id":"prompt_x","name":"X","latest_version":1,
+             "variants":[
+                {"label":"tuned","version":1,"weight":1,
+                 "model":"gpt-4o-mini",
+                 "params":{"temperature":0.1,"top_p":0.5}}
+             ],
+             "versions":[
+               {"version":1,"template":"x","variables":[],
+                "default_model":"gpt-4o",
+                "default_params":{"temperature":0.9,"max_tokens":64}}
+             ]}
+        ]}"#;
+        let r = reg(json);
+        let out = r
+            .render_with_cohort(
+                "t",
+                "prompt_x",
+                &BTreeMap::new(),
+                MissingPolicy::Error,
+                Some("k"),
+            )
+            .unwrap();
+        assert_eq!(out.variant.as_deref(), Some("tuned"));
+        assert_eq!(out.model.as_deref(), Some("gpt-4o-mini"));
+        let params = out.params.unwrap();
+        // Variant keys win; untouched version keys survive (shallow merge).
+        assert_eq!(params["temperature"], 0.1);
+        assert_eq!(params["top_p"], 0.5);
+        assert_eq!(params["max_tokens"], 64);
+
+        // An explicit @vN pin bypasses the variant AND its overrides.
+        let pinned = r
+            .render_with_cohort(
+                "t",
+                "prompt_x@v1",
+                &BTreeMap::new(),
+                MissingPolicy::Error,
+                Some("k"),
+            )
+            .unwrap();
+        assert!(pinned.variant.is_none());
+        assert_eq!(pinned.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(pinned.params.unwrap()["temperature"], 0.9);
+    }
+
+    // --- [ADR-152] D3: the weight-stable assignment properties -----------------
+
+    /// Seeded distribution converges to the configured weights.
+    #[test]
+    fn assignment_distribution_converges_to_weights() {
+        let variants = arms(&[90, 10]);
+        let n = 10_000;
+        let mut first = 0u32;
+        for i in 0..n {
+            let key = format!("user-{i}");
+            if assign_variant("prompt_x", &variants, Some(&key))
+                .unwrap()
+                .label
+                == "arm-0"
+            {
+                first += 1;
+            }
+        }
+        let frac = f64::from(first) / f64::from(n);
+        assert!((0.86..0.94).contains(&frac), "fraction was {frac}");
+    }
+
+    /// EXACT scaling invariance: `50/50` and `25/25` (and any k-scaling) are
+    /// the same split, assignment-for-assignment — the FR-24 fix the old
+    /// `hash % total_weight` mapping violated.
+    #[test]
+    fn assignment_is_invariant_under_weight_scaling() {
+        let cases: &[(&[u32], &[u32])] = &[
+            (&[50, 50], &[25, 25]),
+            (&[90, 10], &[9, 1]),
+            (&[3, 5, 7], &[300, 500, 700]),
+        ];
+        for (w1, w2) in cases {
+            let a1 = arms(w1);
+            let a2 = arms(w2);
+            for i in 0..2_000 {
+                let key = format!("user-{i}");
+                assert_eq!(
+                    assign_variant("prompt_x", &a1, Some(&key)).unwrap().label,
+                    assign_variant("prompt_x", &a2, Some(&key)).unwrap().label,
+                    "scaling {w1:?} → {w2:?} must not move cohort {key}"
+                );
+            }
+        }
+    }
+
+    /// Minimal movement, the exact TWO-arm law: on a weight shift, a moved
+    /// cohort lands only on the arm whose normalized share GREW, and the moved
+    /// fraction tracks the share change.
+    #[test]
+    fn two_arm_shift_moves_cohorts_only_onto_the_grown_arm() {
+        let before = arms(&[50, 50]);
+        let after = arms(&[70, 30]); // arm-0's share grew 0.5 → 0.7
+        let n = 10_000u32;
+        let mut moved_to_grown = 0u32;
+        for i in 0..n {
+            let key = format!("user-{i}");
+            let b = assign_variant("prompt_x", &before, Some(&key))
+                .unwrap()
+                .label
+                .clone();
+            let a = assign_variant("prompt_x", &after, Some(&key))
+                .unwrap()
+                .label
+                .clone();
+            if a != b {
+                assert_eq!(a, "arm-0", "cohort {key} moved onto a SHRUNK arm");
+                moved_to_grown += 1;
+            }
+        }
+        // The moved fraction ≈ the share growth (0.2), never wholesale reshuffle.
+        let frac = f64::from(moved_to_grown) / f64::from(n);
+        assert!((0.16..0.24).contains(&frac), "moved fraction was {frac}");
+    }
+
+    /// The multi-arm aggregate LAW: for a cumulative-threshold scheme, the
+    /// moved measure under a weight shift equals the total displacement of the
+    /// INTERIOR BOUNDARIES — Σ|C_i(after) − C_i(before)| — which can EXCEED
+    /// the total positive share change (the interior-shift effect documented
+    /// on [`assign_variant`]; the global per-cohort destination property
+    /// belongs to rendezvous-class schemes, deferred per [ADR-152] D3). For
+    /// [40,30,30]→[60,20,20]: boundaries move 0.4→0.6 and 0.7→0.8, so the
+    /// moved measure is exactly 0.30 — while the share change is only 0.20.
+    /// The pin is two-sided: the sampled moved fraction must MATCH the
+    /// boundary-displacement law (within sampling noise), which both bounds
+    /// the movement (never `hash % total`'s wholesale reshuffle) and proves
+    /// the implementation walks the thresholds it claims to.
+    #[test]
+    fn multi_arm_shift_movement_matches_boundary_displacement() {
+        let before = arms(&[40, 30, 30]);
+        let after = arms(&[60, 20, 20]);
+        // Interior cumulative boundaries: 0.4→0.6 (|Δ|=0.2), 0.7→0.8 (|Δ|=0.1).
+        let expected_moved_measure = 0.30;
+        let n = 10_000u32;
+        let mut moved = 0u32;
+        for i in 0..n {
+            let key = format!("user-{i}");
+            let b = assign_variant("prompt_x", &before, Some(&key))
+                .unwrap()
+                .label
+                .clone();
+            let a = assign_variant("prompt_x", &after, Some(&key))
+                .unwrap()
+                .label
+                .clone();
+            if a != b {
+                moved += 1;
+            }
+        }
+        let frac = f64::from(moved) / f64::from(n);
+        // The keys hash through fixed-seed FNV-1a, so this is ONE deterministic
+        // sample, not a resampling experiment: its empirical measure at these
+        // boundary intervals deviates a fixed ~0.021 from the ideal 0.30 at
+        // n=10_000 (observed 0.321, identical on every run). The ±0.03
+        // tolerance covers that fixed-sample bias while still discriminating
+        // the boundary-displacement law (0.30) from both the naive
+        // share-change bound (0.20) and a wholesale reshuffle (~0.66).
+        assert!(
+            (frac - expected_moved_measure).abs() < 0.03,
+            "moved fraction {frac} does not match the boundary-displacement law (expected ≈{expected_moved_measure})"
+        );
+    }
+
+    // --- [ADR-152] D1: the cutover load rules ----------------------------------
+
+    #[test]
+    fn legacy_experiments_block_refuses_load_with_the_migration_error() {
         let json = r#"{"prompts":[
             {"tenant_id":"t","id":"prompt_x","name":"X","latest_version":1,
              "experiments":{"e":{"variants":[{"version":1,"weight":1}]}},
              "versions":[{"version":1,"template":"x","variables":[]}]}
         ]}"#;
-        let r = reg(json);
-        let res = r.resolve_with_cohort("t", "prompt_x@e", Some("k")).unwrap();
-        assert_eq!(res.experiment.unwrap().1, "v1");
-    }
-
-    #[test]
-    fn experiment_empty_variants_refuses_load() {
-        let json = r#"{"prompts":[
-            {"tenant_id":"t","id":"prompt_x","name":"X","latest_version":1,
-             "experiments":{"e":{"variants":[]}},
-             "versions":[{"version":1,"template":"x","variables":[]}]}
-        ]}"#;
         let err = PromptRegistry::load_from_json(json, "test", &Bounds::default()).unwrap_err();
-        assert!(matches!(err, PromptLoadError::ExperimentNoVariants { .. }));
+        assert!(matches!(
+            err,
+            PromptLoadError::LegacyExperimentsBlock { .. }
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("ADR-152"), "must name the migration: {msg}");
+        assert!(
+            msg.contains("prompts.example.json"),
+            "must point at the example: {msg}"
+        );
     }
 
     #[test]
-    fn experiment_zero_weight_refuses_load() {
+    fn variant_zero_weight_refuses_load() {
         let json = r#"{"prompts":[
             {"tenant_id":"t","id":"prompt_x","name":"X","latest_version":2,
-             "experiments":{"e":{"variants":[
-                {"version":1,"weight":0},{"version":2,"weight":0}
-             ]}},
+             "variants":[
+                {"label":"a","version":1,"weight":0},
+                {"label":"b","version":2,"weight":0}
+             ],
              "versions":[
                {"version":1,"template":"a","variables":[]},
                {"version":2,"template":"b","variables":[]}
              ]}
         ]}"#;
         let err = PromptRegistry::load_from_json(json, "test", &Bounds::default()).unwrap_err();
-        assert!(matches!(err, PromptLoadError::ExperimentZeroWeight { .. }));
+        assert!(matches!(err, PromptLoadError::VariantsZeroWeight { .. }));
     }
 
     #[test]
-    fn experiment_missing_version_refuses_load() {
-        let json = r#"{"prompts":[
+    fn variant_label_rules_refuse_bad_and_colliding_labels() {
+        // A label in the reserved v<digits> form.
+        let reserved = r#"{"prompts":[
             {"tenant_id":"t","id":"prompt_x","name":"X","latest_version":1,
-             "experiments":{"e":{"variants":[{"version":9,"weight":1}]}},
+             "variants":[{"label":"v2","version":1,"weight":1}],
              "versions":[{"version":1,"template":"x","variables":[]}]}
         ]}"#;
-        let err = PromptRegistry::load_from_json(json, "test", &Bounds::default()).unwrap_err();
         assert!(matches!(
-            err,
-            PromptLoadError::ExperimentVariantMissing { .. }
+            PromptRegistry::load_from_json(reserved, "test", &Bounds::default()).unwrap_err(),
+            PromptLoadError::VariantLabelInvalid { .. }
         ));
-    }
-
-    #[test]
-    fn experiment_name_colliding_with_label_refuses_load() {
-        let json = r#"{"prompts":[
+        // A duplicate variant label.
+        let dup = r#"{"prompts":[
+            {"tenant_id":"t","id":"prompt_x","name":"X","latest_version":1,
+             "variants":[
+                {"label":"a","version":1,"weight":1},
+                {"label":"a","version":1,"weight":1}
+             ],
+             "versions":[{"version":1,"template":"x","variables":[]}]}
+        ]}"#;
+        assert!(matches!(
+            PromptRegistry::load_from_json(dup, "test", &Bounds::default()).unwrap_err(),
+            PromptLoadError::VariantLabelCollision { .. }
+        ));
+        // A variant label colliding with a label-map name.
+        let collide = r#"{"prompts":[
             {"tenant_id":"t","id":"prompt_x","name":"X","latest_version":1,
              "labels":{"prod":1},
-             "experiments":{"prod":{"variants":[{"version":1,"weight":1}]}},
+             "variants":[{"label":"prod","version":1,"weight":1}],
              "versions":[{"version":1,"template":"x","variables":[]}]}
         ]}"#;
-        let err = PromptRegistry::load_from_json(json, "test", &Bounds::default()).unwrap_err();
         assert!(matches!(
-            err,
-            PromptLoadError::ExperimentNameCollision { .. }
+            PromptRegistry::load_from_json(collide, "test", &Bounds::default()).unwrap_err(),
+            PromptLoadError::VariantLabelCollision { .. }
         ));
     }
 
+    /// [ADR-152] D4: the cohort attribution hash never leaks the raw key, is
+    /// deterministic, and pins the exact FNV-1a fold (recomputed inline so an
+    /// algorithm change cannot slip through as "still deterministic").
     #[test]
-    fn experiment_too_many_variants_refuses_load() {
-        let arms: Vec<String> = (1..=(MAX_EXPERIMENT_VARIANTS + 1))
-            .map(|_| r#"{"version":1,"weight":1}"#.to_string())
+    fn cohort_hash_is_stable_hex_and_never_the_raw_key() {
+        let raw = "user-42@example.com";
+        let h = cohort_hash_hex(raw);
+        assert_eq!(h, cohort_hash_hex(raw), "deterministic");
+        assert_ne!(h, raw, "the raw key must never be the durable value");
+        assert!(!h.contains(raw));
+        assert_eq!(h.len(), 16);
+        assert!(h.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(h, cohort_hash_hex("user-43@example.com"));
+
+        // Pin the algorithm itself: an independent inline FNV-1a fold.
+        let mut expect: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in raw.as_bytes() {
+            expect ^= b as u64;
+            expect = expect.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        assert_eq!(h, format!("{expect:016x}"));
+    }
+
+    #[test]
+    fn variant_missing_version_refuses_load() {
+        let json = r#"{"prompts":[
+            {"tenant_id":"t","id":"prompt_x","name":"X","latest_version":1,
+             "variants":[{"label":"a","version":9,"weight":1}],
+             "versions":[{"version":1,"template":"x","variables":[]}]}
+        ]}"#;
+        let err = PromptRegistry::load_from_json(json, "test", &Bounds::default()).unwrap_err();
+        assert!(matches!(err, PromptLoadError::VariantVersionMissing { .. }));
+    }
+
+    #[test]
+    fn too_many_variants_refuses_load() {
+        let arm_rows: Vec<String> = (1..=(MAX_VARIANTS + 1))
+            .map(|i| format!(r#"{{"label":"arm-{i}","version":1,"weight":1}}"#))
             .collect();
         let json = format!(
             r#"{{"prompts":[
                 {{"tenant_id":"t","id":"prompt_x","name":"X","latest_version":1,
-                 "experiments":{{"e":{{"variants":[{}]}}}},
+                 "variants":[{}],
                  "versions":[{{"version":1,"template":"x","variables":[]}}]}}
             ]}}"#,
-            arms.join(",")
+            arm_rows.join(",")
         );
         let err = PromptRegistry::load_from_json(&json, "test", &Bounds::default()).unwrap_err();
-        assert!(matches!(
-            err,
-            PromptLoadError::ExperimentTooManyVariants { .. }
-        ));
+        assert!(matches!(err, PromptLoadError::TooManyVariants { .. }));
     }
 
     #[test]
-    fn prompt_without_experiments_is_byte_identical_resolution() {
-        // The pre-existing GREETING config (no experiments) resolves exactly as
-        // before: latest/label/@vN, no experiment annotation anywhere.
+    fn prompt_without_variants_is_byte_identical_resolution() {
+        // The pre-existing GREETING config (no split) resolves exactly as
+        // before: latest/label/@vN, no served-variant annotation anywhere.
         let r = reg(GREETING);
         let latest = r.resolve("t", "prompt_x").unwrap();
         assert_eq!(latest.version_number, 2);
-        assert!(latest.experiment.is_none());
+        assert!(latest.variant.is_none());
         let prod = r
             .resolve_with_cohort("t", "prompt_x@prod", Some("k"))
             .unwrap();
         assert_eq!(prod.version_number, 1);
         assert_eq!(prod.label.as_deref(), Some("prod"));
-        // A cohort key on a non-experiment ref is ignored (no experiment set).
-        assert!(prod.experiment.is_none());
+        // A cohort key on an unsplit prompt is ignored (no variants declared).
+        assert!(prod.variant.is_none());
     }
 
     #[test]

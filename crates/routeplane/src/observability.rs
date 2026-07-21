@@ -87,15 +87,12 @@ pub struct UsageEvent {
     /// PRD-010 FR-17: the label the prompt was referenced by, if any (else None).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_label: Option<String>,
-    /// PRD-010 (A/B testing): the experiment NAME the prompt was referenced by,
-    /// when resolution went through a weighted experiment. Set only on the
-    /// `prompt.render` join event; None (and omitted) otherwise, so a
-    /// non-experiment prompt render is byte-identical.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_experiment: Option<String>,
-    /// PRD-010 (A/B testing): the SERVED variant label for this experiment
-    /// assignment (alongside the concrete `prompt_version`). Enables per-variant
-    /// analytics. None (and omitted) when no experiment participated.
+    /// [ADR-152] D2: the SERVED variant label when resolution went through the
+    /// prompt's weighted split (alongside the concrete `prompt_version`) — the
+    /// prompt itself is the experiment, so this is the SOLE split identifier
+    /// (`prompt_experiment` retired with the cutover). Enables per-variant
+    /// analytics. None (and omitted) when no split participated, so an unsplit
+    /// render is byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_variant: Option<String>,
     /// F14 (G2.2 / ADR-021): coarse routing-config SOURCE label (`"inline"` /
@@ -232,7 +229,6 @@ impl UsageEvent {
             prompt_id: None,
             prompt_version: None,
             prompt_label: None,
-            prompt_experiment: None,
             prompt_variant: None,
             config_ref: None,
             config_match: None,
@@ -278,7 +274,6 @@ impl UsageEvent {
             prompt_id: None,
             prompt_version: None,
             prompt_label: None,
-            prompt_experiment: None,
             prompt_variant: None,
             config_ref: None,
             config_match: None,
@@ -322,7 +317,6 @@ impl UsageEvent {
             prompt_id: None,
             prompt_version: None,
             prompt_label: None,
-            prompt_experiment: None,
             prompt_variant: None,
             config_ref: None,
             config_match: None,
@@ -372,7 +366,6 @@ impl UsageEvent {
             prompt_id: None,
             prompt_version: None,
             prompt_label: None,
-            prompt_experiment: None,
             prompt_variant: None,
             config_ref: None,
             config_match: None,
@@ -426,7 +419,6 @@ impl UsageEvent {
             prompt_id: None,
             prompt_version: None,
             prompt_label: None,
-            prompt_experiment: None,
             prompt_variant: None,
             config_ref: None,
             config_match: None,
@@ -478,7 +470,6 @@ impl UsageEvent {
             prompt_id: Some(prompt_id),
             prompt_version: Some(prompt_version),
             prompt_label,
-            prompt_experiment: None,
             prompt_variant: None,
             config_ref: None,
             config_match: None,
@@ -532,7 +523,6 @@ impl UsageEvent {
             prompt_id: None,
             prompt_version: None,
             prompt_label: None,
-            prompt_experiment: None,
             prompt_variant: None,
             config_ref: None,
             config_match: None,
@@ -615,15 +605,14 @@ impl UsageEvent {
         self
     }
 
-    /// PRD-010 (A/B testing): annotate this `prompt.render` event with the
-    /// experiment name + served variant label. `None` attaches nothing, so a
-    /// non-experiment prompt render (or any other event) stays byte-identical
-    /// (skip-when-None on both fields). The concrete served `prompt_version` is
-    /// already carried by the base `prompt_render` event.
-    pub fn with_experiment(mut self, experiment: Option<(String, String)>) -> Self {
-        if let Some((name, variant)) = experiment {
-            self.prompt_experiment = Some(name);
-            self.prompt_variant = Some(variant);
+    /// [ADR-152] D2: annotate this `prompt.render` event with the SERVED
+    /// variant label. `None` attaches nothing, so an unsplit prompt render (or
+    /// any other event) stays byte-identical (skip-when-None). The concrete
+    /// served `prompt_version` is already carried by the base `prompt_render`
+    /// event; the split needs no separate name — the prompt IS the experiment.
+    pub fn with_variant(mut self, variant: Option<String>) -> Self {
+        if let Some(v) = variant {
+            self.prompt_variant = Some(v);
         }
         self
     }
@@ -2311,13 +2300,13 @@ mod tests {
         assert_eq!(v["prompt_label"], "prod");
     }
 
-    // --- PRD-010 (A/B testing): experiment annotation --------------------------
+    // --- [ADR-152] D2: served-variant annotation --------------------------------
 
     #[test]
-    fn experiment_fields_omitted_when_absent_byte_identical() {
-        // A prompt.render event for a NON-experiment reference (or with_experiment
-        // given None) must carry neither prompt_experiment nor prompt_variant —
-        // byte-identical to the pre-A/B prompt.render wire shape.
+    fn variant_field_omitted_when_absent_byte_identical() {
+        // A prompt.render event for an unsplit reference (or with_variant given
+        // None) must carry no prompt_variant — and never a prompt_experiment,
+        // which the ADR-152 cutover retired from the wire entirely.
         let e = UsageEvent::prompt_render(
             "k".into(),
             "gpt-4o".into(),
@@ -2327,7 +2316,7 @@ mod tests {
             None,
             false,
         )
-        .with_experiment(None);
+        .with_variant(None);
         let v = serde_json::to_value(&e).unwrap();
         assert!(v.get("prompt_experiment").is_none());
         assert!(v.get("prompt_variant").is_none());
@@ -2337,7 +2326,7 @@ mod tests {
     }
 
     #[test]
-    fn with_experiment_attaches_name_and_served_variant() {
+    fn with_variant_attaches_the_served_label() {
         let e = UsageEvent::prompt_render(
             "k".into(),
             "gpt-4o".into(),
@@ -2347,19 +2336,20 @@ mod tests {
             None,
             false,
         )
-        .with_experiment(Some(("tone".into(), "casual".into())));
+        .with_variant(Some("casual".into()));
         let v = serde_json::to_value(&e).unwrap();
-        assert_eq!(v["prompt_experiment"], "tone");
+        // The retired experiment field never reappears on the wire.
+        assert!(v.get("prompt_experiment").is_none());
         assert_eq!(v["prompt_variant"], "casual");
         // The served concrete version is still the base field.
         assert_eq!(v["prompt_version"], 3);
-        // An experiment-resolved render carries no static label.
+        // A split-resolved render carries no static label.
         assert!(v.get("prompt_label").is_none());
     }
 
     #[test]
-    fn experiment_fields_absent_on_non_prompt_events() {
-        // A regular chat success event never gains the A/B fields.
+    fn variant_field_absent_on_non_prompt_events() {
+        // A regular chat success event never gains the split fields.
         let e = UsageEvent::success(
             "k".into(),
             "openai".into(),
