@@ -136,7 +136,7 @@ pub async fn render_prompt(
             None,
             false,
         )
-        .with_experiment(rendered.experiment.clone()),
+        .with_variant(rendered.variant.clone()),
     );
 
     let body = json!({
@@ -244,7 +244,7 @@ pub async fn prompt_completions(
             None,
             false,
         )
-        .with_experiment(rendered.experiment.clone()),
+        .with_variant(rendered.variant.clone()),
     );
 
     // chat_completions IS a plain `pub async fn` — invoke it directly with the

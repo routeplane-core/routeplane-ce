@@ -554,7 +554,6 @@ mod tests {
             prompt_id: None,
             prompt_version: None,
             prompt_label: None,
-            prompt_experiment: None,
             prompt_variant: None,
             config_ref: None,
             config_match: None,

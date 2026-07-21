@@ -34,13 +34,18 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const PROMPTS: &str = r#"{"prompts":[
     {"tenant_id":"t_test","id":"prompt_greeting","name":"Greeting","latest_version":2,
      "labels":{"prod":1,"staging":2},
-     "experiments":{"tone":{"variants":[
-        {"version":1,"weight":50,"label":"concise"},
-        {"version":2,"weight":50,"label":"friendly"}
-     ]}},
      "versions":[
        {"version":1,"template":"Hi {{name}}.","variables":[{"name":"name"}],"default_model":"gpt-4o"},
        {"version":2,"template":"Hello {{name}}!","variables":[{"name":"name"}],"default_model":"gpt-4o","default_params":{"temperature":0.2}}
+     ]},
+    {"tenant_id":"t_test","id":"prompt_toned","name":"Toned","latest_version":2,
+     "variants":[
+        {"label":"concise","version":1,"weight":50},
+        {"label":"friendly","version":2,"weight":50}
+     ],
+     "versions":[
+       {"version":1,"template":"Hi {{name}}.","variables":[{"name":"name"}],"default_model":"gpt-4o"},
+       {"version":2,"template":"Hello {{name}}!","variables":[{"name":"name"}],"default_model":"gpt-4o"}
      ]},
     {"tenant_id":"t_test","id":"prompt_pii","name":"PII","latest_version":1,
      "versions":[{"version":1,"template":"Contact {{email}} for details","variables":[{"name":"email"}],"default_model":"gpt-4o"}]}
@@ -313,7 +318,7 @@ async fn unknown_label_is_404_prompt_version_not_found() {
     );
 }
 
-// --- PRD-010 (A/B testing): experiment resolution at the HTTP layer -----------
+// --- [ADR-152] D2/D3: weighted-variant resolution at the HTTP layer ----------
 
 async fn render_with_cohort(state: &Arc<AppState>, cohort: Option<&str>) -> serde_json::Value {
     let mut headers = HeaderMap::new();
@@ -323,12 +328,14 @@ async fn render_with_cohort(state: &Arc<AppState>, cohort: Option<&str>) -> serd
             HeaderValue::from_str(c).expect("ascii cohort"),
         );
     }
+    // A BARE reference: the ADR-152 D2 weighted leg (explicit @vN/@label pin
+    // and never split; `latest` applies only to unsplit prompts).
     let resp = render_prompt(
         State(state.clone()),
         Extension(shared_prompts()),
         Extension(vk()),
         Extension(ctx(Tier::Standard, "t_test")),
-        Path("prompt_greeting@tone".to_string()),
+        Path("prompt_toned".to_string()),
         headers,
         Json(render_body(json!({ "variables": { "name": "Ada" } }))),
     )
@@ -338,7 +345,7 @@ async fn render_with_cohort(state: &Arc<AppState>, cohort: Option<&str>) -> serd
 }
 
 #[tokio::test]
-async fn experiment_cohort_header_is_sticky_and_resolves_an_arm() {
+async fn variant_cohort_header_is_sticky_and_resolves_an_arm() {
     let state = build_state(openai_registry("http://127.0.0.1:9")); // never dialed
                                                                     // Same cohort header ⇒ the SAME arm every call (sticky), and the rendered
                                                                     // text matches the assigned version's template.
@@ -354,7 +361,7 @@ async fn experiment_cohort_header_is_sticky_and_resolves_an_arm() {
 }
 
 #[tokio::test]
-async fn experiment_no_cohort_serves_control_arm() {
+async fn variant_no_cohort_serves_control_arm() {
     let state = build_state(openai_registry("http://127.0.0.1:9"));
     // No cohort header ⇒ the control (first declared) arm = version 1 ("concise").
     let v = render_with_cohort(&state, None).await;
@@ -363,7 +370,7 @@ async fn experiment_no_cohort_serves_control_arm() {
 }
 
 #[tokio::test]
-async fn experiment_render_annotates_usage_event_with_served_variant() {
+async fn variant_render_annotates_usage_event_with_served_label() {
     let state = build_state(openai_registry("http://127.0.0.1:9"));
     let _ = render_with_cohort(&state, Some("cohort-xyz")).await;
 
@@ -378,15 +385,14 @@ async fn experiment_render_annotates_usage_event_with_served_variant() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     let ev = found.expect("prompt.render event recorded");
-    assert_eq!(ev.prompt_id.as_deref(), Some("prompt_greeting"));
-    assert_eq!(ev.prompt_experiment.as_deref(), Some("tone"));
+    assert_eq!(ev.prompt_id.as_deref(), Some("prompt_toned"));
     // The served variant label is one of the two arms, and matches the version.
     let variant = ev.prompt_variant.as_deref().expect("served variant");
     match ev.prompt_version {
         Some(1) => assert_eq!(variant, "concise"),
         Some(2) => assert_eq!(variant, "friendly"),
-        other => panic!("unexpected experiment version {other:?}"),
+        other => panic!("unexpected variant version {other:?}"),
     }
-    // An experiment-resolved render carries no static label.
+    // A split-resolved render carries no static label.
     assert!(ev.prompt_label.is_none());
 }
