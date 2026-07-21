@@ -200,7 +200,24 @@ Routeplane is OpenAI-compatible, so the stock OpenAI SDKs already work (see abov
 first-class experience — typed clients, a terminal UI, and gateway tools inside your AI
 assistant — there are also dedicated packages:
 
+Every recording below is a real session against the real gateway running locally — no
+mocks, no staged output. Reproduce or re-record any of them from
+[docs/demos/](https://github.com/routeplane-core/routeplane-ce/tree/main/docs/demos).
+
+**CLI** — zero install with `npx`:
+
+![Demo: rp init pointing at a local gateway, a streamed chat completion answering in real time with a provider/model/token footer, and the live Groq model catalog from rp models list](https://github.com/routeplane-core/routeplane-ce/raw/main/docs/cli-demo.gif)
+
+```bash
+npx @routeplane/cli init    # point at your local gateway
+rp chat "hello"             # streaming completions
+rp logs --limit 20          # request logs
+rp usage                    # cost dashboard
+```
+
 **Python SDK** — `pip install routeplane`
+
+![Demo: a 15-line Python script using the routeplane package — create_with_meta returns the completion plus gateway metadata, printing the answer and "served by groq" with the real token count](https://github.com/routeplane-core/routeplane-ce/raw/main/docs/python-sdk-demo.gif)
 
 ```python
 from routeplane import Routeplane
@@ -214,23 +231,18 @@ resp = rp.chat.completions.create(
 
 **TypeScript SDK** — `npm i @routeplane/sdk`
 
+![Demo: an 18-line Node script streaming a completion token-by-token through the gateway with the @routeplane/sdk core client, ending with the provider, model, and token count](https://github.com/routeplane-core/routeplane-ce/raw/main/docs/ts-sdk-demo.gif)
+
 ```typescript
 import { Routeplane } from '@routeplane/sdk';
 
 const rp = new Routeplane({ apiKey: 'rp_...', baseUrl: 'http://localhost:8080/v1' });
 ```
 
-**CLI** — zero install with `npx`:
-
-```bash
-npx @routeplane/cli init    # point at your local gateway
-rp chat "hello"             # streaming completions
-rp logs --limit 20          # request logs
-rp usage                    # cost dashboard
-```
-
 **MCP server** — 33 gateway tools for Claude Code, Cursor, and VS Code: send completions,
 check costs, and manage providers from your AI assistant. Add it to your assistant's MCP config:
+
+![Demo: Claude Code with an 8-line .mcp.json calling two Routeplane MCP tools live — get_status reports the gateway healthy with all provider circuits closed, then chat_completion routes a prompt through Groq and Claude reports the provider and token count](https://github.com/routeplane-core/routeplane-ce/raw/main/docs/mcp-demo.gif)
 
 ```bash
 npx @routeplane/mcp-server

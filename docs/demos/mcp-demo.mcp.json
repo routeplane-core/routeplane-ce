@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "routeplane": {
+      "command": "npx",
+      "args": ["-y", "@routeplane/mcp-server@latest"],
+      "env": {
+        "ROUTEPLANE_API_KEY": "rp_local_demo_2f8a1c",
+        "ROUTEPLANE_BASE_URL": "http://localhost:8080"
+      }
+    }
+  }
+}
