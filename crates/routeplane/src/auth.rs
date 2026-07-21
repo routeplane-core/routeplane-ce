@@ -1512,10 +1512,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_key_without_entitlement_fields_loads_as_free_core_only() {
+    fn legacy_key_without_entitlement_fields_loads_as_free_full_baseline() {
         // The exact shape of today's "Default Development Key" record — no
         // tenant_id/tier/overrides. Must still load (serde defaults) and resolve
-        // to Free / core-only / tenant_id == name.
+        // to Free / tenant_id == name.
         let key = base_key(
             r#"{
                 "name": "Default Development Key",
@@ -1529,13 +1529,13 @@ mod tests {
 
         let ctx = TenantContext::from_virtual_key(&key, &BTreeSet::new());
         assert_eq!(ctx.tenant_id, "Default Development Key"); // falls back to name
-                                                              // The Free baseline carries exactly {RoutingPolicy (F13 core surface
-                                                              // with a holdback kill switch), TokenCompression (ADR-088 Bundle B,
-                                                              // release-plane gated at rollout)} — no other features.
+                                                              // Every tier (incl. Free) resolves to the full baseline: all features
+                                                              // EXCEPT ModelCatalog (the fail-closed allowlist enforcer, override-only).
         assert!(ctx.capabilities.active(Feature::RoutingPolicy));
         assert!(ctx.capabilities.active(Feature::TokenCompression));
-        assert_eq!(ctx.capabilities.len(), 2);
-        assert!(!ctx.capabilities.active(Feature::SemanticCache));
+        assert!(ctx.capabilities.active(Feature::SemanticCache));
+        assert_eq!(ctx.capabilities.len(), Feature::ALL.len() - 1);
+        assert!(!ctx.capabilities.active(Feature::ModelCatalog));
     }
 
     #[test]
@@ -1553,14 +1553,14 @@ mod tests {
         let ctx = TenantContext::from_virtual_key(&key, &BTreeSet::new());
         assert_eq!(ctx.tenant_id, "t_paid");
         assert_eq!(ctx.tier, Tier::Standard);
-        // Standard baseline:
+        // Standard baseline (every tier grants the full set except ModelCatalog):
         assert!(ctx.capabilities.active(Feature::SemanticCache));
         assert!(ctx.capabilities.active(Feature::AdvancedGuardrails));
         assert!(ctx.capabilities.active(Feature::PromptRegistry));
-        // From the override (add-on):
+        // The finops_export override is idempotent — the baseline already grants it:
         assert!(ctx.capabilities.active(Feature::FinOpsExport));
-        // Not granted:
-        assert!(!ctx.capabilities.active(Feature::AgenticSecurity));
+        // The agentic-security moat is now in every baseline too:
+        assert!(ctx.capabilities.active(Feature::AgenticSecurity));
     }
 
     #[test]

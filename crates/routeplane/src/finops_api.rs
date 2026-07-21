@@ -304,27 +304,31 @@ mod tests {
         assert!(entitlement_gate(&ctx(Tier::Business), "/v1/finops/usage").is_none());
     }
 
-    #[cfg(not(feature = "enterprise"))]
     #[tokio::test]
-    async fn ce_not_entitled_is_the_uniform_enterprise_only_402() {
-        let resp = entitlement_gate(&ctx(Tier::Free), "/v1/finops/usage")
-            .expect("Free tier is not entitled");
-        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
-        assert_eq!(
-            resp.headers()
-                .get("x-routeplane-upgrade")
-                .and_then(|v| v.to_str().ok()),
-            Some("https://routeplane.ai")
-        );
+    async fn held_back_tenant_gets_403_feature_not_released() {
+        // Every tier is entitled to FinOpsExport by baseline now, so the
+        // not-entitled `enterprise_only` refusal is unreachable via tier — the
+        // only refusal path left is a rollout holdback, which yields
+        // feature_not_released (identical on the CE and enterprise builds).
+        let held = TenantContext {
+            tenant_id: "t_test".into(),
+            tier: Tier::Free,
+            capabilities: CapabilitySet::resolve(
+                Tier::Free,
+                &BTreeSet::new(),
+                &BTreeSet::from([Feature::FinOpsExport]),
+            ),
+            compliance_frameworks: Vec::new(),
+            compliance_mode: crate::auth::ComplianceMode::Strict,
+        };
+        let resp =
+            entitlement_gate(&held, "/v1/finops/usage").expect("a held-back tenant is refused");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .expect("body");
         let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        assert_eq!(v["error"]["code"], "enterprise_only");
+        assert_eq!(v["error"]["code"], "feature_not_released");
         assert_eq!(v["error"]["type"], "invalid_request_error");
-        assert!(v["error"]["message"]
-            .as_str()
-            .expect("message")
-            .starts_with("/v1/finops/usage is a Routeplane Enterprise feature"));
     }
 }

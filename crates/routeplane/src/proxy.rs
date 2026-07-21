@@ -8293,8 +8293,11 @@ mod tests {
             .mount(&server)
             .await;
         let state = offpath_state(&server).await;
-        let vk = offpath_vk(Tier::Free); // no AdvancedGuardrails
-        let tenant_ctx = TenantContext::from_virtual_key(&vk, &BTreeSet::new());
+        let vk = offpath_vk(Tier::Free);
+        // Every tier now grants AdvancedGuardrails by baseline; hold it back so
+        // this test still exercises the capability-OFF path.
+        let tenant_ctx =
+            TenantContext::from_virtual_key(&vk, &BTreeSet::from([Feature::AdvancedGuardrails]));
         assert!(!tenant_ctx.capabilities.active(Feature::AdvancedGuardrails));
         let resp = chat_completions(
             State(state),
@@ -8488,8 +8491,11 @@ mod tests {
             .mount(&server)
             .await;
         let state = offpath_state(&server).await;
-        let vk = offpath_vk(Tier::Free); // no AdvancedGuardrails
-        let tenant_ctx = TenantContext::from_virtual_key(&vk, &BTreeSet::new());
+        let vk = offpath_vk(Tier::Free);
+        // Every tier now grants AdvancedGuardrails by baseline; hold it back so
+        // this test still exercises the capability-OFF path.
+        let tenant_ctx =
+            TenantContext::from_virtual_key(&vk, &BTreeSet::from([Feature::AdvancedGuardrails]));
         assert!(!tenant_ctx.capabilities.active(Feature::AdvancedGuardrails));
         let resp = chat_completions(
             State(state),

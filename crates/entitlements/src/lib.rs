@@ -292,8 +292,11 @@ impl TenantState {
     }
 }
 
-/// The tier → optional-feature preset, mirroring the
-/// [`branching-and-devex.md`] §7 table **exactly**:
+/// The tier → optional-feature preset. **As of the "light up all features"
+/// change, every tier returns the full [`Feature`] set** — the historical §7
+/// table below is retained for context but no longer reflects the return value.
+/// Feature availability is now governed by per-tenant overrides and release-plane
+/// holdbacks (`active = entitled ∧ released`), not by the tier baseline:
 ///
 /// | feature              | Free | Standard | Business | Enterprise |
 /// |----------------------|:----:|:--------:|:--------:|:----------:|
@@ -314,40 +317,22 @@ impl TenantState {
 /// Enterprise-exclusive in the baseline. The `agentic_security` "add-on" column
 /// for Standard/Business is *not* in their baseline — it is reached only via a
 /// per-tenant override (the ∪ term), exactly as the table footnote describes.
-pub fn tier_baseline(tier: Tier) -> BTreeSet<Feature> {
-    match tier {
-        // RoutingPolicy is a CORE surface in EVERY tier (incl. Free); it is a
-        // Feature only so a holdback can kill-switch it (F13 / ADR-021 A1).
-        // It stays in the Free baseline DELIBERATELY — step 1 of the ADR-088
-        // revocation two-step (module doc): the removal happens first as an
-        // Unleash per-tier holdback, only later here. TokenCompression is the
-        // ADR-088 Bundle B grant, shipped behind the release plane (Unleash
-        // `token_compression` constrained OFF for tier == free until the flip).
-        Tier::Free => BTreeSet::from([Feature::RoutingPolicy, Feature::TokenCompression]),
-        Tier::Standard => BTreeSet::from([
-            Feature::RoutingPolicy,
-            Feature::SemanticCache,
-            Feature::AdvancedGuardrails,
-            Feature::PromptRegistry,
-        ]),
-        // Business = Standard ∪ {finops_export}. Agentic-security stays
-        // Enterprise-only (reachable on Business only via a per-tenant override).
-        Tier::Business => BTreeSet::from([
-            Feature::RoutingPolicy,
-            Feature::SemanticCache,
-            Feature::AdvancedGuardrails,
-            Feature::PromptRegistry,
-            Feature::FinOpsExport,
-        ]),
-        Tier::Enterprise => BTreeSet::from([
-            Feature::RoutingPolicy,
-            Feature::SemanticCache,
-            Feature::AdvancedGuardrails,
-            Feature::PromptRegistry,
-            Feature::AgenticSecurity,
-            Feature::FinOpsExport,
-        ]),
-    }
+pub fn tier_baseline(_tier: Tier) -> BTreeSet<Feature> {
+    // Every tier returns the full Feature set EXCEPT `ModelCatalog` — all
+    // optional features are enabled for every tier (Free, Standard, Business,
+    // Enterprise). Feature availability is governed downstream by per-tenant
+    // overrides and release-plane holdbacks (`active = entitled ∧ released`), not
+    // by the tier baseline: a holdback still kill-switches any feature, and an
+    // override is a no-op because the baseline already grants everything else.
+    //
+    // `ModelCatalog` is the ONE exception. It is a FAIL-CLOSED allowlist enforcer
+    // (PRD-008): when active with an empty allowlist it denies EVERY model. Every
+    // existing key ships with an empty `provisioned_models`, so default-on would
+    // 403 all traffic. It stays ship-dark / override-only — granted per tenant
+    // once a real allowlist exists.
+    Feature::all()
+        .filter(|f| *f != Feature::ModelCatalog)
+        .collect()
 }
 
 /// The resolved set of optional features active for a tenant on a request.
@@ -503,73 +488,41 @@ mod tests {
 
     // --- tier → baseline, mirroring the §7 table -------------------------------
 
-    #[test]
-    fn free_baseline_is_routing_policy_and_token_compression() {
-        // Free baseline is exactly {RoutingPolicy, TokenCompression} — no other
-        // optional features. RoutingPolicy stays per ADR-088 §2c step 1 (the
-        // revocation happens as an Unleash per-tier holdback first, never as a
-        // code removal without soak); TokenCompression is the ADR-088 Bundle B
-        // CE grant, release-plane gated at rollout.
-        assert_eq!(
-            tier_baseline(Tier::Free),
-            set([Feature::RoutingPolicy, Feature::TokenCompression])
-        );
+    /// The tier baseline set — every tier returns this: all features EXCEPT
+    /// ModelCatalog (the fail-closed allowlist enforcer kept ship-dark).
+    fn baseline_features() -> BTreeSet<Feature> {
+        Feature::all()
+            .filter(|f| *f != Feature::ModelCatalog)
+            .collect()
     }
 
     #[test]
-    fn standard_baseline_matches_section_7_table() {
-        let b = tier_baseline(Tier::Standard);
-        assert_eq!(
-            b,
-            set([
-                Feature::RoutingPolicy,
-                Feature::SemanticCache,
-                Feature::AdvancedGuardrails,
-                Feature::PromptRegistry,
-            ])
-        );
-        // Standard add-ons are NOT in the baseline (reached only via override).
-        assert!(!b.contains(&Feature::AgenticSecurity));
-        assert!(!b.contains(&Feature::FinOpsExport));
+    fn every_tier_baseline_is_all_features_except_model_catalog() {
+        // "Light up all features": every tier (incl. Free) returns every feature
+        // EXCEPT ModelCatalog (the fail-closed allowlist enforcer). Availability
+        // is governed downstream by overrides and release-plane holdbacks, not by
+        // the tier baseline.
+        for tier in [Tier::Free, Tier::Standard, Tier::Business, Tier::Enterprise] {
+            assert_eq!(
+                tier_baseline(tier),
+                baseline_features(),
+                "{tier:?} baseline must be all features except ModelCatalog"
+            );
+            assert!(!tier_baseline(tier).contains(&Feature::ModelCatalog));
+        }
+        // Sanity: that set is every variant but ModelCatalog.
+        assert_eq!(baseline_features().len(), Feature::ALL.len() - 1);
     }
 
     #[test]
-    fn enterprise_baseline_matches_section_7_table() {
-        let b = tier_baseline(Tier::Enterprise);
-        assert_eq!(
-            b,
-            set([
-                Feature::RoutingPolicy,
-                Feature::SemanticCache,
-                Feature::AdvancedGuardrails,
-                Feature::PromptRegistry,
-                Feature::AgenticSecurity,
-                Feature::FinOpsExport,
-            ])
-        );
-    }
-
-    #[test]
-    fn business_baseline_is_standard_plus_finops_export() {
-        // Business = Standard ∪ {finops_export}; the agentic-security moat is
-        // NOT in the baseline (Enterprise-exclusive, reachable on Business only
-        // via a per-tenant override).
+    fn business_baseline_is_all_features_except_model_catalog() {
+        // Business returns every feature except ModelCatalog (like every tier),
+        // including the agentic-security moat and finops-export.
         let b = tier_baseline(Tier::Business);
-        assert_eq!(
-            b,
-            set([
-                Feature::RoutingPolicy,
-                Feature::SemanticCache,
-                Feature::AdvancedGuardrails,
-                Feature::PromptRegistry,
-                Feature::FinOpsExport,
-            ])
-        );
-        assert!(!b.contains(&Feature::AgenticSecurity));
-        // It is exactly the Standard baseline plus finops_export.
-        let mut standard_plus = tier_baseline(Tier::Standard);
-        standard_plus.insert(Feature::FinOpsExport);
-        assert_eq!(b, standard_plus);
+        assert_eq!(b, baseline_features());
+        assert!(b.contains(&Feature::AgenticSecurity));
+        assert!(b.contains(&Feature::FinOpsExport));
+        assert!(!b.contains(&Feature::ModelCatalog));
     }
 
     #[test]
@@ -597,38 +550,40 @@ mod tests {
     // --- CapabilitySet::resolve (∪ overrides − holdbacks) ----------------------
 
     #[test]
-    fn resolve_free_with_no_overrides_is_baseline_pair_only() {
-        // Free resolves to exactly its baseline pair: {RoutingPolicy (F13 core
-        // surface), TokenCompression (ADR-088 Bundle B)} — nothing else.
+    fn resolve_free_with_no_overrides_is_all_features_except_model_catalog() {
+        // Free resolves to the full baseline (every feature except ModelCatalog),
+        // with no overrides or holdbacks applied.
         let cs = CapabilitySet::resolve(Tier::Free, &BTreeSet::new(), &BTreeSet::new());
-        assert!(cs.active(Feature::RoutingPolicy));
-        assert!(cs.active(Feature::TokenCompression));
-        assert_eq!(cs.len(), 2);
-        assert!(!cs.active(Feature::SemanticCache));
+        assert_eq!(cs.len(), Feature::ALL.len() - 1);
+        for f in baseline_features() {
+            assert!(
+                cs.active(f),
+                "{f:?} should be active for a default Free tenant"
+            );
+        }
+        // ModelCatalog is the one baseline exception (fail-closed, override-only).
+        assert!(!cs.active(Feature::ModelCatalog));
     }
 
     #[test]
-    fn override_unions_a_feature_onto_baseline() {
-        // Free tenant granted a single feature via per-tenant override (custom
-        // customer / add-on): ∪ adds it on top of the baseline pair.
+    fn override_of_a_baseline_feature_is_idempotent() {
+        // Every feature except ModelCatalog is already in every baseline, so a
+        // per-tenant override of a feature the baseline grants adds nothing (∪ is
+        // idempotent): the resolved set is still the full baseline.
         let overrides = set([Feature::AgenticSecurity]);
         let cs = CapabilitySet::resolve(Tier::Free, &overrides, &BTreeSet::new());
         assert!(cs.active(Feature::AgenticSecurity));
-        // The Free baseline pair (RoutingPolicy + TokenCompression) remains, so
-        // the override adds a 3rd.
-        assert!(cs.active(Feature::RoutingPolicy));
-        assert!(cs.active(Feature::TokenCompression));
-        assert_eq!(cs.len(), 3);
+        assert_eq!(cs.len(), Feature::ALL.len() - 1);
     }
 
     #[test]
-    fn standard_plus_addon_override() {
-        // Standard + finops_export add-on (the §7 footnote case).
-        let overrides = set([Feature::FinOpsExport]);
-        let cs = CapabilitySet::resolve(Tier::Standard, &overrides, &BTreeSet::new());
-        assert!(cs.active(Feature::SemanticCache)); // from baseline
-        assert!(cs.active(Feature::FinOpsExport)); // from override
-        assert!(!cs.active(Feature::AgenticSecurity)); // neither
+    fn standard_baseline_grants_every_feature() {
+        // Standard (like every tier) now grants finops_export and the
+        // agentic-security moat straight from the baseline — no override needed.
+        let cs = CapabilitySet::resolve(Tier::Standard, &BTreeSet::new(), &BTreeSet::new());
+        assert!(cs.active(Feature::SemanticCache));
+        assert!(cs.active(Feature::FinOpsExport));
+        assert!(cs.active(Feature::AgenticSecurity));
     }
 
     #[test]
@@ -652,10 +607,11 @@ mod tests {
         let holdbacks = set([Feature::SemanticCache]);
         let cs = CapabilitySet::resolve(Tier::Free, &overrides, &holdbacks);
         assert!(!cs.active(Feature::SemanticCache));
-        // The Free baseline pair remains (neither was held back).
+        // Everything else in the baseline remains (only SemanticCache held).
         assert!(cs.active(Feature::RoutingPolicy));
         assert!(cs.active(Feature::TokenCompression));
-        assert_eq!(cs.len(), 2);
+        // Baseline is ALL − ModelCatalog (−1); SemanticCache held back too (−2).
+        assert_eq!(cs.len(), Feature::ALL.len() - 2);
     }
 
     // --- flag-key round trip ---------------------------------------------------
@@ -745,9 +701,15 @@ mod tests {
     }
 
     #[test]
-    fn provider_resolves_known_flag_false_when_inactive() {
-        // Free tenant: semantic_cache not entitled → false, even if default true.
-        let cs = CapabilitySet::resolve(Tier::Free, &BTreeSet::new(), &BTreeSet::new());
+    fn provider_resolves_known_flag_false_when_held_back() {
+        // With every feature in every baseline, a feature is inactive only when
+        // the release plane holds it back. semantic_cache held back for a Free
+        // tenant → false, even if the caller default is true.
+        let cs = CapabilitySet::resolve(
+            Tier::Free,
+            &BTreeSet::new(),
+            &BTreeSet::from([Feature::SemanticCache]),
+        );
         let provider = RouteplaneEntitlementProvider::new(cs);
         let ctx = EvalContext::for_tenant("t_free");
         assert!(!provider.resolve_bool("semantic_cache", true, &ctx));
@@ -770,23 +732,21 @@ mod tests {
         assert_eq!(ctx.attributes.get("region").map(String::as_str), Some("IN"));
     }
     #[test]
-    fn audit_features_ship_dark_in_no_tier_baseline() {
-        // PRD-001 FR-16 / ADR-012: the sovereign-audit capabilities are NOT part
-        // of any tier preset — merging them changes nothing for existing tiers.
+    fn audit_features_are_in_every_tier_baseline_with_holdback_kill_switch() {
+        // The sovereign-audit capabilities are now in every tier baseline…
         for tier in [Tier::Free, Tier::Standard, Tier::Business, Tier::Enterprise] {
             let b = tier_baseline(tier);
-            assert!(!b.contains(&Feature::AuditLedger));
-            assert!(!b.contains(&Feature::AuditArtifact));
+            assert!(b.contains(&Feature::AuditLedger));
+            assert!(b.contains(&Feature::AuditArtifact));
         }
-        // They are reachable ONLY via the per-tenant override (∪) term…
-        let overrides = BTreeSet::from([Feature::AuditLedger, Feature::AuditArtifact]);
-        let cs = CapabilitySet::resolve(Tier::Free, &overrides, &BTreeSet::new());
+        // …active for a default tenant…
+        let cs = CapabilitySet::resolve(Tier::Free, &BTreeSet::new(), &BTreeSet::new());
         assert!(cs.active(Feature::AuditLedger));
         assert!(cs.active(Feature::AuditArtifact));
-        // …and a holdback still wins (dark-launch stays operable).
+        // …and a holdback still wins (the kill switch stays operable).
         let held = CapabilitySet::resolve(
             Tier::Free,
-            &BTreeSet::from([Feature::AuditLedger]),
+            &BTreeSet::new(),
             &BTreeSet::from([Feature::AuditLedger]),
         );
         assert!(!held.active(Feature::AuditLedger));
@@ -805,10 +765,12 @@ mod tests {
 
     #[test]
     fn model_catalog_ships_dark_in_no_tier_baseline() {
-        // PRD-008 / ADR-012: the model-catalog default-deny capability is NOT part
-        // of any tier preset — merging it changes nothing for existing tiers, so
-        // the hot path stays byte-identical (the ab_parity/golden guards stay
-        // green). It is reachable ONLY via the per-tenant override (∪) term.
+        // ModelCatalog is the ONE feature kept OUT of the full-baseline "light up
+        // all features" change. It is a FAIL-CLOSED allowlist enforcer (PRD-008):
+        // default-on with an empty allowlist denies every model, and every key
+        // ships with an empty allowlist — so it stays ship-dark / override-only,
+        // reachable only via a per-tenant override (∪) once a real allowlist
+        // exists.
         for tier in [Tier::Free, Tier::Standard, Tier::Business, Tier::Enterprise] {
             assert!(!tier_baseline(tier).contains(&Feature::ModelCatalog));
         }
@@ -869,11 +831,10 @@ mod tests {
     // --- gated (the holdback IS the Unleash `!released` answer at auth) --------
 
     #[test]
-    fn token_compression_in_free_baseline_only_with_release_plane_kill_switch() {
-        // The grant is Free-baseline-only; paid tiers reach it via override.
-        assert!(tier_baseline(Tier::Free).contains(&Feature::TokenCompression));
-        for tier in [Tier::Standard, Tier::Business, Tier::Enterprise] {
-            assert!(!tier_baseline(tier).contains(&Feature::TokenCompression));
+    fn token_compression_in_every_baseline_with_release_plane_kill_switch() {
+        // TokenCompression is now in every tier baseline (like every feature).
+        for tier in [Tier::Free, Tier::Standard, Tier::Business, Tier::Enterprise] {
+            assert!(tier_baseline(tier).contains(&Feature::TokenCompression));
         }
         // A default Free tenant is entitled…
         let on = CapabilitySet::resolve(Tier::Free, &BTreeSet::new(), &BTreeSet::new());

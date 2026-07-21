@@ -5,8 +5,8 @@
 //! `Extension<SharedPromptRegistry>`. The only "network" is a localhost wiremock
 //! standing in for OpenAI on the completions path.
 //!
-//! Covers: entitlement gate (Free → 402 enterprise_only on CE; held-back
-//! Enterprise → 403 feature_not_released; cleared → resolves, AC-7); GET stored
+//! Covers: entitlement gate (every tier entitled by baseline, so a held-back
+//! tenant → 403 feature_not_released; cleared → resolves, AC-7); GET stored
 //! version (FR-7); pure render with no upstream (FR-8); render-and-run happy path
 //! (FR-9); render-and-run inherits residency (PII + IN → 422, FR-9/§8.2); tenant
 //! isolation 404 (FR-15).
@@ -140,23 +140,21 @@ async fn mount_chat_ok(server: &MockServer) {
 // --- AC-7: entitlement gate ---------------------------------------------------
 
 #[tokio::test]
-async fn free_tenant_gets_402_enterprise_only() {
-    // CE contract: not-entitled → the uniform 402 `enterprise_only` upsell
-    // (matching /v1/finops/* and the Enterprise stub routes).
+async fn free_tenant_held_back_gets_403_feature_not_released() {
+    // PromptRegistry is in every tier baseline now, so a Free tenant is entitled;
+    // a rollout holdback is the only way it goes inactive → feature_not_released.
+    // (The not-entitled enterprise_only 402 path is unreachable via tier once the
+    // baseline grants the feature to every tier.)
     let prompts = shared_prompts();
     let resp = get_prompt(
         Extension(prompts),
-        Extension(ctx(Tier::Free, "t_test")),
+        Extension(ctx_held(Tier::Free, "t_test")),
         Path("prompt_greeting".to_string()),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let v = body_json(resp).await;
-    assert_eq!(v["error"]["code"], "enterprise_only");
-    assert!(v["error"]["message"]
-        .as_str()
-        .expect("message")
-        .starts_with("/v1/prompts is a Routeplane Enterprise feature"));
+    assert_eq!(v["error"]["code"], "feature_not_released");
 }
 
 #[tokio::test]
