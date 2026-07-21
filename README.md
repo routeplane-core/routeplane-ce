@@ -19,9 +19,9 @@ Apache-2.0.
 [![throughput](https://img.shields.io/badge/throughput-~24k_req%2Fs-blue)](https://github.com/routeplane-core/routeplane-ce/blob/main/benchmarks/perf/RESULTS.md)
 [![idle RSS](https://img.shields.io/badge/idle_RSS-24.5_MiB-orange)](https://github.com/routeplane-core/routeplane-ce/blob/main/benchmarks/perf/RESULTS.md)
 [![image](https://img.shields.io/badge/image-36_MiB_compressed-blueviolet)](https://github.com/routeplane-core/routeplane-ce/pkgs/container/routeplane-ce)
-[![npm sdk](https://img.shields.io/npm/v/@routeplane/sdk?label=sdk&color=0EA5E9)](https://www.npmjs.com/package/@routeplane/sdk)
-[![npm cli](https://img.shields.io/npm/v/@routeplane/cli?label=cli&color=0EA5E9)](https://www.npmjs.com/package/@routeplane/cli)
-[![PyPI](https://img.shields.io/pypi/v/routeplane?color=0EA5E9)](https://pypi.org/project/routeplane/)
+[![npm sdk](https://img.shields.io/npm/v/@routeplane/sdk?label=sdk&color=1D4ED8)](https://www.npmjs.com/package/@routeplane/sdk)
+[![npm cli](https://img.shields.io/npm/v/@routeplane/cli?label=cli&color=1D4ED8)](https://www.npmjs.com/package/@routeplane/cli)
+[![PyPI](https://img.shields.io/pypi/v/routeplane?color=1D4ED8)](https://pypi.org/project/routeplane/)
 
 ![Demo: docker compose up, a stock OpenAI SDK fronting a local Ollama model, and the same coding-agent request dropping from 3,766 to 501 prompt tokens with RTK on](https://github.com/routeplane-core/routeplane-ce/raw/main/docs/demo.gif)
 
@@ -391,7 +391,7 @@ ships as `v0.1.0-rc.1` — with the raw load-generator output
 [committed alongside](benchmarks/perf/results/2026-07-04-azure-d8s-v5/). One command reproduces it.
 
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"xyChart": {"plotColorPalette": "#0EA5E9"}}}}%%
+%%{init: {"theme": "base", "themeVariables": {"xyChart": {"plotColorPalette": "#2563EB"}}}}%%
 xychart-beta
     title "Latency added by the gateway hop (ms, 32 connections, at saturation)"
     x-axis ["p50", "p90", "p99"]
