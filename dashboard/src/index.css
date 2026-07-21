@@ -2,8 +2,8 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Routeplane Console theme tokens (ADR-036). Routeplane brand = a deep
-   "routeplane" indigo/violet primary on a near-white canvas; dark mode flips
+/* Routeplane Console theme tokens (ADR-036). Routeplane brand = a
+   navy/royal-blue primary on a near-white canvas; dark mode flips
    the canvas. shadcn/ui-compatible HSL CSS variables. */
 @layer base {
   :root {
@@ -13,9 +13,9 @@
     --card-foreground: 222 47% 11%;
     --popover: 0 0% 100%;
     --popover-foreground: 222 47% 11%;
-    --primary: 256 72% 56%; /* routeplane violet */
+    --primary: 221 83% 53%; /* routeplane navy */
     --primary-foreground: 0 0% 100%;
-    --accent: 173 80% 36%; /* teal accent — pairs with the violet */
+    --accent: 173 80% 36%; /* teal accent — pairs with the navy */
     --accent-foreground: 0 0% 100%;
     --secondary: 220 14% 96%;
     --secondary-foreground: 222 47% 11%;
@@ -23,7 +23,7 @@
     --muted-foreground: 220 9% 46%;
     --border: 220 13% 91%;
     --input: 220 13% 91%;
-    --ring: 256 72% 56%;
+    --ring: 221 83% 53%;
     --success: 142 71% 40%;
     --warning: 32 95% 44%;
     --danger: 0 72% 51%;
@@ -31,8 +31,8 @@
     /* sidebar surface — a hair off the canvas so the rail reads as structure */
     --sidebar: 220 20% 98%;
     --sidebar-foreground: 222 47% 11%;
-    /* categorical chart series — violet, teal, amber, rose, blue, slate */
-    --chart-1: 256 72% 56%;
+    /* categorical chart series — navy, teal, amber, rose, blue, slate */
+    --chart-1: 221 83% 53%;
     --chart-2: 173 70% 38%;
     --chart-3: 32 90% 50%;
     --chart-4: 340 75% 55%;
@@ -48,7 +48,7 @@
     --card-foreground: 210 40% 96%;
     --popover: 223 44% 10%;
     --popover-foreground: 210 40% 96%;
-    --primary: 256 80% 70%;
+    --primary: 213 94% 68%;
     --primary-foreground: 224 47% 9%;
     --accent: 173 70% 48%;
     --accent-foreground: 224 47% 9%;
@@ -58,14 +58,14 @@
     --muted-foreground: 215 18% 62%;
     --border: 217 30% 19%;
     --input: 217 30% 19%;
-    --ring: 256 80% 70%;
+    --ring: 213 94% 68%;
     --success: 142 65% 52%;
     --warning: 32 95% 58%;
     --danger: 0 72% 62%;
     --info: 217 91% 66%;
     --sidebar: 224 44% 9%;
     --sidebar-foreground: 210 40% 96%;
-    --chart-1: 256 80% 70%;
+    --chart-1: 213 94% 68%;
     --chart-2: 173 65% 50%;
     --chart-3: 32 92% 60%;
     --chart-4: 340 72% 65%;
