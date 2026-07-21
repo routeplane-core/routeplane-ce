@@ -19,6 +19,9 @@ Apache-2.0.
 [![throughput](https://img.shields.io/badge/throughput-~24k_req%2Fs-blue)](https://github.com/routeplane-core/routeplane-ce/blob/main/benchmarks/perf/RESULTS.md)
 [![idle RSS](https://img.shields.io/badge/idle_RSS-24.5_MiB-orange)](https://github.com/routeplane-core/routeplane-ce/blob/main/benchmarks/perf/RESULTS.md)
 [![image](https://img.shields.io/badge/image-36_MiB_compressed-blueviolet)](https://github.com/routeplane-core/routeplane-ce/pkgs/container/routeplane-ce)
+[![npm sdk](https://img.shields.io/npm/v/@routeplane/sdk?label=sdk&color=0EA5E9)](https://www.npmjs.com/package/@routeplane/sdk)
+[![npm cli](https://img.shields.io/npm/v/@routeplane/cli?label=cli&color=0EA5E9)](https://www.npmjs.com/package/@routeplane/cli)
+[![PyPI](https://img.shields.io/pypi/v/routeplane?color=0EA5E9)](https://pypi.org/project/routeplane/)
 
 ![Demo: docker compose up, a stock OpenAI SDK fronting a local Ollama model, and the same coding-agent request dropping from 3,766 to 501 prompt tokens with RTK on](https://github.com/routeplane-core/routeplane-ce/raw/main/docs/demo.gif)
 
@@ -96,6 +99,13 @@ cp .env.example .env && cp configs/keys.example.json configs/keys.json
 docker compose up -d
 ```
 
+**Prefer a CLI to `curl`?** Once the gateway is up, drive it from the Routeplane CLI:
+
+```bash
+npx @routeplane/cli init          # point it at http://localhost:8080
+rp chat "hello" --provider groq
+```
+
 > **`docker compose up` pulls the pre-built image** — a few seconds, no Rust toolchain. To build
 > from source instead, run `docker compose up --build` (~10–15 min the first time); see
 > [Requirements](#requirements) for the resources that path needs.
@@ -142,6 +152,52 @@ print(reply.choices[0].message.content)
 For the full self-hosting walkthrough (env vars, keys, building from source, Apple Silicon
 notes), see [SELF_HOST.md](https://github.com/routeplane-core/routeplane-ce/blob/main/SELF_HOST.md).
 
+## SDKs, CLI & MCP Server
+
+Routeplane is OpenAI-compatible, so the stock OpenAI SDKs already work (see above). For a
+first-class experience — typed clients, a terminal UI, and gateway tools inside your AI
+assistant — there are also dedicated packages:
+
+**Python SDK** — `pip install routeplane`
+
+```python
+from routeplane import Routeplane
+
+rp = Routeplane(api_key="rp_...", base_url="http://localhost:8080/v1")
+resp = rp.chat.completions.create(
+    model="gpt-4o",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+```
+
+**TypeScript SDK** — `npm i @routeplane/sdk`
+
+```typescript
+import { Routeplane } from '@routeplane/sdk';
+
+const rp = new Routeplane({ apiKey: 'rp_...', baseUrl: 'http://localhost:8080/v1' });
+```
+
+**CLI** — zero install with `npx`:
+
+```bash
+npx @routeplane/cli init    # point at your local gateway
+rp chat "hello"             # streaming completions
+rp logs --limit 20          # request logs
+rp usage                    # cost dashboard
+```
+
+**MCP server** — 33 gateway tools for Claude Code, Cursor, and VS Code: send completions,
+check costs, and manage providers from your AI assistant. Add it to your assistant's MCP config:
+
+```bash
+npx @routeplane/mcp-server
+```
+
+Source and full docs:
+[TypeScript SDK + CLI + MCP](https://github.com/routeplane-core/routeplane-devtools) ·
+[Python SDK](https://github.com/routeplane-core/routeplane-python).
+
 ## The Console
 
 The same single binary also serves a web console on the gateway's own origin — open
@@ -182,6 +238,10 @@ settings: **base URL → your gateway, key → your `rp_` key.** Zero code chang
 |--------|-------------------------------|
 | OpenAI Python SDK | `OpenAI(base_url="http://localhost:8080/v1", api_key="rp_...")` |
 | OpenAI Node SDK | `new OpenAI({ baseURL: "http://localhost:8080/v1", apiKey: "rp_..." })` |
+| Routeplane Python SDK | `pip install routeplane` — typed first-party client |
+| Routeplane TypeScript SDK | `npm i @routeplane/sdk` — typed first-party client |
+| Routeplane CLI | `npx @routeplane/cli` — chat, logs, and usage from the terminal |
+| Routeplane MCP server | `npx @routeplane/mcp-server` — 33 gateway tools for AI assistants |
 | Cursor | Override the OpenAI base URL in model settings, paste your `rp_` key |
 | Claude Code | Point its Anthropic base URL at the gateway — Routeplane also accepts Anthropic-style `/v1/messages` inbound |
 | Cline | Add an OpenAI-compatible provider with the gateway URL + `rp_` key |
