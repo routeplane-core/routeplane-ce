@@ -1,0 +1,140 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "Minimal Azure Container Apps deployment of Routeplane CE. Runs the published GHCR image serverless (scale-to-zero capable) and exposes the OpenAI-compatible gateway on port 8080. Powers the 'Deploy to Azure' button in the README."
+  },
+  "parameters": {
+    "openaiApiKey": {
+      "type": "secureString",
+      "metadata": {
+        "description": "Your OpenAI API key (sk-...). Stored as a Container Apps secret and referenced by the gateway at request time."
+      }
+    },
+    "gatewayKey": {
+      "type": "string",
+      "defaultValue": "rp_change_me",
+      "metadata": {
+        "description": "The rp_-prefixed gateway key clients present as 'Authorization: Bearer'. Change it from the default before exposing the app."
+      }
+    },
+    "appName": {
+      "type": "string",
+      "defaultValue": "routeplane-ce",
+      "metadata": {
+        "description": "Base name for the container app and its supporting resources."
+      }
+    },
+    "image": {
+      "type": "string",
+      "defaultValue": "ghcr.io/routeplane-core/routeplane-ce:latest",
+      "metadata": {
+        "description": "Container image to deploy. The published GHCR image is public and needs no registry credentials."
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Azure region for all resources."
+      }
+    }
+  },
+  "variables": {
+    "logAnalyticsName": "[concat(parameters('appName'), '-logs')]",
+    "environmentName": "[concat(parameters('appName'), '-env')]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.OperationalInsights/workspaces",
+      "apiVersion": "2022-10-01",
+      "name": "[variables('logAnalyticsName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "sku": {
+          "name": "PerGB2018"
+        },
+        "retentionInDays": 30
+      }
+    },
+    {
+      "type": "Microsoft.App/managedEnvironments",
+      "apiVersion": "2024-03-01",
+      "name": "[variables('environmentName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName'))]"
+      ],
+      "properties": {
+        "appLogsConfiguration": {
+          "destination": "log-analytics",
+          "logAnalyticsConfiguration": {
+            "customerId": "[reference(resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName')), '2022-10-01').customerId]",
+            "sharedKey": "[listKeys(resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName')), '2022-10-01').primarySharedKey]"
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2024-03-01",
+      "name": "[parameters('appName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]"
+      ],
+      "properties": {
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]",
+        "configuration": {
+          "ingress": {
+            "external": true,
+            "targetPort": 8080,
+            "transport": "auto"
+          },
+          "secrets": [
+            {
+              "name": "openai-api-key",
+              "value": "[parameters('openaiApiKey')]"
+            }
+          ]
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "routeplane-ce",
+              "image": "[parameters('image')]",
+              "resources": {
+                "cpu": 0.5,
+                "memory": "1Gi"
+              },
+              "env": [
+                {
+                  "name": "PORT",
+                  "value": "8080"
+                },
+                {
+                  "name": "OPENAI_API_KEY",
+                  "secretRef": "openai-api-key"
+                },
+                {
+                  "name": "RP_KEYS_JSON",
+                  "value": "[concat('{\"keys\":[{\"name\":\"default\",\"routeplane_key\":\"', parameters('gatewayKey'), '\",\"provider_keys\":{\"openai\":\"env:OPENAI_API_KEY\"}}]}')]"
+                }
+              ]
+            }
+          ],
+          "scale": {
+            "minReplicas": 0,
+            "maxReplicas": 3
+          }
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "gatewayUrl": {
+      "type": "string",
+      "value": "[concat('https://', reference(resourceId('Microsoft.App/containerApps', parameters('appName')), '2024-03-01').configuration.ingress.fqdn)]"
+    }
+  }
+}

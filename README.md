@@ -91,6 +91,26 @@ mutexes, so health bookkeeping never serializes your traffic.
 
 ## Quickstart
 
+### Fastest start (one command)
+
+No clone, no config files — pull the published image and hand it a minimal key registry inline:
+
+```bash
+docker run -d -p 8080:8080 \
+  -e OPENAI_API_KEY=sk-your-key \
+  -e RP_KEYS_JSON='{"keys":[{"name":"default","routeplane_key":"rp_local_dev","provider_keys":{"openai":"env:OPENAI_API_KEY"}}]}' \
+  ghcr.io/routeplane-core/routeplane-ce:latest
+```
+
+That's it. Chat completions at `http://localhost:8080/v1/chat/completions` (send
+`Authorization: Bearer rp_local_dev`), and the bundled web console at `http://localhost:8080`.
+`RP_KEYS_JSON` supplies the gateway's key registry without a file mount — the registry is
+fail-closed, so a bare `docker run` with no key registry will refuse to start. Swap
+`rp_local_dev` for your own `rp_` key (`echo "rp_$(openssl rand -hex 24)"`) before you expose the
+gateway to anything.
+
+### Full setup (clone + config)
+
 Docker only — no Rust toolchain needed. Three commands to a running gateway:
 
 ```bash
@@ -151,6 +171,28 @@ print(reply.choices[0].message.content)
 
 For the full self-hosting walkthrough (env vars, keys, building from source, Apple Silicon
 notes), see [SELF_HOST.md](https://github.com/routeplane-core/routeplane-ce/blob/main/SELF_HOST.md).
+
+## Deploy
+
+Deploy Routeplane CE with one click, or self-host it yourself:
+
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Frouteplane-core%2Frouteplane-ce%2Fmain%2Fdeploy%2Fazure%2Fazuredeploy.json)
+
+<!-- The "Deploy to Azure" button loads deploy/azure/azuredeploy.json from `main` via
+     raw.githubusercontent.com, so it resolves once this change is merged to main. -->
+
+The button provisions an [Azure Container Apps](https://learn.microsoft.com/azure/container-apps/)
+environment running the published image — serverless and scale-to-zero-capable. For local, VM, or
+non-Azure hosting, use Docker directly:
+
+| Method | How |
+|--------|-----|
+| **Azure Container Apps** | The **Deploy to Azure** button above — serverless ACA from [`deploy/azure/azuredeploy.json`](deploy/azure/azuredeploy.json) |
+| **Docker (one command)** | The [`docker run` one-liner](#fastest-start-one-command) — published image, inline key registry, no clone |
+| **Docker Compose** | `git clone …` then `docker compose up -d` — full config files on a local box or VM (see [Quickstart](#quickstart)) |
+| **CLI** | `npx @routeplane/cli init` — a *client*, not a server; point it at a gateway you already have running |
+
+Docker, Docker Compose, and the Azure button are the supported deployment paths today.
 
 ## SDKs, CLI & MCP Server
 
