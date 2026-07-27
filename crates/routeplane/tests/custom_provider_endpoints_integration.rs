@@ -55,17 +55,24 @@ fn ctx() -> TenantContext {
 
 /// Register a custom provider straight on the (ephemeral) store — the same
 /// snapshot swap the `/v1/providers` handler performs after validation.
+/// Registered under `t_test`, the tenant every drive in this suite runs as
+/// (`ctx()`): the registry is owner-keyed, so registration and dispatch must
+/// share a tenant.
 async fn register(state: &Arc<AppState>, name: &str, base_url: &str, models: &[&str]) {
     state
         .custom_providers
-        .upsert(CustomProviderConfig {
-            name: name.into(),
-            base_url: base_url.into(),
-            api_key: CUSTOM_KEY.into(),
-            models: models.iter().map(|m| m.to_string()).collect(),
-            stream_include_usage: None,
-            created_at: None,
-        })
+        .upsert(
+            "t_test",
+            CustomProviderConfig {
+                tenant_id: None, // stamped server-side by upsert
+                name: name.into(),
+                base_url: base_url.into(),
+                api_key: CUSTOM_KEY.into(),
+                models: models.iter().map(|m| m.to_string()).collect(),
+                stream_include_usage: None,
+                created_at: None,
+            },
+        )
         .await
         .expect("provider registers");
 }

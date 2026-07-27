@@ -23,17 +23,22 @@
 //! persist-then-swap pair always completes together).
 
 use crate::api_error::{error_response, OpenAiJson};
+use crate::auth::TenantContext;
 use crate::custom_providers::{validate_and_normalize, CustomProviderConfig};
 use crate::proxy::AppState;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use std::sync::Arc;
 
 /// `POST /v1/providers` — validate, persist, hot-swap. 201 created / 200 updated.
+/// The provider is registered under the CALLER's tenant (server-side ownership;
+/// any `tenant_id` in the body is overwritten) and is usable only by that
+/// tenant — see `custom_providers.rs` for the owner-keyed registry.
 pub async fn upsert_provider(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_ctx): Extension<TenantContext>,
     OpenAiJson(mut cfg): OpenAiJson<CustomProviderConfig>,
 ) -> Response {
     if let Err((param, msg)) = validate_and_normalize(&mut cfg) {
@@ -91,14 +96,19 @@ pub async fn upsert_provider(
     let base_url = cfg.base_url.clone();
     let model_count = cfg.models.len();
     let store = state.custom_providers.clone();
+    // Cloned BEFORE the spawn below moves `tenant_ctx`: the health registration
+    // after the await needs the owner too.
+    let tenant_id = tenant_ctx.tenant_id.clone();
     // Spawn so the persist→swap pair completes even if the caller disconnects
     // (a dropped handler future must not leave disk and memory out of step).
-    match tokio::spawn(async move { store.upsert(cfg).await }).await {
+    match tokio::spawn(async move { store.upsert(&tenant_ctx.tenant_id, cfg).await }).await {
         Ok(Ok((view, created))) => {
             // Register a circuit breaker + latency EWMA + in-flight gauge for the
             // provider so it is fast-failed and latency-ordered like a built-in
-            // (ADR-113). Idempotent: an update never resets an existing breaker.
-            state.health.register(&name);
+            // (ADR-113) — under the OWNING tenant, the same owner the store keyed
+            // the adapter by, so two tenants' same-named providers never share a
+            // breaker. Idempotent: an update never resets an existing breaker.
+            state.health.register(&tenant_id, &name);
             tracing::info!(
                 "custom provider {}: name={name} base_url={base_url} models={model_count}",
                 if created { "created" } else { "updated" },
@@ -122,9 +132,15 @@ pub async fn upsert_provider(
     }
 }
 
-/// `GET /v1/providers` — every custom provider, MASKED, sorted by name.
-pub async fn list_providers(State(state): State<Arc<AppState>>) -> Response {
-    let data = state.custom_providers.list();
+/// `GET /v1/providers` — the CALLER's custom providers (its own plus
+/// operator-global ones), MASKED, sorted by name. Owner-scoped: another
+/// tenant's provider names and base URLs are an internal-endpoint map and must
+/// never be listed cross-tenant.
+pub async fn list_providers(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant_ctx): Extension<TenantContext>,
+) -> Response {
+    let data = state.custom_providers.list(&tenant_ctx.tenant_id);
     (
         StatusCode::OK,
         Json(serde_json::json!({ "object": "list", "data": data })),
@@ -132,16 +148,22 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
-/// `DELETE /v1/providers/{name}` — remove, persist, hot-swap; 404 if absent.
+/// `DELETE /v1/providers/{name}` — remove THE CALLER'S provider, persist,
+/// hot-swap; 404 if this tenant has no such provider (deliberately identical
+/// whether another tenant does — no existence leak, and a tenant can no longer
+/// delete another tenant's upstream by name).
 pub async fn delete_provider(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_ctx): Extension<TenantContext>,
     Path(name): Path<String>,
 ) -> Response {
     let store = state.custom_providers.clone();
     let removed_name = name.clone();
     // Same cancellation-safety posture as the upsert: the persist→swap pair
     // runs in a spawned task the client cannot cancel mid-way.
-    match tokio::spawn(async move { store.remove(&removed_name).await }).await {
+    match tokio::spawn(async move { store.remove(&tenant_ctx.tenant_id, &removed_name).await })
+        .await
+    {
         Ok(Ok(true)) => {
             tracing::info!("custom provider deleted: name={name}");
             (

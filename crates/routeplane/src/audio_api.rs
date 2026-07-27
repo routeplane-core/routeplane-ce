@@ -297,9 +297,10 @@ async fn run_audio_text(
         .and_then(|h| h.to_str().ok())
         .map(RoutingStrategy::parse)
         .unwrap_or_default();
-    let ordered = state
-        .router
-        .order_candidates(&eligible, strategy, &state.health);
+    let ordered =
+        state
+            .router
+            .order_candidates(&tenant_ctx.tenant_id, &eligible, strategy, &state.health);
 
     // 4. Budgets & rate limits admission — check-before, fail-stop.
     let admit_now = now_unix_ms();
@@ -341,7 +342,11 @@ async fn run_audio_text(
                 continue;
             }
         };
-        if !state.health.is_available(provider_name) {
+        // Health scope mirrors adapter scope — same tenant as provider resolution.
+        if !state
+            .health
+            .is_available(&tenant_ctx.tenant_id, provider_name)
+        {
             tracing::warn!("Skipping {} — circuit breaker is OPEN", provider_name);
             last_error = format!("circuit breaker open for {provider_name}");
             continue;
@@ -398,8 +403,12 @@ async fn run_audio_text(
 
         match result {
             Ok(response) => {
-                state.health.record_latency(provider_name, elapsed_ms);
-                state.health.record_success(provider_name);
+                state
+                    .health
+                    .record_latency(&tenant_ctx.tenant_id, provider_name, elapsed_ms);
+                state
+                    .health
+                    .record_success(&tenant_ctx.tenant_id, provider_name);
 
                 // Transcription bills by audio DURATION/seconds upstream, not
                 // tokens — the gateway does not measure audio length here, so we
@@ -468,9 +477,13 @@ async fn run_audio_text(
                         if body.starts_with(prefix)
                 );
                 if !this_not_supported {
-                    state.health.record_latency(provider_name, elapsed_ms);
+                    state
+                        .health
+                        .record_latency(&tenant_ctx.tenant_id, provider_name, elapsed_ms);
                     if crate::proxy::counts_as_health_failure(&e) {
-                        state.health.record_failure(provider_name);
+                        state
+                            .health
+                            .record_failure(&tenant_ctx.tenant_id, provider_name);
                     }
                 }
                 last_not_supported = this_not_supported;
@@ -702,7 +715,7 @@ pub async fn speech(
             None => match payload.model.as_deref().and_then(|m| {
                 state
                     .custom_providers
-                    .provider_for_model(m)
+                    .provider_for_model(&tenant_ctx.tenant_id, m)
                     .filter(|_| !crate::models_api::is_builtin_model(m))
             }) {
                 Some(custom) => vec![custom],
@@ -717,9 +730,10 @@ pub async fn speech(
         .and_then(|h| h.to_str().ok())
         .map(RoutingStrategy::parse)
         .unwrap_or_default();
-    let ordered = state
-        .router
-        .order_candidates(&eligible, strategy, &state.health);
+    let ordered =
+        state
+            .router
+            .order_candidates(&tenant_ctx.tenant_id, &eligible, strategy, &state.health);
 
     // 5. Budgets & rate limits admission — check-before, fail-stop.
     let admit_now = now_unix_ms();
@@ -755,11 +769,16 @@ pub async fn speech(
         // Built-in registry FIRST, then the runtime custom registry — the same
         // `resolve_provider` resolution chat uses (one lock-free ArcSwap load +
         // HashMap probe; the owned Arc clone is one refcount bump per attempt).
-        let Some(provider) = state.resolve_provider(provider_name.as_str()) else {
+        let Some(provider) = state.resolve_provider(&tenant_ctx.tenant_id, provider_name.as_str())
+        else {
             last_error = format!("Unsupported provider: {provider_name}");
             continue;
         };
-        if !state.health.is_available(provider_name) {
+        // Health scope mirrors adapter scope — same tenant as provider resolution.
+        if !state
+            .health
+            .is_available(&tenant_ctx.tenant_id, provider_name)
+        {
             tracing::warn!("Skipping {} — circuit breaker is OPEN", provider_name);
             last_error = format!("circuit breaker open for {provider_name}");
             continue;
@@ -767,9 +786,11 @@ pub async fn speech(
         // Key precedence: the virtual key's authored `provider_keys` entry (if
         // one exists for this name), else a runtime custom provider's
         // registered upstream key — identical to the chat path's fallback.
-        let api_key = match resolve_api_key(&virtual_key, provider_name)
-            .or_else(|| state.custom_providers.api_key(provider_name))
-        {
+        let api_key = match resolve_api_key(&virtual_key, provider_name).or_else(|| {
+            state
+                .custom_providers
+                .api_key(&tenant_ctx.tenant_id, provider_name)
+        }) {
             Some(k) => k,
             None => {
                 last_error = format!("API key for {provider_name} not configured");
@@ -806,8 +827,12 @@ pub async fn speech(
 
         match result {
             Ok(audio) => {
-                state.health.record_latency(provider_name, elapsed_ms);
-                state.health.record_success(provider_name);
+                state
+                    .health
+                    .record_latency(&tenant_ctx.tenant_id, provider_name, elapsed_ms);
+                state
+                    .health
+                    .record_success(&tenant_ctx.tenant_id, provider_name);
 
                 // TTS bills by input CHARACTERS upstream, not tokens — the gateway
                 // does not price audio here, so we record 0 tokens (the usage event
@@ -880,9 +905,13 @@ pub async fn speech(
                         if body.starts_with("speech_not_supported")
                 );
                 if !this_not_supported {
-                    state.health.record_latency(provider_name, elapsed_ms);
+                    state
+                        .health
+                        .record_latency(&tenant_ctx.tenant_id, provider_name, elapsed_ms);
                     if crate::proxy::counts_as_health_failure(&e) {
-                        state.health.record_failure(provider_name);
+                        state
+                            .health
+                            .record_failure(&tenant_ctx.tenant_id, provider_name);
                     }
                 }
                 last_not_supported = this_not_supported;

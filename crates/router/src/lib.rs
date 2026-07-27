@@ -327,15 +327,45 @@ impl ProviderHealth {
     }
 }
 
-/// Per-provider health: one circuit breaker plus one latency EWMA plus one
-/// in-flight gauge per provider. Built-ins are registered at startup; custom
-/// providers (ADR-099) are registered at runtime via [`register`](Self::register).
-/// The provider map is held behind an [`ArcSwap`] so registration is an RCU swap
-/// — every read on the request path is a single lock-free atomic load, never a
-/// mutex (ADR-113). The atomics inside each `ProviderHealth` do all per-provider
-/// mutation, so an in-flight record is never lost to a concurrent registration.
+/// The owner key for a provider health cell registered without a tenant: the
+/// built-ins registered at construction, and operator-global custom providers
+/// (the self-host/CE boot file, `tenant_id: None`). The single shared
+/// definition — the binary's `CustomProviderStore` imports THIS constant, so
+/// the health registry and the adapter registry can never disagree on the
+/// sentinel.
+pub const GLOBAL_OWNER: &str = "";
+
+/// Per-provider health, scoped by OWNER: one circuit breaker plus one latency
+/// EWMA plus one in-flight gauge per `(owner, provider)` cell. Built-ins are
+/// registered at startup under [`GLOBAL_OWNER`]; custom providers (ADR-099)
+/// are registered at runtime via [`register`](Self::register) under their
+/// owning tenant. The provider map is held behind an [`ArcSwap`] so
+/// registration is an RCU swap — every read on the request path is a single
+/// lock-free atomic load, never a mutex (ADR-113). The atomics inside each
+/// `ProviderHealth` do all per-provider mutation, so an in-flight record is
+/// never lost to a concurrent registration.
+///
+/// # Scope invariant: the breaker follows the adapter
+///
+/// Every accessor resolves `(owner, provider)` **tenant-first, then
+/// [`GLOBAL_OWNER`]** — the exact resolution order of the adapter registry
+/// (`CustomProviderStore::entry_for` / `AppState::resolve_provider`). If
+/// provider resolution yields a distinct adapter for a tenant, the health
+/// lookup for that tenant yields a distinct breaker/EWMA/gauge; if it falls
+/// through to a shared (built-in or operator-global) adapter, the health state
+/// is the shared cell. Callers therefore pass the AUTHENTICATED tenant
+/// unconditionally and never branch on "is this a built-in" — the fallback IS
+/// the built-in path. A provider name is request-influenced free text, so a
+/// process-wide registry keyed by the bare name let one tenant's dead `myvllm`
+/// open the breaker for every other tenant's unrelated `myvllm` (the
+/// cross-tenant DoS this keying closes); the sibling `key_cooldowns` cells
+/// below were always tenant-keyed for the same reason.
 pub struct HealthTracker {
-    providers: ArcSwap<HashMap<String, Arc<ProviderHealth>>>,
+    /// `owner → provider name → health cells`. Nested (not a `(String, String)`
+    /// tuple key) so the hot path probes with two borrowed `&str`s — a tuple key
+    /// cannot be probed by reference and would force two `String` allocations
+    /// per read, inside `sort_by_key` comparator closures on the ordering path.
+    providers: ArcSwap<HashMap<String, HashMap<String, Arc<ProviderHealth>>>>,
     /// ADR-087 multi-account: per-key rate-limit **cooldown** cells (`cooled_until`
     /// epoch-millis; `0` = not cooled). A fixed-size array indexed by
     /// `hash(tenant, provider, key_index)`, allocated once — lock-free reads/writes
@@ -354,15 +384,22 @@ pub struct HealthTracker {
 const KEY_COOLDOWN_CELLS: usize = 4096;
 
 impl HealthTracker {
+    /// Construct with the built-in provider set, registered under
+    /// [`GLOBAL_OWNER`] — built-ins are process-shared adapters, so their health
+    /// is deliberately shared across tenants (real fleet signal about a real
+    /// upstream). The signature deliberately takes bare names: a built-in has no
+    /// owner by construction.
     pub fn new<I, S>(providers: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let mut map: HashMap<String, Arc<ProviderHealth>> = HashMap::new();
+        let mut by_name: HashMap<String, Arc<ProviderHealth>> = HashMap::new();
         for p in providers {
-            map.insert(p.into(), ProviderHealth::new());
+            by_name.insert(p.into(), ProviderHealth::new());
         }
+        let mut map: HashMap<String, HashMap<String, Arc<ProviderHealth>>> = HashMap::new();
+        map.insert(GLOBAL_OWNER.to_string(), by_name);
         let key_cooldowns = (0..KEY_COOLDOWN_CELLS)
             .map(|_| AtomicU64::new(0))
             .collect::<Vec<_>>()
@@ -373,38 +410,83 @@ impl HealthTracker {
         }
     }
 
-    /// Register a provider's health cells if absent (idempotent). Built-ins are
-    /// registered at construction; this is how a runtime custom provider
-    /// (ADR-099) gets a circuit breaker + latency EWMA + in-flight gauge so it is
-    /// fast-failed and latency-ordered like any built-in (ADR-113).
+    /// Resolve `(owner, provider)` to its health cells and run `f` on them —
+    /// the ONE resolution point every accessor routes through, so the scope rule
+    /// cannot drift per-method. Tenant cell first, then the [`GLOBAL_OWNER`]
+    /// fallback — mirroring `CustomProviderStore::entry_for` /
+    /// `AppState::resolve_provider` exactly (the breaker follows the adapter).
+    /// `None` ⇒ unknown to health under BOTH owners (the callers' fail-open
+    /// contract). Holds the `ArcSwap` load guard only for the closure's duration:
+    /// two borrowed-`&str` probes, no allocation, no `Arc` clone on the read path
+    /// (a closure that must outlive the guard clones only what it keeps — see
+    /// [`enter_in_flight`](Self::enter_in_flight)).
+    fn with_health<R>(
+        &self,
+        owner: &str,
+        provider: &str,
+        f: impl FnOnce(&ProviderHealth) -> R,
+    ) -> Option<R> {
+        let snapshot = self.providers.load();
+        let health = snapshot
+            .get(owner)
+            .and_then(|by_name| by_name.get(provider))
+            .or_else(|| {
+                snapshot
+                    .get(GLOBAL_OWNER)
+                    .and_then(|by_name| by_name.get(provider))
+            })?;
+        Some(f(health))
+    }
+
+    /// Register `(owner, provider)` health cells if absent (idempotent). Built-ins
+    /// are registered at construction under [`GLOBAL_OWNER`]; this is how a runtime
+    /// custom provider (ADR-099) gets a circuit breaker + latency EWMA + in-flight
+    /// gauge — under its OWNING tenant, so two tenants' same-named providers (a
+    /// supported state — per-owner uniqueness) never share a breaker. Pass
+    /// [`GLOBAL_OWNER`] only for an ownerless (operator-global boot-file)
+    /// provider.
     ///
-    /// Additive-only: an existing provider is left **untouched**, so a breaker an
+    /// Additive-only: an existing cell is left **untouched**, so a breaker an
     /// operator just watched open is never reset by re-registering it (or by
-    /// registering a different provider). The RCU closure clones the map — which
-    /// clones the `Arc`s, preserving every provider's accumulated state — and
-    /// swaps in the extended copy. Off the hot path (called on registry upsert).
-    pub fn register(&self, provider: impl Into<String>) {
+    /// registering a different provider). The RCU closure clones the outer map and
+    /// the touched owner's inner map — which clones the `Arc`s, preserving every
+    /// provider's accumulated state — and swaps in the extended copy. Off the hot
+    /// path (called on registry upsert / boot replay); registration is the ONLY
+    /// way a cell is created — no read accessor ever grows the map, so the
+    /// request path stays incapable of minting registry entries.
+    pub fn register(&self, owner: &str, provider: impl Into<String>) {
         let name = provider.into();
         // Fast path: already present ⇒ no allocation, no swap (and never a reset).
-        if self.providers.load().contains_key(&name) {
+        // Deliberately owner-exact (NOT the global fallback): a tenant registering
+        // `myvllm` must get its own cell even when a global `myvllm` exists.
+        if self
+            .providers
+            .load()
+            .get(owner)
+            .is_some_and(|by_name| by_name.contains_key(&name))
+        {
             return;
         }
         self.providers.rcu(|cur| {
             let mut next = HashMap::clone(cur);
-            next.entry(name.clone()).or_insert_with(ProviderHealth::new);
+            next.entry(owner.to_string())
+                .or_default()
+                .entry(name.clone())
+                .or_insert_with(ProviderHealth::new);
             next
         });
     }
 
-    /// Test-only: replace `provider`'s breaker with a clock-injectable one (fresh
-    /// latency/gauge), so cooldown→half-open transitions are deterministic. Uses a
-    /// single `store` (not `rcu`): `CircuitBreaker` holds a `Box<dyn Fn>` clock and
-    /// is not `Clone`, so it cannot be moved into an `FnMut` retry closure — and
-    /// tests are single-threaded here, so there is no swap to contend with.
+    /// Test-only: replace `(owner, provider)`'s breaker with a clock-injectable
+    /// one (fresh latency/gauge), so cooldown→half-open transitions are
+    /// deterministic. Uses a single `store` (not `rcu`): `CircuitBreaker` holds a
+    /// `Box<dyn Fn>` clock and is not `Clone`, so it cannot be moved into an
+    /// `FnMut` retry closure — and tests are single-threaded here, so there is no
+    /// swap to contend with.
     #[cfg(test)]
-    fn set_breaker_for_test(&self, provider: &str, breaker: CircuitBreaker) {
+    fn set_breaker_for_test(&self, owner: &str, provider: &str, breaker: CircuitBreaker) {
         let mut next = (**self.providers.load()).clone();
-        next.insert(
+        next.entry(owner.to_string()).or_default().insert(
             provider.to_string(),
             Arc::new(ProviderHealth {
                 breaker,
@@ -467,46 +549,42 @@ impl HealthTracker {
             .store(0, Ordering::Release);
     }
 
-    /// Record an observed latency sample (milliseconds) for `provider`, folding
-    /// it into that provider's EWMA. Unknown providers are ignored.
-    pub fn record_latency(&self, provider: &str, ms: u64) {
-        if let Some(h) = self.providers.load().get(provider) {
-            h.latency.record(ms);
-        }
+    /// Record an observed latency sample (milliseconds) for `(owner, provider)`,
+    /// folding it into that cell's EWMA (tenant cell first, then the global
+    /// fallback — the adapter's resolution order). Unknown providers are ignored.
+    pub fn record_latency(&self, owner: &str, provider: &str, ms: u64) {
+        self.with_health(owner, provider, |h| h.latency.record(ms));
     }
 
-    /// Current latency EWMA (ms) for `provider`, or `None` if no sample has been
-    /// recorded yet (or the provider is unknown). Used by the `Latency` strategy
-    /// to order providers and to treat untried ones optimistically.
-    pub fn latency_ms(&self, provider: &str) -> Option<u64> {
-        self.providers
-            .load()
-            .get(provider)
-            .and_then(|h| h.latency.read())
+    /// Current latency EWMA (ms) for `(owner, provider)`, or `None` if no sample
+    /// has been recorded yet (or the provider is unknown). Used by the `Latency`
+    /// strategy to order providers and to treat untried ones optimistically.
+    pub fn latency_ms(&self, owner: &str, provider: &str) -> Option<u64> {
+        self.with_health(owner, provider, |h| h.latency.read())
+            .flatten()
     }
 
-    /// Current number of outstanding (in-flight) requests for `provider`. Read by
-    /// the [`RoutingStrategy::LeastBusy`] ordering. An unknown provider (no gauge
-    /// registered) reports the maximum so it sorts LAST — least-busy never
-    /// prefers a provider it cannot meter.
-    pub fn in_flight(&self, provider: &str) -> u64 {
-        self.providers
-            .load()
-            .get(provider)
-            .map(|h| h.in_flight.count.load(Ordering::Relaxed))
-            .unwrap_or(u64::MAX)
+    /// Current number of outstanding (in-flight) requests for `(owner, provider)`.
+    /// Read by the [`RoutingStrategy::LeastBusy`] ordering. An unknown provider
+    /// (no gauge registered) reports the maximum so it sorts LAST — least-busy
+    /// never prefers a provider it cannot meter.
+    pub fn in_flight(&self, owner: &str, provider: &str) -> u64 {
+        self.with_health(owner, provider, |h| {
+            h.in_flight.count.load(Ordering::Relaxed)
+        })
+        .unwrap_or(u64::MAX)
     }
 
-    /// Mark an attempt as DISPATCHED to `provider`: increments its in-flight gauge
-    /// and returns an [`InFlightGuard`] that decrements it on `Drop`. Hold the
-    /// guard across the provider call so the count is balanced on every exit path
-    /// (success, error, `?`, cancellation, panic). Returns `None` for an unknown
-    /// provider (no gauge to track) — the caller proceeds untracked, exactly as
-    /// before the gauge existed.
-    pub fn enter_in_flight(&self, provider: &str) -> Option<InFlightGuard> {
-        // Clone only the gauge Arc (it must outlive the load guard, inside the
-        // returned InFlightGuard) — not the whole ProviderHealth.
-        let gauge = self.providers.load().get(provider)?.in_flight.clone();
+    /// Mark an attempt as DISPATCHED to `(owner, provider)`: increments its
+    /// in-flight gauge and returns an [`InFlightGuard`] that decrements it on
+    /// `Drop`. Hold the guard across the provider call so the count is balanced
+    /// on every exit path (success, error, `?`, cancellation, panic). Returns
+    /// `None` for an unknown provider (no gauge to track) — the caller proceeds
+    /// untracked, exactly as before the gauge existed.
+    pub fn enter_in_flight(&self, owner: &str, provider: &str) -> Option<InFlightGuard> {
+        // Clone only the gauge Arc INSIDE the closure (it must outlive the load
+        // guard, inside the returned InFlightGuard) — not the whole ProviderHealth.
+        let gauge = self.with_health(owner, provider, |h| h.in_flight.clone())?;
         gauge.count.fetch_add(1, Ordering::Relaxed);
         Some(InFlightGuard { gauge })
     }
@@ -517,13 +595,12 @@ impl HealthTracker {
     /// gauge as the trial counter (in HalfOpen every in-flight request IS a
     /// trial, since nothing else dispatches while Open), so it needs no separate
     /// permit bookkeeping and can never leak. Unknown providers (no breaker
-    /// registered) are treated as available.
-    pub fn is_available(&self, provider: &str) -> bool {
-        self.providers
-            .load()
-            .get(provider)
-            .map(|h| h.breaker.admits(h.in_flight.count.load(Ordering::Relaxed)))
-            .unwrap_or(true)
+    /// registered under either owner) are treated as available.
+    pub fn is_available(&self, owner: &str, provider: &str) -> bool {
+        self.with_health(owner, provider, |h| {
+            h.breaker.admits(h.in_flight.count.load(Ordering::Relaxed))
+        })
+        .unwrap_or(true)
     }
 
     /// Atomically ADMIT a probe against `provider` **and** reserve its in-flight
@@ -538,73 +615,79 @@ impl HealthTracker {
     /// breaker-state read is a separate load, but a transition racing it is benign
     /// and self-correcting (a HalfOpen→Closed race admits one extra; a Closed→HalfOpen
     /// race is the same one-instant softness the gauge always had).
-    pub fn try_enter_probe(&self, provider: &str) -> ProbeAdmission {
-        // Hold the load guard for the whole method: `breaker` borrows through it;
-        // only the gauge Arc is cloned (it outlives the guard in the returned
-        // InFlightGuard).
-        let providers = self.providers.load();
-        let Some(health) = providers.get(provider) else {
-            return ProbeAdmission::Untracked;
-        };
-        let breaker = &health.breaker;
-        let gauge = health.in_flight.clone();
-        match breaker.state() {
-            CircuitState::Open => ProbeAdmission::Rejected,
-            // Closed: admit unconditionally — the probe cap is half-open-only. One
-            // relaxed add, identical to `enter_in_flight`.
-            CircuitState::Closed => {
-                gauge.count.fetch_add(1, Ordering::Relaxed);
-                ProbeAdmission::Admitted(InFlightGuard { gauge })
-            }
-            // HalfOpen: conditional increment. Admit only while fewer than
-            // `success_threshold` trials are outstanding; the CAS folds the cap
-            // check and the reservation into one atomic step (no overshoot).
-            CircuitState::HalfOpen => {
-                let cap = breaker.success_threshold;
-                loop {
-                    let cur = gauge.count.load(Ordering::Acquire);
-                    if cur >= cap {
-                        return ProbeAdmission::Rejected;
-                    }
-                    if gauge
-                        .count
-                        .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        return ProbeAdmission::Admitted(InFlightGuard { gauge });
+    pub fn try_enter_probe(&self, owner: &str, provider: &str) -> ProbeAdmission {
+        // The whole admit runs inside the `with_health` closure: `breaker`
+        // borrows through the load guard; only the gauge Arc is cloned (it
+        // outlives the guard in a returned InFlightGuard).
+        self.with_health(owner, provider, |health| {
+            let breaker = &health.breaker;
+            let gauge = health.in_flight.clone();
+            match breaker.state() {
+                CircuitState::Open => ProbeAdmission::Rejected,
+                // Closed: admit unconditionally — the probe cap is half-open-only.
+                // One relaxed add, identical to `enter_in_flight`.
+                CircuitState::Closed => {
+                    gauge.count.fetch_add(1, Ordering::Relaxed);
+                    ProbeAdmission::Admitted(InFlightGuard { gauge })
+                }
+                // HalfOpen: conditional increment. Admit only while fewer than
+                // `success_threshold` trials are outstanding; the CAS folds the cap
+                // check and the reservation into one atomic step (no overshoot).
+                CircuitState::HalfOpen => {
+                    let cap = breaker.success_threshold;
+                    loop {
+                        let cur = gauge.count.load(Ordering::Acquire);
+                        if cur >= cap {
+                            return ProbeAdmission::Rejected;
+                        }
+                        if gauge
+                            .count
+                            .compare_exchange_weak(
+                                cur,
+                                cur + 1,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            return ProbeAdmission::Admitted(InFlightGuard { gauge });
+                        }
                     }
                 }
             }
-        }
+        })
+        // Unknown to health (no cell under either owner): proceed untracked —
+        // fail-open, byte-identical to the pre-gauge behaviour.
+        .unwrap_or(ProbeAdmission::Untracked)
     }
 
-    pub fn record_success(&self, provider: &str) {
-        if let Some(h) = self.providers.load().get(provider) {
-            h.breaker.record_success();
-        }
+    pub fn record_success(&self, owner: &str, provider: &str) {
+        self.with_health(owner, provider, |h| h.breaker.record_success());
     }
 
-    pub fn record_failure(&self, provider: &str) {
-        if let Some(h) = self.providers.load().get(provider) {
-            h.breaker.record_failure();
-        }
+    pub fn record_failure(&self, owner: &str, provider: &str) {
+        self.with_health(owner, provider, |h| h.breaker.record_failure());
     }
 
-    pub fn state(&self, provider: &str) -> CircuitState {
-        self.providers
-            .load()
-            .get(provider)
-            .map(|h| h.breaker.state())
+    pub fn state(&self, owner: &str, provider: &str) -> CircuitState {
+        self.with_health(owner, provider, |h| h.breaker.state())
             .unwrap_or(CircuitState::Closed)
     }
 
-    /// The registered provider names (built-ins plus any runtime-registered
-    /// custom providers). A lock-free load of the current registry snapshot —
-    /// safe to call off the hot path (e.g. the read-only `/status` surface).
-    /// Returns owned `String`s (the snapshot guard does not outlive the call);
-    /// order is unspecified, so the caller sorts for a stable view.
-    pub fn provider_names(&self) -> Vec<String> {
-        self.providers.load().keys().cloned().collect()
+    /// The provider names registered under [`GLOBAL_OWNER`] ONLY: the built-ins
+    /// plus any operator-global (boot-file) custom providers. This feeds the
+    /// UNAUTHENTICATED `/status` surface, so it must never touch the outer
+    /// (tenant) key set — a tenant-registered provider name is customer-chosen
+    /// free text and nothing tenant-shaped may reach that surface. A lock-free
+    /// load of the current registry snapshot, safe off the hot path. Returns
+    /// owned `String`s (the snapshot guard does not outlive the call); order is
+    /// unspecified, so the caller sorts for a stable view.
+    pub fn global_provider_names(&self) -> Vec<String> {
+        self.providers
+            .load()
+            .get(GLOBAL_OWNER)
+            .map(|by_name| by_name.keys().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -620,27 +703,33 @@ mod tests {
     }
 
     #[test]
-    fn provider_names_lists_registered_providers() {
+    fn global_provider_names_lists_registered_builtins() {
         let h = HealthTracker::new(["openai", "anthropic", "gemini"]);
-        let mut names = h.provider_names();
+        let mut names = h.global_provider_names();
         names.sort_unstable();
         assert_eq!(names, vec!["anthropic", "gemini", "openai"]);
     }
 
     // --- ADR-113 dynamic registration (custom providers) ----------------------
+    // Callers pass the authenticated tenant unconditionally; built-ins resolve
+    // through the GLOBAL_OWNER fallback, so these register/lookup tests drive
+    // the tenant-scoped path exactly as the proxy does.
 
     #[test]
     fn unregistered_custom_provider_is_available_but_untracked() {
         let h = HealthTracker::new(["openai"]);
         // Fail-open: an unknown provider is available and its records no-op.
-        assert!(h.is_available("vllm_local"));
-        assert_eq!(h.state("vllm_local"), CircuitState::Closed);
+        assert!(h.is_available("t_a", "vllm_local"));
+        assert_eq!(h.state("t_a", "vllm_local"), CircuitState::Closed);
         for _ in 0..DEFAULT_FAILURE_THRESHOLD {
-            h.record_failure("vllm_local"); // no breaker ⇒ silently ignored
+            h.record_failure("t_a", "vllm_local"); // no breaker ⇒ silently ignored
         }
-        assert!(h.is_available("vllm_local"), "still untracked, never trips");
+        assert!(
+            h.is_available("t_a", "vllm_local"),
+            "still untracked, never trips"
+        );
         assert!(matches!(
-            h.try_enter_probe("vllm_local"),
+            h.try_enter_probe("t_a", "vllm_local"),
             ProbeAdmission::Untracked
         ));
     }
@@ -648,58 +737,199 @@ mod tests {
     #[test]
     fn register_gives_a_custom_provider_a_breaker_that_trips() {
         let h = HealthTracker::new(["openai"]);
-        h.register("vllm_local");
-        assert!(h.is_available("vllm_local"));
-        assert!(h.provider_names().iter().any(|n| n == "vllm_local"));
+        h.register("t_a", "vllm_local");
+        assert!(h.is_available("t_a", "vllm_local"));
         // Now it is tracked: DEFAULT_FAILURE_THRESHOLD failures open the circuit,
         // and order-time `is_available` will drop it (closing ledger #11).
         for _ in 0..DEFAULT_FAILURE_THRESHOLD {
-            h.record_failure("vllm_local");
+            h.record_failure("t_a", "vllm_local");
         }
-        assert_eq!(h.state("vllm_local"), CircuitState::Open);
-        assert!(!h.is_available("vllm_local"));
+        assert_eq!(h.state("t_a", "vllm_local"), CircuitState::Open);
+        assert!(!h.is_available("t_a", "vllm_local"));
     }
 
     #[test]
     fn register_is_idempotent_and_never_resets_an_open_breaker() {
         let h = HealthTracker::new(["openai"]);
-        h.register("vllm_local");
+        h.register("t_a", "vllm_local");
         for _ in 0..DEFAULT_FAILURE_THRESHOLD {
-            h.record_failure("vllm_local");
+            h.record_failure("t_a", "vllm_local");
         }
-        assert_eq!(h.state("vllm_local"), CircuitState::Open);
+        assert_eq!(h.state("t_a", "vllm_local"), CircuitState::Open);
         // Re-registering (an update upsert) must NOT reset the breaker an operator
         // just watched open.
-        h.register("vllm_local");
-        assert_eq!(h.state("vllm_local"), CircuitState::Open);
-        assert!(!h.is_available("vllm_local"));
+        h.register("t_a", "vllm_local");
+        assert_eq!(h.state("t_a", "vllm_local"), CircuitState::Open);
+        assert!(!h.is_available("t_a", "vllm_local"));
     }
 
     #[test]
     fn registering_one_provider_preserves_anothers_state() {
         let h = HealthTracker::new(["openai"]);
-        h.register("vllm_a");
+        h.register("t_a", "vllm_a");
         for _ in 0..DEFAULT_FAILURE_THRESHOLD {
-            h.record_failure("vllm_a");
+            h.record_failure("t_a", "vllm_a");
         }
-        assert_eq!(h.state("vllm_a"), CircuitState::Open);
-        // Registering a DIFFERENT provider swaps the map; the clone preserves
-        // vllm_a's live breaker Arc, so its Open state survives.
-        h.register("vllm_b");
-        assert_eq!(h.state("vllm_a"), CircuitState::Open);
-        assert!(h.is_available("vllm_b"));
+        assert_eq!(h.state("t_a", "vllm_a"), CircuitState::Open);
+        // Registering a DIFFERENT provider (even under a different owner) swaps
+        // the map; the clone preserves vllm_a's live breaker Arc, so its Open
+        // state survives.
+        h.register("t_b", "vllm_b");
+        assert_eq!(h.state("t_a", "vllm_a"), CircuitState::Open);
+        assert!(h.is_available("t_b", "vllm_b"));
     }
 
     #[test]
     fn register_is_a_noop_for_a_builtin() {
         let h = HealthTracker::new(["openai"]);
         for _ in 0..DEFAULT_FAILURE_THRESHOLD {
-            h.record_failure("openai");
+            h.record_failure("t_a", "openai");
         }
-        assert_eq!(h.state("openai"), CircuitState::Open);
-        // Re-registering a built-in must not reset its breaker either.
-        h.register("openai");
-        assert_eq!(h.state("openai"), CircuitState::Open);
+        assert_eq!(h.state("t_a", "openai"), CircuitState::Open);
+        // Re-registering a built-in under GLOBAL_OWNER must not reset its breaker.
+        h.register(GLOBAL_OWNER, "openai");
+        assert_eq!(h.state("t_a", "openai"), CircuitState::Open);
+    }
+
+    // --- tenant-scoped health cells --------------------------------------------
+
+    /// The cross-tenant DoS this keying closes.
+    ///
+    /// Cross-tenant name collisions are a SUPPORTED state (`CustomProviderStore`
+    /// is keyed per-owner), but the health registry was keyed by the BARE
+    /// provider name, so two tenants' distinct `myvllm` providers — different
+    /// base_url, different upstream, different credentials — collapsed onto ONE
+    /// breaker/EWMA/gauge. Tenant A pointing its `myvllm` at a dead host and
+    /// sending a handful of requests opened the breaker for tenant B's healthy,
+    /// unrelated `myvllm`. FAILS ON THE OLD CODE (single flat map): A's
+    /// failures tripped B's availability.
+    #[test]
+    fn same_provider_name_across_tenants_does_not_share_a_breaker() {
+        let h = HealthTracker::new(["openai"]);
+        h.register("t_alpha", "myvllm");
+        h.register("t_beta", "myvllm");
+
+        // Drive t_alpha's myvllm to Open.
+        for _ in 0..DEFAULT_FAILURE_THRESHOLD {
+            h.record_failure("t_alpha", "myvllm");
+        }
+        assert_eq!(h.state("t_alpha", "myvllm"), CircuitState::Open);
+        assert!(!h.is_available("t_alpha", "myvllm"));
+
+        // The victim tenant's same-named provider is untouched.
+        assert!(
+            h.is_available("t_beta", "myvllm"),
+            "cross-tenant DoS: tenant A driving its own `myvllm` breaker Open \
+             must not fast-fail tenant B's distinct provider of the same name"
+        );
+        assert_eq!(
+            h.state("t_beta", "myvllm"),
+            CircuitState::Closed,
+            "t_beta's breaker must still be Closed after t_alpha's failures"
+        );
+
+        // And t_beta owns its own independent lifecycle: it can trip on its own.
+        for _ in 0..DEFAULT_FAILURE_THRESHOLD {
+            h.record_failure("t_beta", "myvllm");
+        }
+        assert_eq!(h.state("t_beta", "myvllm"), CircuitState::Open);
+        assert!(!h.is_available("t_beta", "myvllm"));
+    }
+
+    /// The secondary cross-tenant channels: the latency EWMA (routing bias) and
+    /// the in-flight gauge (LeastBusy ordering) must be per-cell too. FAILS ON
+    /// THE OLD CODE: A's 5000ms sample skewed B's `latency` ordering, and A's
+    /// outstanding requests inflated B's least-busy count.
+    #[test]
+    fn latency_and_in_flight_do_not_bleed_across_tenants() {
+        let h = HealthTracker::new(["openai"]);
+        h.register("t_alpha", "myvllm");
+        h.register("t_beta", "myvllm");
+
+        h.record_latency("t_alpha", "myvllm", 5_000);
+        assert_eq!(h.latency_ms("t_alpha", "myvllm"), Some(5_000));
+        assert_eq!(
+            h.latency_ms("t_beta", "myvllm"),
+            None,
+            "tenant A's latency sample must not seed tenant B's EWMA \
+             (cross-tenant routing-bias channel)"
+        );
+
+        let guard = h.enter_in_flight("t_alpha", "myvllm").unwrap();
+        assert_eq!(h.in_flight("t_alpha", "myvllm"), 1);
+        assert_eq!(
+            h.in_flight("t_beta", "myvllm"),
+            0,
+            "tenant A's outstanding request must not inflate tenant B's \
+             least-busy gauge"
+        );
+        drop(guard);
+        assert_eq!(h.in_flight("t_alpha", "myvllm"), 0);
+    }
+
+    /// Pins the INTENDED sharing: a built-in provider is one process-wide
+    /// adapter talking to one real upstream, so its breaker is a fleet signal
+    /// and IS shared across tenants. If a later "fix" per-tenants the
+    /// built-ins, this fails and forces that to be a deliberate decision.
+    #[test]
+    fn builtin_breaker_is_shared_across_tenants() {
+        let h = HealthTracker::new(["openai"]);
+        for _ in 0..DEFAULT_FAILURE_THRESHOLD {
+            h.record_failure("t_alpha", "openai");
+        }
+        assert_eq!(h.state("t_alpha", "openai"), CircuitState::Open);
+        assert!(
+            !h.is_available("t_beta", "openai"),
+            "built-in health is deliberately SHARED: openai being down is true \
+             for every tenant, so t_alpha's observed failures must fast-fail \
+             t_beta too (one global cell, by construction)"
+        );
+        assert_eq!(h.state(GLOBAL_OWNER, "openai"), CircuitState::Open);
+    }
+
+    /// Resolution order mirrors the adapter registry: a tenant's OWN cell
+    /// shadows a global one of the same name (a tenant's own provider wins in
+    /// `CustomProviderStore::entry_for`, so its breaker must win here too).
+    #[test]
+    fn tenant_entry_shadows_the_global_one() {
+        let h = HealthTracker::new(["openai"]);
+        h.register(GLOBAL_OWNER, "shared");
+        h.register("t_a", "shared");
+
+        // Trip the GLOBAL cell; the tenant with its OWN cell is unaffected…
+        for _ in 0..DEFAULT_FAILURE_THRESHOLD {
+            h.record_failure(GLOBAL_OWNER, "shared");
+        }
+        assert!(
+            h.is_available("t_a", "shared"),
+            "a tenant with its own provider must read its OWN cell, not the \
+             global one (shadowing mirrors adapter resolution)"
+        );
+        // …while a tenant WITHOUT its own cell falls through to the global one.
+        assert!(!h.is_available("t_b", "shared"));
+
+        // And records from the shadowed tenant land on ITS cell, not the global.
+        h.record_latency("t_a", "shared", 100);
+        assert_eq!(h.latency_ms("t_a", "shared"), Some(100));
+        assert_eq!(h.latency_ms("t_b", "shared"), None); // global cell: no sample
+    }
+
+    /// The `/status` contract asserted at the source: the global name fold must
+    /// never see a tenant-owned registration (a provider name is
+    /// customer-chosen free text; `/status` is unauthenticated).
+    #[test]
+    fn global_provider_names_excludes_tenant_owned() {
+        let h = HealthTracker::new(["openai"]);
+        h.register(GLOBAL_OWNER, "ollama_box");
+        h.register("t_acme", "acme-bank-internal");
+        let mut names = h.global_provider_names();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["ollama_box", "openai"],
+            "a tenant-registered provider name must never surface through the \
+             global fold that feeds the unauthenticated /status page"
+        );
     }
 
     // --- ADR-087 per-key cooldown cells ---------------------------------------
@@ -825,12 +1055,12 @@ mod tests {
     #[test]
     fn health_tracker_gates_known_and_passes_unknown() {
         let h = HealthTracker::new(["openai"]);
-        assert!(h.is_available("openai"));
-        assert!(h.is_available("unknown")); // no breaker -> available
+        assert!(h.is_available(GLOBAL_OWNER, "openai"));
+        assert!(h.is_available(GLOBAL_OWNER, "unknown")); // no breaker -> available
         for _ in 0..5 {
-            h.record_failure("openai");
+            h.record_failure(GLOBAL_OWNER, "openai");
         }
-        assert!(!h.is_available("openai"));
+        assert!(!h.is_available(GLOBAL_OWNER, "openai"));
     }
 
     #[test]
@@ -845,28 +1075,31 @@ mod tests {
         let c = clock.clone();
         // failure_threshold=2, success_threshold=3, cooldown=100ms.
         h.set_breaker_for_test(
+            GLOBAL_OWNER,
             "openai",
             CircuitBreaker::with_clock(2, 3, 100, Box::new(move || c.load(Ordering::Relaxed))),
         );
 
         // Trip Open — refused regardless of load.
-        h.record_failure("openai");
-        h.record_failure("openai");
-        assert!(!h.is_available("openai"));
+        h.record_failure(GLOBAL_OWNER, "openai");
+        h.record_failure(GLOBAL_OWNER, "openai");
+        assert!(!h.is_available(GLOBAL_OWNER, "openai"));
 
         // Cooldown elapses → HalfOpen. The probe cap now reuses the live in-flight
         // gauge as the trial counter: admit up to success_threshold (3) concurrent
         // trials, then fail excess arrivals over.
         clock.store(200, Ordering::Relaxed);
-        let g1 = h.enter_in_flight("openai").unwrap();
-        let g2 = h.enter_in_flight("openai").unwrap();
-        assert_eq!(h.in_flight("openai"), 2);
-        assert!(h.is_available("openai")); // 2 trials in flight < 3 → still admits
-        let g3 = h.enter_in_flight("openai").unwrap();
-        assert_eq!(h.in_flight("openai"), 3);
-        assert!(!h.is_available("openai")); // 3 in flight → cap saturated, fail over
+        let g1 = h.enter_in_flight(GLOBAL_OWNER, "openai").unwrap();
+        let g2 = h.enter_in_flight(GLOBAL_OWNER, "openai").unwrap();
+        assert_eq!(h.in_flight(GLOBAL_OWNER, "openai"), 2);
+        // 2 trials in flight < 3 → still admits
+        assert!(h.is_available(GLOBAL_OWNER, "openai"));
+        let g3 = h.enter_in_flight(GLOBAL_OWNER, "openai").unwrap();
+        assert_eq!(h.in_flight(GLOBAL_OWNER, "openai"), 3);
+        // 3 in flight → cap saturated, fail over
+        assert!(!h.is_available(GLOBAL_OWNER, "openai"));
         drop(g3); // a trial completes → a probe slot frees up
-        assert!(h.is_available("openai"));
+        assert!(h.is_available(GLOBAL_OWNER, "openai"));
         drop(g1);
         drop(g2);
     }
@@ -880,31 +1113,32 @@ mod tests {
         let c = clock.clone();
         // failure_threshold=2, success_threshold=2, cooldown=100ms.
         h.set_breaker_for_test(
+            GLOBAL_OWNER,
             "openai",
             CircuitBreaker::with_clock(2, 2, 100, Box::new(move || c.load(Ordering::Relaxed))),
         );
 
         // Closed: admits unconditionally (probe cap is half-open-only).
-        match h.try_enter_probe("openai") {
+        match h.try_enter_probe(GLOBAL_OWNER, "openai") {
             ProbeAdmission::Admitted(g) => {
-                assert_eq!(h.in_flight("openai"), 1);
+                assert_eq!(h.in_flight(GLOBAL_OWNER, "openai"), 1);
                 drop(g);
-                assert_eq!(h.in_flight("openai"), 0);
+                assert_eq!(h.in_flight(GLOBAL_OWNER, "openai"), 0);
             }
             _ => panic!("Closed breaker must admit"),
         }
 
         // Unknown provider: Untracked (fail-open), no gauge touched.
         assert!(matches!(
-            h.try_enter_probe("unknown"),
+            h.try_enter_probe(GLOBAL_OWNER, "unknown"),
             ProbeAdmission::Untracked
         ));
 
         // Trip Open — every probe refused.
-        h.record_failure("openai");
-        h.record_failure("openai");
+        h.record_failure(GLOBAL_OWNER, "openai");
+        h.record_failure(GLOBAL_OWNER, "openai");
         assert!(matches!(
-            h.try_enter_probe("openai"),
+            h.try_enter_probe(GLOBAL_OWNER, "openai"),
             ProbeAdmission::Rejected
         ));
 
@@ -912,57 +1146,58 @@ mod tests {
         // success_threshold (2) trials — reservation is ATOMIC with the check, so
         // unlike the soft `is_available` gate there is no check→dispatch overshoot.
         clock.store(200, Ordering::Relaxed);
-        let p1 = match h.try_enter_probe("openai") {
+        let p1 = match h.try_enter_probe(GLOBAL_OWNER, "openai") {
             ProbeAdmission::Admitted(g) => g,
             _ => panic!("1st half-open probe must be admitted"),
         };
-        let p2 = match h.try_enter_probe("openai") {
+        let p2 = match h.try_enter_probe(GLOBAL_OWNER, "openai") {
             ProbeAdmission::Admitted(g) => g,
             _ => panic!("2nd half-open probe must be admitted"),
         };
-        assert_eq!(h.in_flight("openai"), 2);
+        assert_eq!(h.in_flight(GLOBAL_OWNER, "openai"), 2);
         // 3rd probe: cap saturated → Rejected, and the gauge did NOT increment
         // (the CAS never fired) — proving the reservation is hard, not soft.
         assert!(matches!(
-            h.try_enter_probe("openai"),
+            h.try_enter_probe(GLOBAL_OWNER, "openai"),
             ProbeAdmission::Rejected
         ));
-        assert_eq!(h.in_flight("openai"), 2);
+        assert_eq!(h.in_flight(GLOBAL_OWNER, "openai"), 2);
         // A trial completes → a permit frees → the next probe is admitted again.
         drop(p2);
-        assert_eq!(h.in_flight("openai"), 1);
-        let p3 = match h.try_enter_probe("openai") {
+        assert_eq!(h.in_flight(GLOBAL_OWNER, "openai"), 1);
+        let p3 = match h.try_enter_probe(GLOBAL_OWNER, "openai") {
             ProbeAdmission::Admitted(g) => g,
             _ => panic!("probe must be admitted after a permit frees"),
         };
-        assert_eq!(h.in_flight("openai"), 2);
+        assert_eq!(h.in_flight(GLOBAL_OWNER, "openai"), 2);
         drop(p1);
         drop(p3);
-        assert_eq!(h.in_flight("openai"), 0);
+        assert_eq!(h.in_flight(GLOBAL_OWNER, "openai"), 0);
     }
 
     #[test]
     fn latency_unset_until_first_sample_then_seeds() {
         let h = HealthTracker::new(["openai"]);
-        assert_eq!(h.latency_ms("openai"), None);
-        h.record_latency("openai", 100);
-        assert_eq!(h.latency_ms("openai"), Some(100)); // first sample seeds EWMA
+        assert_eq!(h.latency_ms(GLOBAL_OWNER, "openai"), None);
+        h.record_latency(GLOBAL_OWNER, "openai", 100);
+        // first sample seeds EWMA
+        assert_eq!(h.latency_ms(GLOBAL_OWNER, "openai"), Some(100));
     }
 
     #[test]
     fn latency_ewma_smooths_toward_new_samples() {
         let h = HealthTracker::new(["openai"]);
-        h.record_latency("openai", 100); // seed = 100
-        h.record_latency("openai", 200); // 0.2*200 + 0.8*100 = 120
-        assert_eq!(h.latency_ms("openai"), Some(120));
-        h.record_latency("openai", 200); // 0.2*200 + 0.8*120 = 136
-        assert_eq!(h.latency_ms("openai"), Some(136));
+        h.record_latency(GLOBAL_OWNER, "openai", 100); // seed = 100
+        h.record_latency(GLOBAL_OWNER, "openai", 200); // 0.2*200 + 0.8*100 = 120
+        assert_eq!(h.latency_ms(GLOBAL_OWNER, "openai"), Some(120));
+        h.record_latency(GLOBAL_OWNER, "openai", 200); // 0.2*200 + 0.8*120 = 136
+        assert_eq!(h.latency_ms(GLOBAL_OWNER, "openai"), Some(136));
     }
 
     #[test]
     fn latency_unknown_provider_is_ignored_and_none() {
         let h = HealthTracker::new(["openai"]);
-        h.record_latency("unknown", 500); // no-op
-        assert_eq!(h.latency_ms("unknown"), None);
+        h.record_latency(GLOBAL_OWNER, "unknown", 500); // no-op
+        assert_eq!(h.latency_ms(GLOBAL_OWNER, "unknown"), None);
     }
 }

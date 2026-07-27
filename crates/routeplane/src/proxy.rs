@@ -599,18 +599,27 @@ impl AppState {
         }
     }
 
-    /// Resolve a provider adapter by name: the built-in registry FIRST (a
-    /// custom provider can never shadow a built-in name — rejected at
+    /// Resolve a provider adapter by name FOR ONE TENANT: the built-in registry
+    /// FIRST (a custom provider can never shadow a built-in name — rejected at
     /// registration and enforced again by this ordering), then the runtime
-    /// custom registry (one lock-free `ArcSwap::load` + `HashMap` probe; an
-    /// empty registry is an instant miss ⇒ byte-identical). Returns an OWNED
-    /// `Arc` clone — one refcount bump per attempt, the cost of supporting
-    /// dynamically-registered adapters whose lifetime is not `&self`'s.
-    pub(crate) fn resolve_provider(&self, name: &str) -> Option<Arc<dyn Provider>> {
+    /// custom registry, owner-scoped tenant-first→operator-global (one
+    /// lock-free `ArcSwap::load` + `HashMap` probe; an empty registry is an
+    /// instant miss ⇒ byte-identical). `tenant_id` must be the AUTHENTICATED
+    /// tenant (`tenant_ctx.tenant_id`), never request material — the provider
+    /// NAME is request-influenced free text, and resolving it without the
+    /// tenant dimension is exactly the confused-deputy the owner keying closes.
+    /// Returns an OWNED `Arc` clone — one refcount bump per attempt, the cost
+    /// of supporting dynamically-registered adapters whose lifetime is not
+    /// `&self`'s.
+    pub(crate) fn resolve_provider(
+        &self,
+        tenant_id: &str,
+        name: &str,
+    ) -> Option<Arc<dyn Provider>> {
         if let Some(p) = self.providers.get(name) {
             return Some(p.clone());
         }
-        self.custom_providers.adapter(name)
+        self.custom_providers.adapter(tenant_id, name)
     }
 
     /// Record a usage event to the in-memory observability ring AND fan it to the
@@ -1215,6 +1224,7 @@ fn semantic_embed_model() -> String {
 /// engaged for region-locked / classification-positive requests).
 async fn embed_for_semantic_cache(
     state: &AppState,
+    tenant_id: &str,
     virtual_key: &VirtualKey,
     chain: &[String],
     embed_model: &str,
@@ -1224,17 +1234,19 @@ async fn embed_for_semantic_cache(
     use routeplane_types::{EmbeddingInput, EmbeddingRequest};
     for provider_name in chain {
         // Built-in registry first, then the runtime custom registry (a custom
-        // OpenAI-compatible endpoint may serve /v1/embeddings too).
-        let Some(provider) = state.resolve_provider(provider_name.as_str()) else {
+        // OpenAI-compatible endpoint may serve /v1/embeddings too) — owner-scoped.
+        let Some(provider) = state.resolve_provider(tenant_id, provider_name.as_str()) else {
             continue;
         };
-        if !state.health.is_available(provider_name) {
+        // Health scope mirrors adapter scope — the same tenant expression as
+        // the `resolve_provider` call above.
+        if !state.health.is_available(tenant_id, provider_name) {
             continue;
         }
         // Key precedence: the virtual key's `provider_keys` entry (if one is
         // authored for this name), else the custom provider's registered key.
         let Some(api_key) = resolve_api_key(virtual_key, provider_name)
-            .or_else(|| state.custom_providers.api_key(provider_name))
+            .or_else(|| state.custom_providers.api_key(tenant_id, provider_name))
         else {
             continue;
         };
@@ -2866,7 +2878,7 @@ async fn chat_completions_pipeline(
                 // the registry is empty ⇒ byte-identical legacy default.
                 None => match state
                     .custom_providers
-                    .provider_for_model(&payload.model)
+                    .provider_for_model(&tenant_ctx.tenant_id, &payload.model)
                     .filter(|_| !crate::models_api::is_builtin_model(&payload.model))
                 {
                     Some(custom) => vec![default_target_plan(&custom)],
@@ -3290,6 +3302,7 @@ async fn chat_completions_pipeline(
         let chain: Vec<String> = ordered_chain_for_embedding(&flat_targets);
         if let Some(embedding) = embed_for_semantic_cache(
             &state,
+            &tenant_ctx.tenant_id,
             &virtual_key,
             &chain,
             embed_model,
@@ -3531,9 +3544,12 @@ async fn chat_completions_pipeline(
             cost: t.cost,
         })
         .collect();
-    let ordered_names = state
-        .router
-        .order_candidates_with_specs(&specs, strategy, &state.health);
+    let ordered_names = state.router.order_candidates_with_specs(
+        &tenant_ctx.tenant_id,
+        &specs,
+        strategy,
+        &state.health,
+    );
     let ordered_targets = reorder_targets(attempt_targets, &ordered_names);
     tracing::info!(
         "Routing strategy={:?} sovereign={} -> attempt_order={:?}",
@@ -3736,9 +3752,12 @@ async fn chat_completions_pipeline(
         .enumerate()
         .filter_map(|(idx, target)| {
             // Built-in registry OR the runtime custom registry (lock-free probe,
-            // only reached when the built-in map misses).
+            // only reached when the built-in map misses; owner-scoped —
+            // tenant-first, then operator-global).
             if !registry.contains_key(target.provider.as_str())
-                && !state.custom_providers.contains(target.provider.as_str())
+                && !state
+                    .custom_providers
+                    .contains(&tenant_ctx.tenant_id, target.provider.as_str())
             {
                 last_error = format!("Unsupported provider: {}", target.provider);
                 return None;
@@ -3750,13 +3769,13 @@ async fn chat_completions_pipeline(
                 match virtual_key.provider_keys.get(target.provider.as_str()) {
                     Some(value) if is_key_pool(value) => {
                         let mut rng = PolicyRng::seeded(target_rng_seed(request_seed, idx));
-                        let tenant = virtual_key
-                            .tenant_id
-                            .as_deref()
-                            .unwrap_or(&virtual_key.name);
+                        // ONE tenant expression per loop — the same
+                        // `tenant_ctx.tenant_id` the health/breaker calls and
+                        // `resolve_provider` use (auth.rs resolves it from the
+                        // key, so it equals the old vk-derived form).
                         order_pool_keys(
                             resolve_pool(value),
-                            tenant,
+                            &tenant_ctx.tenant_id,
                             &target.provider,
                             &state.health,
                             now_ms,
@@ -3771,7 +3790,11 @@ async fn chat_completions_pipeline(
                     // `provider_keys` entry for the same name wins — the
                     // documented per-key override).
                     _ => resolve_api_key(&virtual_key, &target.provider)
-                        .or_else(|| state.custom_providers.api_key(&target.provider))
+                        .or_else(|| {
+                            state
+                                .custom_providers
+                                .api_key(&tenant_ctx.tenant_id, &target.provider)
+                        })
                         .map(|key| vec![(None, key)])
                         .unwrap_or_default(),
                 };
@@ -3820,6 +3843,7 @@ async fn chat_completions_pipeline(
                 let mut pool_health_failure = false;
                 for (key_index, api_key) in &rt.keys {
                     match attempt_target(
+                        &tenant_ctx.tenant_id,
                         &state,
                         rt.target,
                         &rt.shaped,
@@ -3858,15 +3882,19 @@ async fn chat_completions_pipeline(
                     }
                 }
                 // The pool for this target is exhausted (no key won). Record the
-                // single provider-level failure now (pool targets only).
+                // single provider-level failure now (pool targets only), scoped
+                // by the same tenant the adapter was resolved under.
                 if is_pool && pool_health_failure {
-                    state.health.record_failure(&rt.target.provider);
+                    state
+                        .health
+                        .record_failure(&tenant_ctx.tenant_id, &rt.target.provider);
                 }
             }
             won
         }
         Some(hedge) => {
             run_hedged_targets(
+                &tenant_ctx.tenant_id,
                 &state,
                 &ready
                     .iter()
@@ -3896,7 +3924,8 @@ async fn chat_completions_pipeline(
         // have swapped the registry mid-flight) instead of `expect()`ing: the
         // adapter here is only consulted for its residency claim, so a miss
         // degrades to "no region", never a panic on the request thread.
-        let provider: Option<Arc<dyn Provider>> = state.resolve_provider(provider_name.as_str());
+        let provider: Option<Arc<dyn Provider>> =
+            state.resolve_provider(&tenant_ctx.tenant_id, provider_name.as_str());
         {
             {
                 for choice in response.choices.iter_mut() {
@@ -4608,6 +4637,11 @@ fn upstream_client_status(e: &ProviderError) -> Option<u16> {
 /// attempts never share mutable state — the hot path stays lock-free.
 #[allow(clippy::too_many_arguments)]
 async fn attempt_target(
+    // The AUTHENTICATED tenant (`tenant_ctx.tenant_id`) — the scope key for
+    // adapter resolution AND every health/breaker/cooldown call in this loop,
+    // so adapter scope and health scope can never diverge (the breaker follows
+    // the adapter).
+    tenant_id: &str,
     state: &AppState,
     target: &TargetPlan,
     shaped: &ChatCompletionRequest,
@@ -4625,19 +4659,20 @@ async fn attempt_target(
     key_index: Option<usize>,
 ) -> TargetOutcome {
     let provider_name = &target.provider;
-    // Built-in first, then the runtime custom registry (lock-free). Owned Arc
-    // (one refcount bump per attempt) so a concurrently-deleted custom adapter
-    // stays alive for the duration of this in-flight attempt.
-    let provider: Arc<dyn Provider> = match state.resolve_provider(provider_name.as_str()) {
-        Some(p) => p,
-        None => {
-            return TargetOutcome::Exhausted {
-                last_error: format!("Unsupported provider: {provider_name}"),
-                health_failure: false,
-                terminal_client_status: None,
+    // Built-in first, then the runtime custom registry (lock-free, owner-scoped).
+    // Owned Arc (one refcount bump per attempt) so a concurrently-deleted custom
+    // adapter stays alive for the duration of this in-flight attempt.
+    let provider: Arc<dyn Provider> =
+        match state.resolve_provider(tenant_id, provider_name.as_str()) {
+            Some(p) => p,
+            None => {
+                return TargetOutcome::Exhausted {
+                    last_error: format!("Unsupported provider: {provider_name}"),
+                    health_failure: false,
+                    terminal_client_status: None,
+                }
             }
-        }
-    };
+        };
     let max_retries = target.retry.attempts;
     let mut attempt: u32 = 0;
     let mut retry_after_hint: Option<Duration> = None;
@@ -4663,8 +4698,12 @@ async fn attempt_target(
             }
         }
 
-        // Re-check the breaker before each (re)try (ADR-021 §4).
-        if !state.health.is_available(provider_name) {
+        // Re-check the breaker before each (re)try (ADR-021 §4). The health
+        // scope is `tenant_id` — the SAME tenant `resolve_provider` used above,
+        // so the breaker consulted is the one bound to the adapter that will be
+        // dispatched (tenant cell for a tenant custom provider, the
+        // GLOBAL_OWNER fallback for a built-in/operator-global one).
+        if !state.health.is_available(tenant_id, provider_name) {
             tracing::warn!("Skipping {} — circuit breaker is OPEN", provider_name);
             return TargetOutcome::Exhausted {
                 last_error: format!("circuit breaker open for {provider_name}"),
@@ -4703,7 +4742,7 @@ async fn attempt_target(
         // decrements on Drop — which fires when `result` is bound below, on
         // cancellation (a hedge loser dropped mid-flight), or on unwind — so it is
         // held across the whole provider round-trip.
-        let _in_flight = match state.health.try_enter_probe(provider_name) {
+        let _in_flight = match state.health.try_enter_probe(tenant_id, provider_name) {
             ProbeAdmission::Admitted(g) => Some(g),
             // Unknown-to-health provider (no gauge): proceed untracked, exactly as
             // before the gauge existed (fail-open, byte-identical).
@@ -4738,15 +4777,17 @@ async fn attempt_target(
 
         match result {
             Ok(response) => {
-                state.health.record_latency(provider_name, elapsed_ms);
-                state.health.record_success(provider_name);
+                state
+                    .health
+                    .record_latency(tenant_id, provider_name, elapsed_ms);
+                state.health.record_success(tenant_id, provider_name);
                 // ADR-087: this pool key demonstrably works — clear any cooldown.
+                // `tenant_id` is the resolved tenant (`tenant_id ?? key name`) —
+                // the same value the previous vk-derived expression produced, and
+                // the same scope the breaker calls above use (one tenant
+                // expression per loop, so breaker and cooldown can never diverge).
                 if let Some(pool_idx) = key_index {
-                    let tenant = virtual_key
-                        .tenant_id
-                        .as_deref()
-                        .unwrap_or(&virtual_key.name);
-                    state.health.clear_key(tenant, provider_name, pool_idx);
+                    state.health.clear_key(tenant_id, provider_name, pool_idx);
                 }
                 return TargetOutcome::Won {
                     response: Box::new(response),
@@ -4764,7 +4805,9 @@ async fn attempt_target(
                 // `latency` strategy stops preferring a timing-out provider. Without
                 // this the EWMA stayed stale-fast and re-selected the dead provider
                 // every request until the breaker opened (and again each half-open).
-                state.health.record_latency(provider_name, elapsed_ms);
+                state
+                    .health
+                    .record_latency(tenant_id, provider_name, elapsed_ms);
                 // F12 (ADR-021 A1): a 429 is the caller's throttle, not provider
                 // health — do not trip the breaker on it.
                 let health_failure = counts_as_health_failure(&e);
@@ -4776,19 +4819,16 @@ async fn attempt_target(
                 // single-key value (`None`) keeps the legacy per-attempt breaker
                 // feed — byte-identical.
                 if key_index.is_none() && health_failure {
-                    state.health.record_failure(provider_name);
+                    state.health.record_failure(tenant_id, provider_name);
                 }
                 // ADR-087: cool THIS pool key by error class (429 → Retry-After/20s,
                 // 401/403 → dead-key 10m, 5xx/timeout → 2s; a 4xx bad-request never
                 // cools a healthy key). Extend-only, so the failover walk skips it.
+                // Same `tenant_id` scope as the breaker calls above.
                 if let Some(pool_idx) = key_index {
                     if let Some(cool_ms) = key_cooldown_for_error(&e) {
-                        let tenant = virtual_key
-                            .tenant_id
-                            .as_deref()
-                            .unwrap_or(&virtual_key.name);
                         state.health.cool_key(
-                            tenant,
+                            tenant_id,
                             provider_name,
                             pool_idx,
                             unix_millis() + cool_ms,
@@ -4867,6 +4907,10 @@ fn target_rng_seed(base: u64, idx: usize) -> u64 {
 /// `x-routeplane-hedged` marker.
 #[allow(clippy::too_many_arguments)]
 async fn run_hedged_targets(
+    // The AUTHENTICATED tenant — threaded into every hedged `attempt_target`
+    // so concurrent hedges score health under the same scope as the sequential
+    // path (the breaker follows the adapter).
+    tenant_id: &str,
     state: &Arc<AppState>,
     ready: &[(usize, &TargetPlan, &ChatCompletionRequest, &str)],
     deadline: Deadline,
@@ -4922,6 +4966,7 @@ async fn run_hedged_targets(
             let was_hedge = $was_hedge;
             in_flight.push(Box::pin(async move {
                 let outcome = attempt_target(
+                    tenant_id,
                     &state,
                     &target,
                     &shaped,
@@ -5263,16 +5308,17 @@ async fn stream_chat_completions(
     let now_ms = unix_millis();
     for (target_idx, target) in targets.iter().enumerate() {
         let provider_name = &target.provider;
-        // Built-in first, then the runtime custom registry (lock-free). Owned
-        // Arc so a concurrently-deleted custom adapter stays alive while this
-        // stream is being established.
-        let provider: Arc<dyn Provider> = match state.resolve_provider(provider_name.as_str()) {
-            Some(p) => p,
-            None => {
-                last_error = format!("Unsupported provider: {provider_name}");
-                continue;
-            }
-        };
+        // Built-in first, then the runtime custom registry (lock-free,
+        // owner-scoped). Owned Arc so a concurrently-deleted custom adapter
+        // stays alive while this stream is being established.
+        let provider: Arc<dyn Provider> =
+            match state.resolve_provider(&tenant_ctx.tenant_id, provider_name.as_str()) {
+                Some(p) => p,
+                None => {
+                    last_error = format!("Unsupported provider: {provider_name}");
+                    continue;
+                }
+            };
         // ADR-087 multi-account: build this target's ORDERED key list — the
         // streaming parity of the buffered attempt loop. A single value is one
         // `(None, key)` entry (byte-identical to the pre-pool single resolve); a
@@ -5283,10 +5329,13 @@ async fn stream_chat_completions(
         // named `A,env:B` (→ None → "not configured"), and a literal pool was sent
         // whole as the bearer key (→ provider 401) — so every `stream:true`
         // request for a pooled provider hard-failed (Finding 1 / ADR-087 §4).
-        let tenant = virtual_key
-            .tenant_id
-            .as_deref()
-            .unwrap_or(&virtual_key.name);
+        // ONE tenant expression for every scoped call in this loop — breaker,
+        // EWMA, probe gauge, and per-key cooldowns all use the same
+        // authenticated tenant `resolve_provider` above resolved the adapter
+        // under, so scope can never diverge inside the loop. (auth.rs resolves
+        // `tenant_ctx.tenant_id` from the key — `tenant_id ?? name` — so this
+        // equals the vk-derived expression the cooldown calls used before.)
+        let tenant = tenant_ctx.tenant_id.as_str();
         let key_value = virtual_key.provider_keys.get(provider_name.as_str());
         let target_is_pool = matches!(key_value, Some(v) if is_key_pool(v));
         let keys: Vec<(Option<usize>, String)> = match key_value {
@@ -5308,7 +5357,7 @@ async fn stream_chat_completions(
             // registered upstream key (an authored `provider_keys` entry for
             // the same name wins), identical to the buffered path.
             _ => resolve_api_key(&virtual_key, provider_name)
-                .or_else(|| state.custom_providers.api_key(provider_name))
+                .or_else(|| state.custom_providers.api_key(tenant, provider_name))
                 .map(|key| vec![(None, key)])
                 .unwrap_or_default(),
         };
@@ -5349,7 +5398,7 @@ async fn stream_chat_completions(
                         tokio::time::sleep(delay).await;
                     }
                 }
-                if !state.health.is_available(provider_name) {
+                if !state.health.is_available(tenant, provider_name) {
                     tracing::warn!("Skipping {} — circuit breaker is OPEN", provider_name);
                     last_error = format!("circuit breaker open for {provider_name}");
                     break;
@@ -5382,7 +5431,7 @@ async fn stream_chat_completions(
                 // permit are reserved atomically (no check→dispatch overshoot past
                 // the `is_available` pre-check above). Held until the first chunk is
                 // in hand (or the attempt fails/times out); drops on every arm below.
-                let _in_flight = match state.health.try_enter_probe(provider_name) {
+                let _in_flight = match state.health.try_enter_probe(tenant, provider_name) {
                     ProbeAdmission::Admitted(g) => Some(g),
                     ProbeAdmission::Untracked => None,
                     // Cap saturated: shed this trial and fail over, mirroring the
@@ -5409,9 +5458,11 @@ async fn stream_chat_completions(
                         // contract as the buffered attempt + sibling endpoints):
                         // fold the elapsed establish time in so a slow/failing
                         // provider is de-preferred by the `latency` strategy.
-                        state
-                            .health
-                            .record_latency(provider_name, started.elapsed().as_millis() as u64);
+                        state.health.record_latency(
+                            tenant,
+                            provider_name,
+                            started.elapsed().as_millis() as u64,
+                        );
                         // F12 (ADR-021 A1): a 429 is the caller's key/quota throttle,
                         // not provider health — do not trip the breaker on it.
                         let health_failure = counts_as_health_failure(&e);
@@ -5431,7 +5482,7 @@ async fn stream_chat_completions(
                                 );
                             }
                         } else if health_failure {
-                            state.health.record_failure(provider_name);
+                            state.health.record_failure(tenant, provider_name);
                         }
                         last_error = e.to_string();
                         // Sticky client-4xx (see the buffered path).
@@ -5483,9 +5534,11 @@ async fn stream_chat_completions(
                         // the `latency` strategy stops preferring this provider on
                         // the next request. Recorded before the breaker feed, matching
                         // the buffered attempt loop + sibling endpoints.
-                        state
-                            .health
-                            .record_latency(provider_name, started.elapsed().as_millis() as u64);
+                        state.health.record_latency(
+                            tenant,
+                            provider_name,
+                            started.elapsed().as_millis() as u64,
+                        );
                         // A stream-establishment timeout is a real health fault. ADR-087
                         // §4: for a POOL key, cool it (transient) and defer the provider
                         // failure to pool exhaustion; a single-key value trips the
@@ -5499,7 +5552,7 @@ async fn stream_chat_completions(
                                 unix_millis() + key_cooldown_ms(Some(500), None),
                             );
                         } else {
-                            state.health.record_failure(provider_name);
+                            state.health.record_failure(tenant, provider_name);
                         }
                         last_error = format!(
                             "provider {} timed out establishing stream after {}ms",
@@ -5549,18 +5602,20 @@ async fn stream_chat_completions(
             Some(x) => x,
             None => {
                 // ADR-087 §4: the pool for this target is exhausted (no key could
-                // establish a stream) — feed the shared breaker exactly once here
+                // establish a stream) — feed the breaker exactly once here
                 // (pool targets only; a single-key value already fed it above).
                 if target_is_pool && pool_health_failure {
-                    state.health.record_failure(provider_name);
+                    state.health.record_failure(tenant, provider_name);
                 }
                 continue; // → next candidate target
             }
         };
 
         // First chunk in hand → committed. Record success + ttfc latency.
-        state.health.record_latency(provider_name, elapsed_ms);
-        state.health.record_success(provider_name);
+        state
+            .health
+            .record_latency(tenant, provider_name, elapsed_ms);
+        state.health.record_success(tenant, provider_name);
         tracing::info!(
             "Stream established with {} (ttfc={}ms)",
             provider_name,
@@ -8862,8 +8917,9 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(state.health.in_flight("err"), 0);
+        assert_eq!(state.health.in_flight("t_test", "err"), 0);
         let outcome = attempt_target(
+            "t_test",
             &state,
             &target,
             &req,
@@ -8880,8 +8936,10 @@ mod tests {
         .await;
         assert!(matches!(outcome, TargetOutcome::Exhausted { .. }));
         // The RAII guard decremented on the error/early-return path: balanced.
+        // (The "err" provider was registered at construction, i.e. under
+        // GLOBAL_OWNER, so the "t_test" probe falls through to the same cell.)
         assert_eq!(
-            state.health.in_flight("err"),
+            state.health.in_flight("t_test", "err"),
             0,
             "in-flight gauge must return to 0 after a failed attempt"
         );
@@ -8896,7 +8954,7 @@ mod tests {
         // attempt moves the EWMA from unset to a real sample.
         let state = in_flight_state("err");
         assert_eq!(
-            state.health.latency_ms("err"),
+            state.health.latency_ms("t_test", "err"),
             None,
             "EWMA is unset before any attempt"
         );
@@ -8935,6 +8993,7 @@ mod tests {
         };
 
         let outcome = attempt_target(
+            "t_test",
             &state,
             &target,
             &req,
@@ -8954,7 +9013,7 @@ mod tests {
         // near-instantly, so any `Some` value proves the failure was recorded —
         // pre-fix this stayed `None`).
         assert!(
-            state.health.latency_ms("err").is_some(),
+            state.health.latency_ms("t_test", "err").is_some(),
             "latency EWMA must be fed on a FAILED attempt, not only on success"
         );
     }

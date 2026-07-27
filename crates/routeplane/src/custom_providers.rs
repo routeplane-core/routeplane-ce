@@ -41,6 +41,17 @@ use std::sync::Arc;
 /// NO `Debug` derive — `api_key` is a secret and must never ride a `{:?}`.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CustomProviderConfig {
+    /// Owning tenant — the isolation dimension of the registry key.
+    ///
+    /// `Some(t)` — created by tenant `t` through the admin API; usable ONLY by
+    /// `t`. `None` — an operator-global provider declared in the boot file of a
+    /// self-host deployment, where one operator owns the whole registry and
+    /// sharing it is the point.
+    ///
+    /// Absent in existing files ⇒ `None` ⇒ the previous global behaviour, so an
+    /// existing self-host `providers.json` keeps working unchanged.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
     /// Registry key + the `x-routeplane-provider` routing name
     /// (`^[a-z0-9_-]{1,64}$`; built-in names are rejected at registration).
     pub name: String,
@@ -328,20 +339,48 @@ pub struct CustomProviderEntry {
 /// An immutable snapshot of the runtime registry. Swapped whole on mutation.
 #[derive(Default)]
 pub struct RuntimeProviders {
-    by_name: HashMap<String, Arc<CustomProviderEntry>>,
-    /// model id → provider name, for header-less model-based routing. When two
-    /// custom providers claim the same model id, the lexicographically-first
-    /// provider NAME wins (deterministic across restarts).
-    model_index: HashMap<String, String>,
+    /// `(owner, name)` — owner is the tenant id, or `""` for an operator-global
+    /// provider. Keyed by owner because a bare name let ANY authenticated tenant
+    /// name another tenant's provider and be dispatched to that tenant's
+    /// upstream ON THAT TENANT'S API KEY (confused deputy + credential and
+    /// billing theft), and let an upsert on the same name overwrite or delete
+    /// it.
+    by_name: HashMap<(String, String), Arc<CustomProviderEntry>>,
+    /// `(owner, model id)` → provider name, for header-less model-based routing.
+    /// Owner-scoped for the same reason: without it, merely sending a `model`
+    /// string another tenant registered was enough to reach their upstream —
+    /// no header required. When two of ONE owner's providers claim the same
+    /// model id, the lexicographically-first provider NAME wins (deterministic
+    /// across restarts).
+    model_index: HashMap<(String, String), String>,
+}
+
+/// The registry key for an operator-global provider (no owning tenant) — the
+/// single shared definition, imported from the router crate so the adapter
+/// registry and the health registry can never disagree on the sentinel.
+pub(crate) use routeplane_router::GLOBAL_OWNER;
+
+/// Owner key for a config: its tenant, or the global sentinel.
+fn owner_of(cfg: &CustomProviderConfig) -> String {
+    cfg.tenant_id
+        .clone()
+        .unwrap_or_else(|| GLOBAL_OWNER.to_string())
 }
 
 impl RuntimeProviders {
     fn build(configs: Vec<CustomProviderConfig>) -> Result<Self, String> {
-        let mut by_name: HashMap<String, Arc<CustomProviderEntry>> =
+        let mut by_name: HashMap<(String, String), Arc<CustomProviderEntry>> =
             HashMap::with_capacity(configs.len());
         for cfg in configs {
-            if by_name.contains_key(&cfg.name) {
-                return Err(format!("duplicate provider name '{}'", cfg.name));
+            // Per-OWNER uniqueness: two tenants may each register "myvllm".
+            // Global uniqueness would have made one tenant's chosen name deny
+            // the name to everyone else — a cross-tenant side channel of its own.
+            let key = (owner_of(&cfg), cfg.name.clone());
+            if by_name.contains_key(&key) {
+                return Err(format!(
+                    "duplicate provider name '{}' for the same owner",
+                    cfg.name
+                ));
             }
             // The adapter is the generic OpenAI-compatible SelfHostedProvider
             // pointed at this provider's base_url. No residency region: a
@@ -357,24 +396,28 @@ impl RuntimeProviders {
             };
             let adapter: Arc<dyn Provider> = Arc::new(self_hosted);
             by_name.insert(
-                cfg.name.clone(),
+                key,
                 Arc::new(CustomProviderEntry {
                     config: cfg,
                     adapter,
                 }),
             );
         }
-        // Deterministic model index: iterate providers in name order so a
-        // contested model id always resolves to the same provider.
-        let mut names: Vec<&String> = by_name.keys().collect();
+        // Deterministic model index: iterate providers in (owner, name) order so
+        // a contested model id always resolves to the same provider.
+        let mut names: Vec<&(String, String)> = by_name.keys().collect();
         names.sort_unstable();
-        let mut model_index: HashMap<String, String> = HashMap::new();
+        let mut model_index: HashMap<(String, String), String> = HashMap::new();
         for name in names {
-            if let Some(entry) = by_name.get(name.as_str()) {
+            if let Some(entry) = by_name.get(name) {
+                let (owner, provider_name) = name;
                 for model in &entry.config.models {
+                    // Owner-scoped: one tenant's model id must never index to
+                    // another tenant's provider, or a bare `model` string would
+                    // reach their upstream with no header at all.
                     model_index
-                        .entry(model.clone())
-                        .or_insert_with(|| name.to_string());
+                        .entry((owner.clone(), model.clone()))
+                        .or_insert_with(|| provider_name.clone());
                 }
             }
         }
@@ -455,64 +498,131 @@ impl CustomProviderStore {
 
     // ---- hot-path reads (one wait-free ArcSwap load + HashMap probe each) ----
 
-    /// The adapter for a custom provider, or `None`. The `Arc` clone is one
-    /// refcount bump; the adapter itself was built at registration time.
-    pub fn adapter(&self, name: &str) -> Option<Arc<dyn Provider>> {
-        self.shared
-            .load()
-            .by_name
-            .get(name)
-            .map(|e| e.adapter.clone())
+    /// Resolve `(tenant, name)`, falling back to an operator-global entry.
+    ///
+    /// Order is load-bearing: a tenant's OWN provider always wins, so an
+    /// operator-global name can never shadow or intercept one a customer
+    /// registered. The global fallback exists for self-host, where one operator
+    /// owns the boot file and sharing the registry is the point; tenant-owned
+    /// entries (created through the admin API) are never shared.
+    fn entry_for(&self, tenant_id: &str, name: &str) -> Option<Arc<CustomProviderEntry>> {
+        let snap = self.shared.load();
+        snap.by_name
+            .get(&(tenant_id.to_string(), name.to_string()))
+            .or_else(|| {
+                snap.by_name
+                    .get(&(GLOBAL_OWNER.to_string(), name.to_string()))
+            })
+            .cloned()
     }
 
-    /// The upstream API key for a custom provider (dispatch-only use). This is
-    /// the ONLY raw-key read accessor; callers must never log or echo it.
-    pub fn api_key(&self, name: &str) -> Option<String> {
-        self.shared
-            .load()
-            .by_name
-            .get(name)
+    /// The adapter for one tenant's custom provider, or `None`. The `Arc` clone
+    /// is one refcount bump; the adapter itself was built at registration time.
+    pub fn adapter(&self, tenant_id: &str, name: &str) -> Option<Arc<dyn Provider>> {
+        self.entry_for(tenant_id, name).map(|e| e.adapter.clone())
+    }
+
+    /// The upstream API key for one tenant's custom provider (dispatch-only).
+    /// This is the ONLY raw-key read accessor; callers must never log or echo it.
+    ///
+    /// `tenant_id` MUST be the AUTHENTICATED tenant. Taking it from a request
+    /// field would restore the very confused-deputy this signature closes: the
+    /// bug was that any authenticated tenant naming another tenant's provider
+    /// was dispatched to that tenant's upstream on that tenant's key.
+    pub fn api_key(&self, tenant_id: &str, name: &str) -> Option<String> {
+        self.entry_for(tenant_id, name)
             .map(|e| e.config.api_key.clone())
     }
 
-    /// Is `name` a registered custom provider?
-    pub fn contains(&self, name: &str) -> bool {
-        self.shared.load().by_name.contains_key(name)
+    /// Is `name` a custom provider this tenant may use?
+    pub fn contains(&self, tenant_id: &str, name: &str) -> bool {
+        self.entry_for(tenant_id, name).is_some()
     }
 
-    /// The custom provider registered for `model`, if any (header-less
-    /// model-based routing). One load + probe; empty registry ⇒ instant miss.
-    pub fn provider_for_model(&self, model: &str) -> Option<String> {
-        self.shared.load().model_index.get(model).cloned()
+    /// The custom provider registered for `model` FOR THIS TENANT, if any
+    /// (header-less model-based routing). One load + probe; empty registry ⇒
+    /// instant miss.
+    ///
+    /// Owner-scoped because this path needs no header at all — merely sending a
+    /// `model` string another tenant had registered was enough to be routed to
+    /// their upstream.
+    pub fn provider_for_model(&self, tenant_id: &str, model: &str) -> Option<String> {
+        let snap = self.shared.load();
+        snap.model_index
+            .get(&(tenant_id.to_string(), model.to_string()))
+            .or_else(|| {
+                snap.model_index
+                    .get(&(GLOBAL_OWNER.to_string(), model.to_string()))
+            })
+            .cloned()
     }
 
     // ---- discovery / observability reads (admin surfaces, not the chat path) ----
 
-    /// Masked views of every provider, sorted by name.
-    pub fn list(&self) -> Vec<ProviderView> {
+    /// Masked views of the providers THIS TENANT may see, sorted by name: its
+    /// own, plus operator-global ones.
+    ///
+    /// Previously returned every tenant's providers, disclosing their names and
+    /// base URLs (an internal-endpoint map) to any authenticated caller.
+    pub fn list(&self, tenant_id: &str) -> Vec<ProviderView> {
         self.shared
             .load()
             .configs_sorted()
             .iter()
+            .filter(|c| match c.tenant_id.as_deref() {
+                Some(owner) => owner == tenant_id,
+                None => true, // operator-global
+            })
             .map(view_of)
             .collect()
     }
 
-    /// Sorted provider names (the `/status` provider-list fold).
-    pub fn names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.shared.load().by_name.keys().cloned().collect();
+    /// Sorted names of OPERATOR-GLOBAL providers only (`tenant_id: None`, the
+    /// self-host boot file) — the `/status` provider-list fold.
+    ///
+    /// Deliberately NOT all owners: `/status` is served with **no auth**, and a
+    /// tenant-registered provider name is customer-chosen free text
+    /// (`acme-bank-internal`), so surfacing it there is a public disclosure. A
+    /// per-tenant view belongs on the authed admin surface ([`Self::list`]),
+    /// never here.
+    pub fn global_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .shared
+            .load()
+            .by_name
+            .keys()
+            .filter(|(owner, _name)| owner == GLOBAL_OWNER)
+            .map(|(_owner, name)| name.clone())
+            .collect();
         names.sort_unstable();
         names
     }
 
-    /// `(model id, owning provider name)` pairs for the `/v1/models` fold,
-    /// sorted by model id (deterministic listing).
-    pub fn model_entries(&self) -> Vec<(String, String)> {
+    /// Every registered `(owner, name)` pair — the boot-time health replay.
+    /// Owner-preserving on purpose: a name-only projection that deduplicates
+    /// across owners would rebuild the shared-breaker defect at every restart by
+    /// collapsing two tenants' same-named providers back onto one health
+    /// registration.
+    pub fn owned_names(&self) -> Vec<(String, String)> {
+        self.shared.load().by_name.keys().cloned().collect()
+    }
+
+    /// `(model id, owning provider name)` pairs for THIS TENANT's `/v1/models`
+    /// fold, sorted by model id (deterministic listing): the tenant's own
+    /// models plus operator-global ones — the same visibility rule as
+    /// [`Self::list`].
+    ///
+    /// Owner-scoped for the same reason as `list()`: an unscoped fold would
+    /// disclose every tenant's custom model ids to any authenticated caller
+    /// (confirmable one at a time via `GET /v1/models/{id}`) — ids the caller
+    /// could not even dispatch to, since routing is owner-scoped.
+    pub fn model_entries(&self, tenant_id: &str) -> Vec<(String, String)> {
         let snapshot = self.shared.load();
         let mut entries: Vec<(String, String)> = snapshot
             .model_index
             .iter()
-            .map(|(m, p)| (m.clone(), p.clone()))
+            .filter(|((owner, _m), _p)| owner == tenant_id || owner == GLOBAL_OWNER)
+            .map(|((_owner, m), p)| (m.clone(), p.clone()))
             .collect();
         entries.sort();
         entries
@@ -532,17 +642,30 @@ impl CustomProviderStore {
 
     // ---- mutations (admin path ONLY; persist-then-swap) ----
 
-    /// Upsert a (pre-validated) provider: persist the new registry file
-    /// atomically FIRST, then swap the live snapshot — a reader never sees an
-    /// entry that is not durable. Returns the masked view + `true` if created
-    /// (vs updated). Errors never contain key material.
+    /// Upsert a (pre-validated) provider for ONE TENANT: persist the new
+    /// registry file atomically FIRST, then swap the live snapshot — a reader
+    /// never sees an entry that is not durable. Returns the masked view +
+    /// `true` if created (vs updated). Errors never contain key material.
+    ///
+    /// `tenant_id` is stamped onto the config, overriding whatever the request
+    /// body carried — a caller must not be able to declare itself the owner of
+    /// someone else's provider, nor create a global one. Matching is
+    /// owner-scoped, so an upsert can only ever touch the caller's own entry:
+    /// before this, an upsert on a bare NAME overwrote another tenant's
+    /// base_url and API key, or created a name that denied it to them.
     pub async fn upsert(
         &self,
+        tenant_id: &str,
         mut cfg: CustomProviderConfig,
     ) -> Result<(ProviderView, bool), String> {
         let _g = self.write_lock.lock().await;
+        // Server-side ownership: never trust a body-supplied tenant.
+        cfg.tenant_id = Some(tenant_id.to_string());
         let mut configs = self.shared.load().configs_sorted();
-        let created = match configs.iter_mut().find(|c| c.name == cfg.name) {
+        let created = match configs
+            .iter_mut()
+            .find(|c| c.name == cfg.name && c.tenant_id.as_deref() == Some(tenant_id))
+        {
             Some(existing) => {
                 // Preserve the original creation stamp on update.
                 cfg.created_at = existing.created_at.clone();
@@ -562,12 +685,18 @@ impl CustomProviderStore {
         Ok((view_of(&cfg), created))
     }
 
-    /// Remove a provider. `Ok(false)` when the name was not registered.
-    pub async fn remove(&self, name: &str) -> Result<bool, String> {
+    /// Remove ONE TENANT'S provider. `Ok(false)` when this tenant has no such
+    /// provider — including when another tenant does, which is deliberately
+    /// indistinguishable (no existence leak) and, more importantly, means a
+    /// tenant can no longer delete another tenant's upstream by name.
+    ///
+    /// An operator-global entry (`tenant_id: None`, boot file) is never removed
+    /// through this path; it is not the caller's to delete.
+    pub async fn remove(&self, tenant_id: &str, name: &str) -> Result<bool, String> {
         let _g = self.write_lock.lock().await;
         let mut configs = self.shared.load().configs_sorted();
         let before = configs.len();
-        configs.retain(|c| c.name != name);
+        configs.retain(|c| !(c.name == name && c.tenant_id.as_deref() == Some(tenant_id)));
         if configs.len() == before {
             return Ok(false);
         }
@@ -640,6 +769,7 @@ mod tests {
 
     fn cfg(name: &str, models: &[&str]) -> CustomProviderConfig {
         CustomProviderConfig {
+            tenant_id: None,
             name: name.into(),
             base_url: "http://vllm.internal:8000".into(),
             api_key: "sk-custom-abcdef1234".into(),
@@ -647,6 +777,121 @@ mod tests {
             stream_include_usage: None,
             created_at: None,
         }
+    }
+
+    /// A provider owned by `tenant`, with an owner-identifiable API key so a
+    /// cross-tenant leak is visible in the assertion rather than inferred.
+    fn owned_cfg(tenant: &str, name: &str, models: &[&str], key: &str) -> CustomProviderConfig {
+        let mut c = cfg(name, models);
+        c.tenant_id = Some(tenant.to_string());
+        c.api_key = key.to_string();
+        c
+    }
+
+    /// The confused-deputy this keying closes.
+    ///
+    /// Keyed on a bare provider NAME, any authenticated tenant naming another
+    /// tenant's provider was dispatched to that tenant's upstream ON THAT
+    /// TENANT'S API KEY. Confused deputy, credential theft and billing theft in
+    /// one lookup. This asserts every read surface is owner-scoped.
+    #[test]
+    fn one_tenant_can_never_reach_another_tenants_provider() {
+        let store = CustomProviderStore::ephemeral();
+        let next = RuntimeProviders::build(vec![
+            owned_cfg("t_victim", "myvllm", &["victim-model"], "sk-VICTIM-SECRET"),
+            owned_cfg(
+                "t_attacker",
+                "attacker-own",
+                &["attacker-model"],
+                "sk-ATTACKER",
+            ),
+        ])
+        .expect("registry builds");
+        store.shared.store(Arc::new(next));
+
+        // 1. Naming the victim's provider explicitly (the header path).
+        assert_eq!(
+            store.api_key("t_attacker", "myvllm"),
+            None,
+            "attacker must NOT receive the victim's upstream API key"
+        );
+        assert!(
+            store.adapter("t_attacker", "myvllm").is_none(),
+            "attacker must not resolve the victim's adapter (that is the dispatch)"
+        );
+        assert!(!store.contains("t_attacker", "myvllm"));
+
+        // 2. The header-LESS path: merely sending a model id the victim
+        //    registered was enough to be routed to their upstream.
+        assert_eq!(
+            store.provider_for_model("t_attacker", "victim-model"),
+            None,
+            "a victim-registered model id must not route the attacker to them"
+        );
+
+        // 3. The owner still works — this must be isolation, not breakage.
+        assert_eq!(
+            store.api_key("t_victim", "myvllm").as_deref(),
+            Some("sk-VICTIM-SECRET")
+        );
+        assert_eq!(
+            store
+                .provider_for_model("t_victim", "victim-model")
+                .as_deref(),
+            Some("myvllm")
+        );
+
+        // 4. The listing disclosed every tenant's names and base URLs.
+        let listed = store.list("t_attacker");
+        assert!(
+            listed.iter().all(|v| v.name != "myvllm"),
+            "listing must not disclose another tenant's provider: {:?}",
+            listed.iter().map(|v| &v.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// Two tenants may each register "myvllm". Global name uniqueness would let
+    /// the first tenant to claim a name deny it to everyone else — a
+    /// cross-tenant side channel of its own.
+    #[test]
+    fn the_same_provider_name_may_exist_in_two_tenants() {
+        let store = CustomProviderStore::ephemeral();
+        let next = RuntimeProviders::build(vec![
+            owned_cfg("t_a", "myvllm", &["m-a"], "sk-A"),
+            owned_cfg("t_b", "myvllm", &["m-b"], "sk-B"),
+        ])
+        .expect("per-owner uniqueness allows the same name in two tenants");
+        store.shared.store(Arc::new(next));
+
+        assert_eq!(store.api_key("t_a", "myvllm").as_deref(), Some("sk-A"));
+        assert_eq!(store.api_key("t_b", "myvllm").as_deref(), Some("sk-B"));
+    }
+
+    /// An operator-global provider (boot file, `tenant_id: None`) stays shared —
+    /// that is the self-host deployment shape — but a tenant's OWN provider
+    /// must win, so a global name can never shadow or intercept a customer's.
+    #[test]
+    fn operator_global_is_shared_but_never_shadows_a_tenants_own() {
+        let store = CustomProviderStore::ephemeral();
+        let mut global = cfg("shared", &["shared-model"]);
+        global.api_key = "sk-GLOBAL".into();
+        let next = RuntimeProviders::build(vec![
+            global,
+            owned_cfg("t_a", "shared", &["shared-model"], "sk-TENANT-A-OWN"),
+        ])
+        .expect("registry builds");
+        store.shared.store(Arc::new(next));
+
+        assert_eq!(
+            store.api_key("t_b", "shared").as_deref(),
+            Some("sk-GLOBAL"),
+            "a tenant with no own entry falls back to the operator-global one"
+        );
+        assert_eq!(
+            store.api_key("t_a", "shared").as_deref(),
+            Some("sk-TENANT-A-OWN"),
+            "a tenant's OWN provider must win over an operator-global of the same name"
+        );
     }
 
     fn temp_registry_path(tag: &str) -> PathBuf {
@@ -779,46 +1024,60 @@ mod tests {
     async fn upsert_lookup_remove_round_trip_in_memory() {
         let store = CustomProviderStore::ephemeral();
         assert!(store.is_empty());
-        assert!(store.provider_for_model("llama3").is_none());
+        assert!(store.provider_for_model("t_test", "llama3").is_none());
 
-        let (view, created) = store.upsert(cfg("myvllm", &["llama3"])).await.unwrap();
+        let (view, created) = store
+            .upsert("t_test", cfg("myvllm", &["llama3"]))
+            .await
+            .unwrap();
         assert!(created);
         assert_eq!(view.api_key, "…1234", "view must be masked");
         assert!(view.created_at.is_some());
 
         // Hot-path reads see it immediately (the ArcSwap swap happened).
-        assert!(store.contains("myvllm"));
+        assert!(store.contains("t_test", "myvllm"));
         assert_eq!(
-            store.provider_for_model("llama3").as_deref(),
+            store.provider_for_model("t_test", "llama3").as_deref(),
             Some("myvllm")
         );
         assert_eq!(
-            store.api_key("myvllm").as_deref(),
+            store.api_key("t_test", "myvllm").as_deref(),
             Some("sk-custom-abcdef1234")
         );
-        assert!(store.adapter("myvllm").is_some());
+        assert!(store.adapter("t_test", "myvllm").is_some());
 
         // Update preserves created_at and reports created=false.
         let created_at = view.created_at.clone();
         let mut updated = cfg("myvllm", &["llama3", "qwen"]);
         updated.api_key = "sk-custom-zzzz9999".into();
-        let (view2, created2) = store.upsert(updated).await.unwrap();
+        let (view2, created2) = store.upsert("t_test", updated).await.unwrap();
         assert!(!created2);
         assert_eq!(view2.created_at, created_at);
-        assert_eq!(store.provider_for_model("qwen").as_deref(), Some("myvllm"));
+        assert_eq!(
+            store.provider_for_model("t_test", "qwen").as_deref(),
+            Some("myvllm")
+        );
 
-        assert!(store.remove("myvllm").await.unwrap());
-        assert!(!store.remove("myvllm").await.unwrap());
-        assert!(store.provider_for_model("llama3").is_none());
+        assert!(store.remove("t_test", "myvllm").await.unwrap());
+        assert!(!store.remove("t_test", "myvllm").await.unwrap());
+        assert!(store.provider_for_model("t_test", "llama3").is_none());
     }
 
     #[tokio::test]
     async fn contested_model_resolves_to_lexicographically_first_provider() {
         let store = CustomProviderStore::ephemeral();
-        store.upsert(cfg("zeta", &["shared-model"])).await.unwrap();
-        store.upsert(cfg("alpha", &["shared-model"])).await.unwrap();
+        store
+            .upsert("t_test", cfg("zeta", &["shared-model"]))
+            .await
+            .unwrap();
+        store
+            .upsert("t_test", cfg("alpha", &["shared-model"]))
+            .await
+            .unwrap();
         assert_eq!(
-            store.provider_for_model("shared-model").as_deref(),
+            store
+                .provider_for_model("t_test", "shared-model")
+                .as_deref(),
             Some("alpha"),
             "deterministic precedence: first provider name in sort order wins"
         );
@@ -831,7 +1090,10 @@ mod tests {
 
         let store = CustomProviderStore::load(path.clone()).expect("absent file loads empty");
         assert!(store.is_empty());
-        store.upsert(cfg("myvllm", &["llama3"])).await.unwrap();
+        store
+            .upsert("t_test", cfg("myvllm", &["llama3"]))
+            .await
+            .unwrap();
 
         // The file exists, the tmp is gone (rename), and perms are 0600.
         assert!(path.exists());
@@ -843,12 +1105,19 @@ mod tests {
             assert_eq!(mode, 0o600, "registry file must be 0600 (holds secrets)");
         }
 
-        // A fresh store (a restart) sees the same registry.
+        // A fresh store (a restart) sees the same registry, under the same owner.
         let reloaded = CustomProviderStore::load(path.clone()).expect("reload");
-        assert!(reloaded.contains("myvllm"));
+        assert!(reloaded.contains("t_test", "myvllm"));
         assert_eq!(
-            reloaded.api_key("myvllm").as_deref(),
+            reloaded.api_key("t_test", "myvllm").as_deref(),
             Some("sk-custom-abcdef1234")
+        );
+        // The owner persisted with the entry: another tenant cannot see it after
+        // a restart either, and the boot replay enumerates it owner-preserved.
+        assert!(!reloaded.contains("t_other", "myvllm"));
+        assert_eq!(
+            reloaded.owned_names(),
+            vec![("t_test".to_string(), "myvllm".to_string())]
         );
 
         let _ = std::fs::remove_file(&path);
