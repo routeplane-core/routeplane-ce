@@ -122,6 +122,7 @@ impl Provider for AzureOpenAiProvider {
         // rejects unknown fields). No-op when absent ⇒ byte-identical.
         let mut body = serde_json::to_value(&request)?;
         crate::openai::strip_cache_control_for_openai(&mut body);
+        crate::openai::remap_max_tokens_for_reasoning_models(&mut body, &request.model);
 
         let response = self
             .client
@@ -166,6 +167,7 @@ impl Provider for AzureOpenAiProvider {
         body["stream_options"] = json!({ "include_usage": true });
         // Strip the Anthropic-only cache marker before egress (Azure rejects it).
         crate::openai::strip_cache_control_for_openai(&mut body);
+        crate::openai::remap_max_tokens_for_reasoning_models(&mut body, &request.model);
 
         let resp = crate::client::streaming_client()
             .post(&url)
