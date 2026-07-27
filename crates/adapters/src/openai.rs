@@ -631,8 +631,19 @@ mod tests {
 
     #[test]
     fn rejects_max_tokens_covers_gpt5_and_o_series() {
-        for m in ["gpt-5", "gpt-5-mini", "gpt-5-mini-2025-08-07", "openai/gpt-5",
-                  "o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini", "openai/o3-mini"] {
+        for m in [
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5-mini-2025-08-07",
+            "openai/gpt-5",
+            "o1",
+            "o1-mini",
+            "o1-preview",
+            "o3",
+            "o3-mini",
+            "o4-mini",
+            "openai/o3-mini",
+        ] {
             assert!(rejects_max_tokens(m), "{m} should reject max_tokens");
         }
         for m in ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "claude-3-5-sonnet"] {
@@ -657,11 +668,13 @@ mod tests {
 
     #[test]
     fn an_explicit_max_completion_tokens_wins_over_the_legacy_field() {
-        let mut body =
-            serde_json::json!({"max_tokens": 100, "max_completion_tokens": 999});
+        let mut body = serde_json::json!({"max_tokens": 100, "max_completion_tokens": 999});
         remap_max_tokens_for_reasoning_models(&mut body, "gpt-5");
         assert_eq!(body["max_completion_tokens"], 999, "caller intent wins");
-        assert!(body.get("max_tokens").is_none(), "legacy field still removed");
+        assert!(
+            body.get("max_tokens").is_none(),
+            "legacy field still removed"
+        );
     }
 
     #[test]
