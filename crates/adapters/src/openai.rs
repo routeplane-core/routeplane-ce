@@ -114,6 +114,34 @@ pub(crate) fn lift_openai_cached_tokens(v: &mut serde_json::Value) {
 /// A request carrying none of these is untouched (byte-identical). Shared by
 /// every OpenAI-wire adapter (Azure, self-hosted, Groq, DeepSeek,
 /// Mistral-as-OpenAI, Bedrock, ...) via [`strip_cache_control_for_openai`].
+/// Whether `model` rejects `max_tokens` and requires `max_completion_tokens`.
+/// The GPT-5 family and the o-series reasoning models (o1, o3, o4) all 400 on
+/// `max_tokens`. Aggregator prefixes (`openai/gpt-5`) are stripped first.
+pub(crate) fn rejects_max_tokens(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    let base = m.split_once('/').map_or(m.as_str(), |(_, rest)| rest);
+    base.starts_with("gpt-5")
+        || base.starts_with("o1")
+        || base.starts_with("o3")
+        || base.starts_with("o4")
+}
+
+/// Remap `max_tokens` -> `max_completion_tokens` for models that reject the
+/// legacy field. When `max_completion_tokens` is already present it wins and
+/// `max_tokens` is simply removed. No-op when the model accepts `max_tokens` or
+/// when neither field is set, so every other model stays byte-identical.
+pub(crate) fn remap_max_tokens_for_reasoning_models(body: &mut serde_json::Value, model: &str) {
+    if !rejects_max_tokens(model) {
+        return;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    if let Some(val) = obj.remove("max_tokens") {
+        obj.entry("max_completion_tokens").or_insert(val);
+    }
+}
+
 pub(crate) fn strip_cache_control_for_openai(body: &mut serde_json::Value) {
     let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return;
@@ -155,6 +183,7 @@ impl Provider for OpenAIProvider {
         // (the strip is a no-op), so parity/golden are unchanged.
         let mut body = serde_json::to_value(&request)?;
         strip_cache_control_for_openai(&mut body);
+        remap_max_tokens_for_reasoning_models(&mut body, &request.model);
 
         let response = self
             .client
@@ -199,6 +228,7 @@ impl Provider for OpenAIProvider {
         body["stream_options"] = json!({ "include_usage": true });
         // Strip the Anthropic-only cache marker before egress (OpenAI rejects it).
         strip_cache_control_for_openai(&mut body);
+        remap_max_tokens_for_reasoning_models(&mut body, &request.model);
 
         let resp = crate::client::streaming_client()
             .post(url)
@@ -598,6 +628,41 @@ mod tests {
     use super::*;
     use crate::RetryClass;
     use futures::stream;
+
+    #[test]
+    fn rejects_max_tokens_covers_gpt5_and_o_series() {
+        for m in ["gpt-5", "gpt-5-mini", "gpt-5-mini-2025-08-07", "openai/gpt-5",
+                  "o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini", "openai/o3-mini"] {
+            assert!(rejects_max_tokens(m), "{m} should reject max_tokens");
+        }
+        for m in ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "claude-3-5-sonnet"] {
+            assert!(!rejects_max_tokens(m), "{m} should accept max_tokens");
+        }
+    }
+
+    #[test]
+    fn remap_moves_max_tokens_only_for_reasoning_models() {
+        // Reasoning model: remapped.
+        let mut body = serde_json::json!({"model": "o3-mini", "max_tokens": 256});
+        remap_max_tokens_for_reasoning_models(&mut body, "o3-mini");
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["max_completion_tokens"], 256);
+
+        // Ordinary model: untouched (byte-identical).
+        let mut body = serde_json::json!({"model": "gpt-4o", "max_tokens": 256});
+        remap_max_tokens_for_reasoning_models(&mut body, "gpt-4o");
+        assert_eq!(body["max_tokens"], 256);
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn an_explicit_max_completion_tokens_wins_over_the_legacy_field() {
+        let mut body =
+            serde_json::json!({"max_tokens": 100, "max_completion_tokens": 999});
+        remap_max_tokens_for_reasoning_models(&mut body, "gpt-5");
+        assert_eq!(body["max_completion_tokens"], 999, "caller intent wins");
+        assert!(body.get("max_tokens").is_none(), "legacy field still removed");
+    }
 
     #[test]
     fn parses_openai_content_delta() {
