@@ -26,7 +26,7 @@ async fn status_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         &state.cache,
         &state.observability_engine,
         0,
-        &state.custom_providers.names(),
+        &state.custom_providers.global_names(),
     ))
 }
 
@@ -52,7 +52,7 @@ async fn status_snapshot_has_expected_shape() {
         &state.cache,
         &state.observability_engine,
         0,
-        &state.custom_providers.names(),
+        &state.custom_providers.global_names(),
     );
 
     for key in ["shed_total", "providers", "cache", "usage"] {

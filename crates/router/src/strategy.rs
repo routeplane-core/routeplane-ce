@@ -21,6 +21,13 @@ use std::sync::atomic::Ordering;
 
 use crate::HealthTracker;
 
+// Ordering reads health through the tenant-scoped accessors: every entry point
+// takes the request's `owner` (the authenticated tenant id; the proxy passes it
+// unconditionally) so a tenant's custom-provider health is read from ITS cell,
+// with built-ins falling through to the `GLOBAL_OWNER` cell. This is a scope
+// key, not routing policy — the per-key cooldown accessors on the same
+// `HealthTracker` have always taken `tenant: &str` the same way.
+
 /// How to order eligible providers into an attempt sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RoutingStrategy {
@@ -225,21 +232,24 @@ impl Router {
     }
 
     /// Order the eligible candidates into an attempt sequence for `strategy`,
-    /// using process-default RNG seeding for `Weighted`.
+    /// using process-default RNG seeding for `Weighted`. `owner` is the
+    /// authenticated tenant id (health scope).
     pub fn order_candidates(
         &self,
+        owner: &str,
         eligible: &[String],
         strategy: RoutingStrategy,
         health: &HealthTracker,
     ) -> Vec<String> {
         let mut rng = Rng::seeded(default_weighted_seed());
-        self.order_candidates_with_rng(eligible, strategy, health, &mut rng)
+        self.order_candidates_with_rng(owner, eligible, strategy, health, &mut rng)
     }
 
     /// Like [`Self::order_candidates`] but with an injected RNG, so `Weighted`
     /// ordering is deterministic under test.
     pub fn order_candidates_with_rng(
         &self,
+        owner: &str,
         eligible: &[String],
         strategy: RoutingStrategy,
         health: &HealthTracker,
@@ -248,18 +258,22 @@ impl Router {
         // 1. Drop circuit-OPEN providers up front (preserving input order).
         let mut live: Vec<String> = eligible
             .iter()
-            .filter(|name| health.is_available(name))
+            .filter(|name| health.is_available(owner, name))
             .cloned()
             .collect();
 
-        // 2. Order the survivors by strategy.
+        // 2. Order the survivors by strategy. The health probes below run inside
+        //    `sort_by_key` comparator closures — the reason the tracker's nested
+        //    map probes by `&str` (a tuple key would allocate per comparison).
         match strategy {
             RoutingStrategy::Priority => {}
             RoutingStrategy::Cost => {
                 live.sort_by_key(|name| self.config.get(name).cost);
             }
             RoutingStrategy::Latency => {
-                live.sort_by_key(|name| health.latency_ms(name).map(|ms| ms + 1).unwrap_or(0));
+                live.sort_by_key(|name| {
+                    health.latency_ms(owner, name).map(|ms| ms + 1).unwrap_or(0)
+                });
             }
             RoutingStrategy::Weighted => {
                 live = self.weighted_order(live, rng);
@@ -269,7 +283,7 @@ impl Router {
             }
             RoutingStrategy::LeastBusy => {
                 // Stable sort by ascending in-flight count; ties keep input order.
-                live.sort_by_key(|name| health.in_flight(name));
+                live.sort_by_key(|name| health.in_flight(owner, name));
             }
         }
 
@@ -281,17 +295,19 @@ impl Router {
     /// Process-default RNG seeding for `Weighted`.
     pub fn order_candidates_with_specs(
         &self,
+        owner: &str,
         specs: &[CandidateSpec],
         strategy: RoutingStrategy,
         health: &HealthTracker,
     ) -> Vec<String> {
         let mut rng = Rng::seeded(default_weighted_seed());
-        self.order_candidates_with_specs_rng(specs, strategy, health, &mut rng)
+        self.order_candidates_with_specs_rng(owner, specs, strategy, health, &mut rng)
     }
 
     /// Like [`Self::order_candidates_with_specs`] but with an injected RNG.
     pub fn order_candidates_with_specs_rng(
         &self,
+        owner: &str,
         specs: &[CandidateSpec],
         strategy: RoutingStrategy,
         health: &HealthTracker,
@@ -300,7 +316,7 @@ impl Router {
         // 1. Drop circuit-OPEN providers, preserving input (policy) order.
         let mut live: Vec<&CandidateSpec> = specs
             .iter()
-            .filter(|s| health.is_available(&s.name))
+            .filter(|s| health.is_available(owner, &s.name))
             .collect();
 
         // 2. Order by strategy, reading overrides first, defaults second.
@@ -310,7 +326,12 @@ impl Router {
                 live.sort_by_key(|s| s.cost.unwrap_or_else(|| self.config.get(&s.name).cost));
             }
             RoutingStrategy::Latency => {
-                live.sort_by_key(|s| health.latency_ms(&s.name).map(|ms| ms + 1).unwrap_or(0));
+                live.sort_by_key(|s| {
+                    health
+                        .latency_ms(owner, &s.name)
+                        .map(|ms| ms + 1)
+                        .unwrap_or(0)
+                });
             }
             RoutingStrategy::Weighted => {
                 live = self.weighted_order_specs(live, rng);
@@ -319,7 +340,7 @@ impl Router {
                 live = self.round_robin_order(live);
             }
             RoutingStrategy::LeastBusy => {
-                live.sort_by_key(|s| health.in_flight(&s.name));
+                live.sort_by_key(|s| health.in_flight(owner, &s.name));
             }
         }
 
@@ -421,6 +442,7 @@ fn default_weighted_seed() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GLOBAL_OWNER;
 
     fn tracker() -> HealthTracker {
         HealthTracker::new(["openai", "anthropic", "gemini", "azure_openai"])
@@ -489,10 +511,10 @@ mod tests {
         let h = tracker();
         let eligible = names(&["openai", "anthropic", "gemini"]);
         // Cursor starts at 0: first call leads with index 0, then 1, then 2, wrap.
-        let o0 = r.order_candidates(&eligible, RoutingStrategy::RoundRobin, &h);
-        let o1 = r.order_candidates(&eligible, RoutingStrategy::RoundRobin, &h);
-        let o2 = r.order_candidates(&eligible, RoutingStrategy::RoundRobin, &h);
-        let o3 = r.order_candidates(&eligible, RoutingStrategy::RoundRobin, &h);
+        let o0 = r.order_candidates(GLOBAL_OWNER, &eligible, RoutingStrategy::RoundRobin, &h);
+        let o1 = r.order_candidates(GLOBAL_OWNER, &eligible, RoutingStrategy::RoundRobin, &h);
+        let o2 = r.order_candidates(GLOBAL_OWNER, &eligible, RoutingStrategy::RoundRobin, &h);
+        let o3 = r.order_candidates(GLOBAL_OWNER, &eligible, RoutingStrategy::RoundRobin, &h);
         assert_eq!(o0, names(&["openai", "anthropic", "gemini"]));
         assert_eq!(o1, names(&["anthropic", "gemini", "openai"]));
         assert_eq!(o2, names(&["gemini", "openai", "anthropic"]));
@@ -511,13 +533,13 @@ mod tests {
         let r = Router::with_defaults();
         let h = tracker();
         for _ in 0..5 {
-            h.record_failure("anthropic"); // trip anthropic OPEN
+            h.record_failure(GLOBAL_OWNER, "anthropic"); // trip anthropic OPEN
         }
         let eligible = names(&["openai", "anthropic", "gemini"]);
         // Survivors are [openai, gemini] (len 2): rotation cycles between them and
         // never includes the OPEN provider.
-        let o0 = r.order_candidates(&eligible, RoutingStrategy::RoundRobin, &h);
-        let o1 = r.order_candidates(&eligible, RoutingStrategy::RoundRobin, &h);
+        let o0 = r.order_candidates(GLOBAL_OWNER, &eligible, RoutingStrategy::RoundRobin, &h);
+        let o1 = r.order_candidates(GLOBAL_OWNER, &eligible, RoutingStrategy::RoundRobin, &h);
         assert_eq!(o0, names(&["openai", "gemini"]));
         assert_eq!(o1, names(&["gemini", "openai"]));
         assert!(!o0.contains(&"anthropic".to_string()));
@@ -531,7 +553,7 @@ mod tests {
         let eligible = names(&["openai"]);
         for _ in 0..3 {
             assert_eq!(
-                r.order_candidates(&eligible, RoutingStrategy::RoundRobin, &h),
+                r.order_candidates(GLOBAL_OWNER, &eligible, RoutingStrategy::RoundRobin, &h),
                 names(&["openai"])
             );
         }
@@ -542,11 +564,11 @@ mod tests {
         let r = Router::with_defaults();
         let h = tracker();
         // openai: 2 in flight, anthropic: 0, gemini: 1.
-        let _g1 = h.enter_in_flight("openai").unwrap();
-        let _g2 = h.enter_in_flight("openai").unwrap();
-        let _g3 = h.enter_in_flight("gemini").unwrap();
+        let _g1 = h.enter_in_flight(GLOBAL_OWNER, "openai").unwrap();
+        let _g2 = h.enter_in_flight(GLOBAL_OWNER, "openai").unwrap();
+        let _g3 = h.enter_in_flight(GLOBAL_OWNER, "gemini").unwrap();
         let eligible = names(&["openai", "anthropic", "gemini"]);
-        let out = r.order_candidates(&eligible, RoutingStrategy::LeastBusy, &h);
+        let out = r.order_candidates(GLOBAL_OWNER, &eligible, RoutingStrategy::LeastBusy, &h);
         assert_eq!(out, names(&["anthropic", "gemini", "openai"]));
     }
 
@@ -556,21 +578,21 @@ mod tests {
         let h = tracker();
         // All zero in flight → stable sort preserves the input order.
         let eligible = names(&["gemini", "openai", "anthropic"]);
-        let out = r.order_candidates(&eligible, RoutingStrategy::LeastBusy, &h);
+        let out = r.order_candidates(GLOBAL_OWNER, &eligible, RoutingStrategy::LeastBusy, &h);
         assert_eq!(out, eligible);
     }
 
     #[test]
     fn in_flight_guard_balances_on_drop() {
         let h = tracker();
-        assert_eq!(h.in_flight("openai"), 0);
+        assert_eq!(h.in_flight(GLOBAL_OWNER, "openai"), 0);
         {
-            let _g = h.enter_in_flight("openai").unwrap();
-            assert_eq!(h.in_flight("openai"), 1);
-            let _g2 = h.enter_in_flight("openai").unwrap();
-            assert_eq!(h.in_flight("openai"), 2);
+            let _g = h.enter_in_flight(GLOBAL_OWNER, "openai").unwrap();
+            assert_eq!(h.in_flight(GLOBAL_OWNER, "openai"), 1);
+            let _g2 = h.enter_in_flight(GLOBAL_OWNER, "openai").unwrap();
+            assert_eq!(h.in_flight(GLOBAL_OWNER, "openai"), 2);
         } // both guards drop here
-        assert_eq!(h.in_flight("openai"), 0);
+        assert_eq!(h.in_flight(GLOBAL_OWNER, "openai"), 0);
     }
 
     #[test]
@@ -579,9 +601,9 @@ mod tests {
         let h = HealthTracker::new(["openai"]);
         // "ghost" has no gauge → in_flight == u64::MAX → sorts last under LeastBusy.
         let eligible = names(&["ghost", "openai"]);
-        let out = r.order_candidates(&eligible, RoutingStrategy::LeastBusy, &h);
+        let out = r.order_candidates(GLOBAL_OWNER, &eligible, RoutingStrategy::LeastBusy, &h);
         assert_eq!(out, names(&["openai", "ghost"]));
-        assert_eq!(h.in_flight("ghost"), u64::MAX);
+        assert_eq!(h.in_flight(GLOBAL_OWNER, "ghost"), u64::MAX);
     }
 
     #[test]
@@ -589,7 +611,7 @@ mod tests {
         let r = Router::with_defaults();
         let h = tracker();
         let eligible = names(&["anthropic", "openai", "gemini"]);
-        let out = r.order_candidates(&eligible, RoutingStrategy::Priority, &h);
+        let out = r.order_candidates(GLOBAL_OWNER, &eligible, RoutingStrategy::Priority, &h);
         assert_eq!(out, eligible);
     }
 
@@ -598,7 +620,7 @@ mod tests {
         let r = Router::with_defaults();
         let h = tracker();
         let eligible = names(&["anthropic", "openai", "gemini", "azure_openai"]);
-        let out = r.order_candidates(&eligible, RoutingStrategy::Cost, &h);
+        let out = r.order_candidates(GLOBAL_OWNER, &eligible, RoutingStrategy::Cost, &h);
         assert_eq!(
             out,
             names(&["gemini", "openai", "azure_openai", "anthropic"])
@@ -609,10 +631,10 @@ mod tests {
     fn latency_orders_lowest_first_untried_lead() {
         let r = Router::with_defaults();
         let h = tracker();
-        h.record_latency("openai", 300);
-        h.record_latency("anthropic", 100);
+        h.record_latency(GLOBAL_OWNER, "openai", 300);
+        h.record_latency(GLOBAL_OWNER, "anthropic", 100);
         let eligible = names(&["openai", "anthropic", "gemini"]);
-        let out = r.order_candidates(&eligible, RoutingStrategy::Latency, &h);
+        let out = r.order_candidates(GLOBAL_OWNER, &eligible, RoutingStrategy::Latency, &h);
         assert_eq!(out, names(&["gemini", "anthropic", "openai"]));
     }
 
@@ -621,7 +643,7 @@ mod tests {
         let r = Router::with_defaults();
         let h = tracker();
         let eligible = names(&["openai", "anthropic", "gemini"]);
-        let out = r.order_candidates(&eligible, RoutingStrategy::Latency, &h);
+        let out = r.order_candidates(GLOBAL_OWNER, &eligible, RoutingStrategy::Latency, &h);
         assert_eq!(out, eligible);
     }
 
@@ -630,10 +652,10 @@ mod tests {
         let r = Router::with_defaults();
         let h = tracker();
         for _ in 0..5 {
-            h.record_failure("openai");
+            h.record_failure(GLOBAL_OWNER, "openai");
         }
         let eligible = names(&["openai", "anthropic", "gemini"]);
-        let out = r.order_candidates(&eligible, RoutingStrategy::Priority, &h);
+        let out = r.order_candidates(GLOBAL_OWNER, &eligible, RoutingStrategy::Priority, &h);
         assert_eq!(out, names(&["anthropic", "gemini"]));
     }
 
@@ -644,11 +666,21 @@ mod tests {
         let eligible = names(&["openai", "anthropic", "gemini"]);
 
         let mut rng_a = Rng::seeded(42);
-        let out_a =
-            r.order_candidates_with_rng(&eligible, RoutingStrategy::Weighted, &h, &mut rng_a);
+        let out_a = r.order_candidates_with_rng(
+            GLOBAL_OWNER,
+            &eligible,
+            RoutingStrategy::Weighted,
+            &h,
+            &mut rng_a,
+        );
         let mut rng_b = Rng::seeded(42);
-        let out_b =
-            r.order_candidates_with_rng(&eligible, RoutingStrategy::Weighted, &h, &mut rng_b);
+        let out_b = r.order_candidates_with_rng(
+            GLOBAL_OWNER,
+            &eligible,
+            RoutingStrategy::Weighted,
+            &h,
+            &mut rng_b,
+        );
 
         assert_eq!(out_a, out_b);
         assert_eq!(out_a.len(), 3);
@@ -688,8 +720,13 @@ mod tests {
         let mut first_is_gemini = 0;
         for seed in 0..200u64 {
             let mut rng = Rng::seeded(seed);
-            let out =
-                r.order_candidates_with_rng(&eligible, RoutingStrategy::Weighted, &h, &mut rng);
+            let out = r.order_candidates_with_rng(
+                GLOBAL_OWNER,
+                &eligible,
+                RoutingStrategy::Weighted,
+                &h,
+                &mut rng,
+            );
             if out[0] == "gemini" {
                 first_is_gemini += 1;
             }
@@ -702,11 +739,17 @@ mod tests {
         let r = Router::with_defaults();
         let h = tracker();
         for _ in 0..5 {
-            h.record_failure("openai");
+            h.record_failure(GLOBAL_OWNER, "openai");
         }
         let eligible = names(&["openai", "anthropic", "gemini"]);
         let mut rng = Rng::seeded(7);
-        let out = r.order_candidates_with_rng(&eligible, RoutingStrategy::Weighted, &h, &mut rng);
+        let out = r.order_candidates_with_rng(
+            GLOBAL_OWNER,
+            &eligible,
+            RoutingStrategy::Weighted,
+            &h,
+            &mut rng,
+        );
         assert!(!out.contains(&"openai".to_string()));
         assert_eq!(out.len(), 2);
     }
@@ -721,13 +764,13 @@ mod tests {
         let s = specs(&["anthropic", "openai", "gemini"]);
         // Priority: identical input order.
         assert_eq!(
-            r.order_candidates_with_specs(&s, RoutingStrategy::Priority, &h),
-            r.order_candidates(&eligible, RoutingStrategy::Priority, &h),
+            r.order_candidates_with_specs(GLOBAL_OWNER, &s, RoutingStrategy::Priority, &h),
+            r.order_candidates(GLOBAL_OWNER, &eligible, RoutingStrategy::Priority, &h),
         );
         // Cost: defaults match the legacy cost ordering.
         assert_eq!(
-            r.order_candidates_with_specs(&s, RoutingStrategy::Cost, &h),
-            r.order_candidates(&eligible, RoutingStrategy::Cost, &h),
+            r.order_candidates_with_specs(GLOBAL_OWNER, &s, RoutingStrategy::Cost, &h),
+            r.order_candidates(GLOBAL_OWNER, &eligible, RoutingStrategy::Cost, &h),
         );
     }
 
@@ -749,7 +792,7 @@ mod tests {
                 cost: Some(1),
             },
         ];
-        let out = r.order_candidates_with_specs(&s, RoutingStrategy::Cost, &h);
+        let out = r.order_candidates_with_specs(GLOBAL_OWNER, &s, RoutingStrategy::Cost, &h);
         assert_eq!(out, names(&["anthropic", "openai"]));
     }
 
@@ -772,8 +815,13 @@ mod tests {
         let mut led = 0;
         for seed in 0..200u64 {
             let mut rng = Rng::seeded(seed);
-            let out =
-                r.order_candidates_with_specs_rng(&s, RoutingStrategy::Weighted, &h, &mut rng);
+            let out = r.order_candidates_with_specs_rng(
+                GLOBAL_OWNER,
+                &s,
+                RoutingStrategy::Weighted,
+                &h,
+                &mut rng,
+            );
             if out[0] == "anthropic" {
                 led += 1;
             }

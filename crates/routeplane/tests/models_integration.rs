@@ -58,6 +58,23 @@ fn auth() -> SharedAuthState {
     shared_auth_state(AuthState::load_from_json(KEYS, "test").expect("registry loads"))
 }
 
+/// The tenant extension the auth middleware would inject — the handlers are
+/// owner-scoped for the custom-provider model fold, so direct invocations
+/// carry the same extension the authed route provides.
+fn ctx() -> axum::Extension<routeplane::auth::TenantContext> {
+    axum::Extension(routeplane::auth::TenantContext {
+        tenant_id: "t_acme".into(),
+        tier: routeplane_entitlements::Tier::Free,
+        capabilities: routeplane_entitlements::CapabilitySet::resolve(
+            routeplane_entitlements::Tier::Free,
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+        ),
+        compliance_frameworks: Vec::new(),
+        compliance_mode: routeplane::auth::ComplianceMode::Strict,
+    })
+}
+
 async fn body_json(resp: Response) -> serde_json::Value {
     let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
         .await
@@ -69,7 +86,7 @@ async fn body_json(resp: Response) -> serde_json::Value {
 
 #[tokio::test]
 async fn list_models_returns_openai_list_shape_with_known_model() {
-    let resp = list_models(State(build_stub_state())).await;
+    let resp = list_models(State(build_stub_state()), ctx()).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let v = body_json(resp).await;
 
@@ -107,6 +124,7 @@ async fn list_models_returns_openai_list_shape_with_known_model() {
 async fn retrieve_known_model_returns_the_object() {
     let resp = retrieve_model(
         State(build_stub_state()),
+        ctx(),
         Path("claude-3-5-sonnet-latest".to_string()),
     )
     .await;
@@ -122,6 +140,7 @@ async fn retrieve_known_model_returns_the_object() {
 async fn retrieve_unknown_model_returns_404_openai_envelope() {
     let resp = retrieve_model(
         State(build_stub_state()),
+        ctx(),
         Path("no-such-model-xyz".to_string()),
     )
     .await;
@@ -187,7 +206,7 @@ async fn authenticated_list_passes_the_gate() {
 
 #[tokio::test]
 async fn list_models_includes_operator_combos_additively() {
-    let resp = list_models(State(state_with_combo())).await;
+    let resp = list_models(State(state_with_combo()), ctx()).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let v = body_json(resp).await;
     let data = v["data"].as_array().expect("data is an array");
@@ -206,7 +225,12 @@ async fn list_models_includes_operator_combos_additively() {
 
 #[tokio::test]
 async fn retrieve_combo_by_id_returns_the_object() {
-    let resp = retrieve_model(State(state_with_combo()), Path("fast-cheap".to_string())).await;
+    let resp = retrieve_model(
+        State(state_with_combo()),
+        ctx(),
+        Path("fast-cheap".to_string()),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let v = body_json(resp).await;
     assert_eq!(v["id"], "fast-cheap");
@@ -217,7 +241,7 @@ async fn retrieve_combo_by_id_returns_the_object() {
 #[tokio::test]
 async fn no_combos_configured_yields_no_gateway_owned_entries() {
     // Empty registry (the default) ⇒ no combo entries ⇒ base catalog byte-identical.
-    let resp = list_models(State(build_stub_state())).await;
+    let resp = list_models(State(build_stub_state()), ctx()).await;
     let v = body_json(resp).await;
     let data = v["data"].as_array().expect("data is an array");
     assert!(

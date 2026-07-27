@@ -401,7 +401,7 @@ pub async fn messages(
     let model_routes_to_custom = !crate::models_api::is_builtin_model(&req.model)
         && state
             .custom_providers
-            .provider_for_model(&req.model)
+            .provider_for_model(&tenant_ctx.tenant_id, &req.model)
             .is_some();
     if !headers.contains_key("x-routeplane-provider") && !model_routes_to_custom {
         headers.insert(

@@ -10,7 +10,7 @@
 //! aggregate operational state: no keys, tenant ids, request bodies, or PII.
 
 use routeplane_cache::ExactCache;
-use routeplane_router::{CircuitState, HealthTracker};
+use routeplane_router::{CircuitState, HealthTracker, GLOBAL_OWNER};
 use serde_json::{json, Value};
 
 use crate::observability::ObservabilityEngine;
@@ -25,18 +25,25 @@ fn circuit_str(state: CircuitState) -> &'static str {
 
 /// Build the `/status` JSON snapshot from the live engines. `shed_total` is
 /// passed in because the capacity-shed counter is a binary-level global.
-/// `custom_providers` is the (sorted) runtime custom-provider name list —
-/// appended to the provider list with an explicit `"custom": true` marker (they
-/// are untracked by the boot-time health registry, which fails open for them,
-/// so `circuit` is honestly reported `closed` with no latency sample).
+/// `custom_providers` is the (sorted) OPERATOR-GLOBAL runtime custom-provider
+/// name list — appended to the provider list with an explicit `"custom": true`
+/// marker, read from their `GLOBAL_OWNER` health cells.
 pub fn status_snapshot_json(
     health: &HealthTracker,
     cache: &ExactCache,
     observability: &ObservabilityEngine,
     shed_total: u64,
+    // OPERATOR-GLOBAL custom providers ONLY (`CustomProviderStore::global_names`).
+    // This surface is unauthenticated, and a TENANT-registered provider name is
+    // customer-chosen free text — passing an all-owners name list here (the old
+    // `names()`) published every customer's provider names. The second loop
+    // below re-emits every element of this slice verbatim, so the caller's
+    // filtering is the actual control.
     custom_providers: &[String],
 ) -> Value {
-    let mut names = health.provider_names();
+    // GLOBAL_OWNER fold only: tenant-owned health cells never reach this
+    // surface — `global_provider_names` cannot see them by construction.
+    let mut names = health.global_provider_names();
     names.sort_unstable();
     // Runtime custom providers (ADR-099) are now IN the circuit registry too
     // (ADR-113 registers a breaker/EWMA/gauge on upsert so they are fast-failed
@@ -48,16 +55,19 @@ pub fn status_snapshot_json(
         .map(|p| {
             json!({
                 "provider": p,
-                "circuit": circuit_str(health.state(p)),
-                "latency_ewma_ms": health.latency_ms(p), // null until first sample
+                "circuit": circuit_str(health.state(GLOBAL_OWNER, p)),
+                // null until first sample
+                "latency_ewma_ms": health.latency_ms(GLOBAL_OWNER, p),
             })
         })
         .collect();
     for name in custom_providers {
         providers.push(json!({
             "provider": name,
-            "circuit": circuit_str(health.state(name)), // real state (ADR-113)
-            "latency_ewma_ms": health.latency_ms(name),  // null until first sample
+            // real state (ADR-113); operator-global cell
+            "circuit": circuit_str(health.state(GLOBAL_OWNER, name)),
+            // null until first sample
+            "latency_ewma_ms": health.latency_ms(GLOBAL_OWNER, name),
             "custom": true,
         }));
     }

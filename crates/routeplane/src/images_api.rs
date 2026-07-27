@@ -193,9 +193,10 @@ pub async fn image_generation(
         .and_then(|h| h.to_str().ok())
         .map(RoutingStrategy::parse)
         .unwrap_or_default();
-    let ordered = state
-        .router
-        .order_candidates(&eligible, strategy, &state.health);
+    let ordered =
+        state
+            .router
+            .order_candidates(&tenant_ctx.tenant_id, &eligible, strategy, &state.health);
 
     // 5. Budgets & rate limits admission — check-before, fail-stop.
     let admit_now = now_unix_ms();
@@ -234,7 +235,11 @@ pub async fn image_generation(
                 continue;
             }
         };
-        if !state.health.is_available(provider_name) {
+        // Health scope mirrors adapter scope — same tenant as provider resolution.
+        if !state
+            .health
+            .is_available(&tenant_ctx.tenant_id, provider_name)
+        {
             tracing::warn!("Skipping {} — circuit breaker is OPEN", provider_name);
             last_error = format!("circuit breaker open for {provider_name}");
             continue;
@@ -278,8 +283,12 @@ pub async fn image_generation(
 
         match result {
             Ok(response) => {
-                state.health.record_latency(provider_name, elapsed_ms);
-                state.health.record_success(provider_name);
+                state
+                    .health
+                    .record_latency(&tenant_ctx.tenant_id, provider_name, elapsed_ms);
+                state
+                    .health
+                    .record_success(&tenant_ctx.tenant_id, provider_name);
 
                 // Image generation has no token billing; record the number of
                 // generated images as the usage total so FinOps has a real number
@@ -349,9 +358,13 @@ pub async fn image_generation(
                         if body.starts_with("image_generation_not_supported")
                 );
                 if !this_not_supported {
-                    state.health.record_latency(provider_name, elapsed_ms);
+                    state
+                        .health
+                        .record_latency(&tenant_ctx.tenant_id, provider_name, elapsed_ms);
                     if crate::proxy::counts_as_health_failure(&e) {
-                        state.health.record_failure(provider_name);
+                        state
+                            .health
+                            .record_failure(&tenant_ctx.tenant_id, provider_name);
                     }
                 }
                 last_not_supported = this_not_supported;

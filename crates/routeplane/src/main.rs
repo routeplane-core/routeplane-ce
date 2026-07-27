@@ -967,8 +967,12 @@ async fn main() {
     // Register health cells for custom providers loaded from disk at boot (ADR-113),
     // so a restart doesn't leave a persisted custom provider without a circuit
     // breaker until its next upsert. Idempotent; no-op when none are configured.
-    for name in state.custom_providers.names() {
-        state.health.register(&name);
+    // OWNER-PRESERVING: replay `(owner, name)` pairs, never a name-only
+    // projection — a deduped name list would collapse two tenants' same-named
+    // providers back onto ONE shared breaker at every boot, silently
+    // reconstructing the cross-tenant DoS the tenant-scoped registry closed.
+    for (owner, name) in state.custom_providers.owned_names() {
+        state.health.register(&owner, &name);
     }
 
     // ADR-064: CP→DP rate-limit distributor — spawned ONLY when RP_CP_CONFIG_URL is
@@ -1617,7 +1621,9 @@ async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         &state.cache,
         &state.observability_engine,
         shed_total(),
-        &state.custom_providers.names(),
+        // Operator-global names ONLY: /status is unauthenticated, and a
+        // tenant-registered provider name is customer-chosen free text.
+        &state.custom_providers.global_names(),
     ))
 }
 

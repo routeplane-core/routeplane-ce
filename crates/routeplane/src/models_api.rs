@@ -25,12 +25,13 @@
 //! No DB, no network, no locks — a read of static data. Nothing here can panic
 //! on the request thread (no `unwrap`/`expect`).
 
+use crate::auth::TenantContext;
 use crate::proxy::AppState;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use serde::Serialize;
 use std::sync::{Arc, LazyLock};
@@ -864,14 +865,22 @@ pub fn is_builtin_model(id: &str) -> bool {
 }
 
 /// Runtime custom-provider models (`owned_by = <provider name>`), folded onto
-/// the catalog at request time — the same posture as the env-discovered
-/// deployments. ADDITIVE + deduplicated by id against everything already in
-/// `existing` (built-in catalog + combos win a contested id, matching the
-/// routing precedence). Empty registry ⇒ empty vec ⇒ byte-identical list.
-fn custom_provider_models(state: &AppState, existing: &[ModelObject]) -> Vec<ModelObject> {
+/// the catalog at request time — OWNER-SCOPED: the caller's own models plus
+/// operator-global ones, never another tenant's. An unscoped fold disclosed
+/// every tenant's custom model ids to any authenticated caller (and
+/// `GET /v1/models/{id}` confirmed them one at a time) — ids the caller could
+/// not even dispatch to, since routing is owner-scoped. ADDITIVE +
+/// deduplicated by id against everything already in `existing` (built-in
+/// catalog + combos win a contested id, matching the routing precedence).
+/// Empty registry ⇒ empty vec ⇒ byte-identical list.
+fn custom_provider_models(
+    state: &AppState,
+    tenant_id: &str,
+    existing: &[ModelObject],
+) -> Vec<ModelObject> {
     state
         .custom_providers
-        .model_entries()
+        .model_entries(tenant_id)
         .into_iter()
         .filter(|(id, _)| !existing.iter().any(|m| &m.id == id))
         .map(|(id, owner)| ModelObject {
@@ -887,11 +896,14 @@ fn custom_provider_models(state: &AppState, existing: &[ModelObject]) -> Vec<Mod
 /// `GET /v1/models` — the full catalog as the OpenAI `{"object":"list", …}`
 /// envelope. Authed (the route rides the same auth layer as chat). 200 always.
 /// The static provider catalog plus any operator-defined combos (ADR-086) plus
-/// any runtime custom-provider models.
-pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
+/// the CALLER's runtime custom-provider models (owner-scoped).
+pub async fn list_models(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant_ctx): Extension<TenantContext>,
+) -> Response {
     let mut data = full_catalog();
     data.extend(combo_models(&state));
-    let custom = custom_provider_models(&state, &data);
+    let custom = custom_provider_models(&state, &tenant_ctx.tenant_id, &data);
     data.extend(custom);
     let list = ModelList {
         object: "list",
@@ -900,10 +912,13 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
     (StatusCode::OK, Json(list)).into_response()
 }
 
-/// `GET /v1/models/{id}` — the single model object (base model OR combo), or a 404
-/// OpenAI error envelope for an unknown id. Authed.
+/// `GET /v1/models/{id}` — the single model object (base model OR combo OR one
+/// of the CALLER's custom-provider models), or a 404 OpenAI error envelope for
+/// an unknown id. Authed. The custom leg is owner-scoped so this endpoint can
+/// no longer be used to confirm another tenant's model ids one at a time.
 pub async fn retrieve_model(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_ctx): Extension<TenantContext>,
     Path(id): Path<String>,
 ) -> Response {
     if let Some(model) = full_catalog().into_iter().find(|m| m.id == id) {
@@ -915,7 +930,7 @@ pub async fn retrieve_model(
     // Runtime custom-provider model (additive; built-ins/combos matched above).
     if let Some((model_id, owner)) = state
         .custom_providers
-        .model_entries()
+        .model_entries(&tenant_ctx.tenant_id)
         .into_iter()
         .find(|(m, _)| m == &id)
     {

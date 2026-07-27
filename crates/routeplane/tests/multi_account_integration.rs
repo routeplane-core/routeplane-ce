@@ -288,7 +288,7 @@ async fn dead_key_pool_does_not_open_the_shared_provider_breaker() {
         "a fully-dead pool cannot succeed"
     );
     assert!(
-        state.health.is_available("openai"),
+        state.health.is_available(TENANT, "openai"),
         "a single request through a dead key pool must NOT open the shared provider \
          breaker (ADR-087 §4: the breaker is fed once, on exhaustion — not per key)"
     );
