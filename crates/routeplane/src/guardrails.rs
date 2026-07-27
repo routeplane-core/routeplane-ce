@@ -182,6 +182,142 @@ impl GuardrailConfig {
     }
 }
 
+/// Hold-back window for [`StreamMasker`], in bytes.
+///
+/// Must exceed the longest span any recognizer can match, or an identifier could
+/// straddle the boundary undetected. 256 comfortably covers every current
+/// recognizer (Aadhaar 12, PAN 10, cards ≤19, SSN 11, IPv4 ≤15, emails, and the
+/// provider API-key shapes) with room to spare. Raising it costs perceived
+/// streaming latency — output is held back by at most this many bytes until
+/// [`StreamMasker::flush`] — so it is a floor, not a target.
+#[allow(dead_code)]
+pub const STREAM_MASK_WINDOW_BYTES: usize = 256;
+
+/// Hard ceiling on retained bytes before [`StreamMasker`] force-flushes.
+///
+/// Bounds memory per stream: without it, pathological input that keeps looking
+/// like a straddling match could buffer a whole response.
+#[allow(dead_code)]
+const STREAM_MASK_MAX_CARRY_BYTES: usize = STREAM_MASK_WINDOW_BYTES * 4;
+
+/// Stateful output masker that survives chunk boundaries ([PRD-071]).
+///
+/// # Why this exists
+///
+/// Per-chunk masking is blind to an identifier split across two SSE frames:
+/// neither frame contains a complete match, so neither is redacted and the
+/// client reassembles the original. That failure is silent and depends on where
+/// the provider happened to split its tokens.
+///
+/// # How it stays correct
+///
+/// Masking is a **local substitution** over matches, so when no match straddles
+/// the hold-back boundary, `mask(whole) == mask(settled) ++ mask(tail)`. The
+/// masker exploits exactly that: it masks the settled prefix in isolation *and*
+/// in context, and only emits when the two agree. Disagreement means a match
+/// spans the boundary, so it emits nothing and waits for more input.
+///
+/// Because masking changes length, index arithmetic over the masked text is not
+/// sound — hence the agreement check rather than a byte offset. A false negative
+/// on the check costs one extra round of buffering; it can never leak.
+///
+/// # Contract
+///
+/// The caller MUST call [`flush`](Self::flush) when the upstream stream ends —
+/// including on abort — or the retained tail is dropped and the response is
+/// silently truncated.
+///
+/// [PRD-071]: https://github.com/routeplane-core/docs/blob/main/product/prd/071-streaming-guardrails-rolling-buffer.md
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub struct StreamMasker {
+    /// Raw (unmasked) text retained until it can be proven settled.
+    carry: String,
+}
+
+#[allow(dead_code)]
+impl StreamMasker {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            carry: String::new(),
+        }
+    }
+
+    /// Feed the next raw chunk; returns the masked text that is safe to emit now
+    /// (often empty while a boundary is unsettled).
+    ///
+    /// `mask` is the masking function to apply — supplied by the caller so this
+    /// type stays independent of the engine/config/capability plumbing.
+    pub fn push<F>(&mut self, chunk: &str, mask: F) -> String
+    where
+        F: Fn(&str) -> String,
+    {
+        self.carry.push_str(chunk);
+
+        if self.carry.len() <= STREAM_MASK_WINDOW_BYTES {
+            return String::new();
+        }
+
+        // Force progress before unbounded growth: mask everything we hold and
+        // start clean. Safe — we have the complete carry, so any match wholly
+        // inside it is caught; only a match continuing into the *next* chunk can
+        // be split, which is the pre-existing per-chunk behaviour and strictly
+        // no worse.
+        if self.carry.len() > STREAM_MASK_MAX_CARRY_BYTES {
+            return self.flush(mask);
+        }
+
+        let split = floor_char_boundary(&self.carry, self.carry.len() - STREAM_MASK_WINDOW_BYTES);
+        if split == 0 {
+            return String::new();
+        }
+
+        let masked_settled = mask(&self.carry[..split]);
+        let masked_full = mask(&self.carry);
+
+        if masked_full.starts_with(&masked_settled) {
+            self.carry.drain(..split);
+            masked_settled
+        } else {
+            // A detection straddles the boundary — hold and wait for the rest.
+            String::new()
+        }
+    }
+
+    /// Mask and emit everything still retained. Call once when the stream ends.
+    pub fn flush<F>(&mut self, mask: F) -> String
+    where
+        F: Fn(&str) -> String,
+    {
+        if self.carry.is_empty() {
+            return String::new();
+        }
+        let out = mask(&self.carry);
+        self.carry.clear();
+        out
+    }
+
+    /// Bytes currently retained — for tests and bounded-memory assertions.
+    #[must_use]
+    pub fn buffered_len(&self) -> usize {
+        self.carry.len()
+    }
+}
+
+/// Largest `i <= idx` that is a UTF-8 char boundary of `s`.
+///
+/// `str::floor_char_boundary` is still unstable, and slicing mid-codepoint
+/// panics — which on the streaming path would abort a live response.
+#[allow(dead_code)]
+fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +370,111 @@ mod tests {
         let cfg = GuardrailConfig::masking();
         let input = "a perfectly ordinary sentence";
         assert_eq!(engine().process_text(input, &cfg), input);
+    }
+
+    // ---- StreamMasker (PRD-071) ------------------------------------------
+    //
+    // Padding exceeds STREAM_MASK_WINDOW_BYTES so the settled/carry split is
+    // actually exercised; without it everything buffers to `flush` and the
+    // boundary logic is never reached.
+
+    fn masker_fn() -> impl Fn(&str) -> String {
+        let eng = GuardrailEngine::new();
+        let cfg = GuardrailConfig::masking();
+        move |s: &str| eng.process_text(s, &cfg)
+    }
+
+    fn drive(chunks: &[&str]) -> String {
+        let mask = masker_fn();
+        let mut m = StreamMasker::new();
+        let mut out = String::new();
+        for c in chunks {
+            out.push_str(&m.push(c, &mask));
+        }
+        out.push_str(&m.flush(&mask));
+        out
+    }
+
+    #[test]
+    fn pii_split_across_chunk_boundary_is_masked() {
+        // The regression this type exists for: per-chunk masking misses this.
+        let pad = "x".repeat(400);
+        let text = format!("{pad} PAN ABCDE1234F {pad}");
+        // Split squarely inside the PAN.
+        let cut = text.find("ABCDE1234F").unwrap() + 4;
+        let out = drive(&[&text[..cut], &text[cut..]]);
+        assert!(!out.contains("ABCDE1234F"), "raw PAN survived the boundary");
+        assert!(out.contains("[PAN_MASKED]"));
+    }
+
+    #[test]
+    fn masked_at_every_split_point_of_the_identifier() {
+        let pad = "x".repeat(400);
+        let text = format!("{pad} PAN ABCDE1234F {pad}");
+        let start = text.find("ABCDE1234F").unwrap();
+        for cut in start..start + "ABCDE1234F".len() {
+            let out = drive(&[&text[..cut], &text[cut..]]);
+            assert!(!out.contains("ABCDE1234F"), "leaked at split {cut}");
+        }
+    }
+
+    #[test]
+    fn clean_stream_round_trips_byte_identically() {
+        // Backward compatibility: no PII ⇒ output is the concatenated input.
+        let text = "y".repeat(1000);
+        let out = drive(&[&text[..300], &text[300..700], &text[700..]]);
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn nothing_is_lost_without_flush_being_called_twice() {
+        let mask = masker_fn();
+        let mut m = StreamMasker::new();
+        let text = "z".repeat(600);
+        let mut out = m.push(&text, &mask);
+        out.push_str(&m.flush(&mask));
+        assert_eq!(out, text);
+        // A second flush is a no-op, not a duplicate emission.
+        assert!(m.flush(&mask).is_empty());
+        assert_eq!(m.buffered_len(), 0);
+    }
+
+    #[test]
+    fn retained_bytes_stay_bounded() {
+        let mask = masker_fn();
+        let mut m = StreamMasker::new();
+        for _ in 0..50 {
+            let _ = m.push(&"q".repeat(200), &mask);
+            assert!(
+                m.buffered_len() <= STREAM_MASK_MAX_CARRY_BYTES,
+                "carry grew past the ceiling: {}",
+                m.buffered_len()
+            );
+        }
+    }
+
+    #[test]
+    fn multibyte_boundaries_do_not_panic_or_corrupt() {
+        // Slicing mid-codepoint panics, which on the streaming path would abort a
+        // live response. Mixed 1/2/3-byte units guarantee the masker's internal
+        // `len - WINDOW` offset lands mid-codepoint and has to be floored.
+        let unit = "aé€"; // 6 bytes
+        let text = unit.repeat(200); // 1200 bytes
+        let cut = unit.len() * 100; // a real char boundary, so the test itself is safe
+        let out = drive(&[&text[..cut], &text[cut..]]);
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn floor_char_boundary_never_splits_a_codepoint() {
+        let s = "aé€";
+        for i in 0..=s.len() {
+            let f = floor_char_boundary(s, i);
+            assert!(
+                s.is_char_boundary(f),
+                "offset {f} from {i} is not a boundary"
+            );
+            assert!(f <= i);
+        }
     }
 }

@@ -456,8 +456,24 @@ pub struct CacheDirective {
     pub namespace: String,
     /// FR-9/FR-18: skip the lookup, execute upstream, overwrite the entry.
     pub force_refresh: bool,
-    /// Only legal with `mode: "semantic"`; ∈ [0.80, 0.999]. PLACEHOLDER until
-    /// the G3.6 eval gate (FR-12) — validated for schema stability only.
+    /// Only legal with `mode: "semantic"`; ∈ [0.80, 0.999].
+    ///
+    /// **This knob can only TIGHTEN.** It is applied as `min_cosine_floor` on the
+    /// [ADR-105] verified lookup, floored *under* each entry's own bounded-error
+    /// cut — so a misconfigured value can narrow what is served but can never
+    /// widen a hit, and a bare cosine number is never the thing standing between
+    /// a caller and a wrong answer.
+    ///
+    /// The safety property is carried by the fidelity gate and the online
+    /// confirmation count, not by this number, and that gate's operating point
+    /// **is** eval-gated: `crates/routeplane/tests/fidelity_eval.rs` (ADR-110
+    /// slice C) asserts the FR-12 false-hit bound of ≤ 1% against the
+    /// CODEOWNER-gated corpus, and runs in the per-PR quality gate ([ADR-032]).
+    ///
+    /// Historical note: this field was marked "PLACEHOLDER until the G3.6 eval
+    /// gate (FR-12) — validated for schema stability only". That has been untrue
+    /// since the fidelity eval landed; the stale comment was read as "semantic
+    /// caching is not safe to enable", which understated what shipped.
     pub similarity_threshold: Option<f64>,
     /// Per-entry size ceiling; ≤ the 256 KiB platform cap, may only lower it
     /// (FR-3/FR-8).
