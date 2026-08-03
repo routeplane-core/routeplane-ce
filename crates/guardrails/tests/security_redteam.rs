@@ -45,6 +45,34 @@ fn corpus_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/security/corpus")
 }
 
+/// Whether the adversarial corpus is present in this checkout.
+///
+/// It always is in this repository — the corpus lives at `tests/security/corpus/`
+/// and this gate is required on every PR. It is NOT present in the Community
+/// Edition export, which ships this test file without the corpus data
+/// ([routeplane#619]): a CE clone therefore ran `cargo test` and got two PANICS
+/// from a *security* gate, which is both a bad first impression and a gate that
+/// does not actually gate.
+///
+/// Whether the corpus should be exported at all is a packaging decision, not a
+/// test concern — note `known_gaps.jsonl` documents an unpatched detector gap, so
+/// publishing it verbatim has a disclosure dimension. Until that is decided, an
+/// absent corpus SKIPS loudly rather than panicking. This changes nothing here
+/// (the corpus is always present), and it does not weaken the gate: a corpus that
+/// goes missing in THIS repo would be a deletion, which review catches.
+fn corpus_available() -> bool {
+    let dir = corpus_dir();
+    if dir.is_dir() {
+        return true;
+    }
+    eprintln!(
+        "SKIPPED: adversarial corpus not found at {} — the red-team gate did NOT run. \
+         This build has no OWASP-LLM-Top-10 detector coverage. See routeplane#619.",
+        dir.display()
+    );
+    false
+}
+
 fn load(rel: &str) -> Vec<Value> {
     let path = corpus_dir().join(rel);
     let body = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
@@ -79,6 +107,9 @@ fn pct(hits: usize, total: usize) -> f64 {
 
 #[test]
 fn redteam_corpus_meets_manifest_floors() {
+    if !corpus_available() {
+        return;
+    }
     // ---- injection (prompt-injection / jailbreak / exfil-intent / tool-poison) ----
     let attacks = load("injection/attacks.jsonl");
     let benign = load("injection/benign.jsonl");
@@ -180,6 +211,9 @@ fn redteam_corpus_meets_manifest_floors() {
 /// nor silently vanish). Mirrors `guardrail_eval::known_gaps_are_excluded`.
 #[test]
 fn redteam_known_gaps_are_excluded_from_scoring() {
+    if !corpus_available() {
+        return;
+    }
     let gaps = load("injection/known_gaps.jsonl");
     assert!(
         !gaps.is_empty(),
