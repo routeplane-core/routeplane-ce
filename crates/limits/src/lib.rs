@@ -1349,6 +1349,15 @@ fn preserve_scope_counters(
 #[derive(Debug)]
 pub struct LimitRegistry {
     inner: ArcSwap<RegistrySnapshot>,
+    /// The deployment's replica count, captured at construction so that a
+    /// later `replace` / `replace_preserving_counters` re-applies the SAME
+    /// ADR-023 §6 share-clamp the registry was built with.
+    ///
+    /// A field rather than a parameter on the replace methods on purpose:
+    /// both rebuilt via `build()` (replicas = 1) and silently dropped the
+    /// clamp, and threading the count through each caller would leave the
+    /// identical footgun armed for the next one.
+    max_replicas: u32,
 }
 
 impl Default for LimitRegistry {
@@ -1362,6 +1371,7 @@ impl LimitRegistry {
     pub fn empty() -> Self {
         Self {
             inner: ArcSwap::from_pointee(RegistrySnapshot::default()),
+            max_replicas: 1,
         }
     }
 
@@ -1440,6 +1450,7 @@ impl LimitRegistry {
         }
         Self {
             inner: ArcSwap::from_pointee(snap),
+            max_replicas,
         }
     }
 
@@ -1452,7 +1463,10 @@ impl LimitRegistry {
     /// [`replace_preserving_counters`](Self::replace_preserving_counters), which
     /// keeps the counts of every scope whose policy did not change.
     pub fn replace(&self, entries: impl IntoIterator<Item = KeyLimitsInput>) {
-        let built = Self::build(entries);
+        // `build_with_replicas(self.max_replicas)`, NOT `build` — `build`
+        // hardcodes one replica, silently dropping the ADR-023 §6 share-clamp
+        // this registry was constructed with.
+        let built = Self::build_with_replicas(entries, self.max_replicas);
         self.inner.store(built.inner.load_full());
     }
 
@@ -1467,7 +1481,12 @@ impl LimitRegistry {
     /// removed scopes simply disappear. Same lock-free single-store swap as
     /// `replace` (one `ArcSwap` store); the diff work is off the hot path.
     pub fn replace_preserving_counters(&self, entries: impl IntoIterator<Item = KeyLimitsInput>) {
-        let built = Self::build(entries);
+        // `build_with_replicas(self.max_replicas)`, NOT `build`. Rebuilding at
+        // one replica un-clamps every cap, and it also breaks counter
+        // preservation as collateral: `same_policy` compares POST-clamp values,
+        // so a clamped 40 never matches an unclamped 1000 and every in-window
+        // count resets at the same instant.
+        let built = Self::build_with_replicas(entries, self.max_replicas);
         let prev = self.inner.load_full();
         // `built` is freshly constructed and unshared ⇒ we can own its snapshot
         // outright and rewrite the unchanged scopes to point back at the prior
@@ -1869,6 +1888,61 @@ mod tests {
         assert!(matches!(g.admit(now), Admission::Allowed(_)));
         assert!(matches!(g.admit(now), Admission::Allowed(_)));
         assert!(matches!(g.admit(now), Admission::Denied(_))); // 4th: clamped to 3
+    }
+
+    #[test]
+    fn replace_preserving_counters_keeps_the_per_replica_clamp() {
+        // REGRESSION: both replace methods rebuilt via `build()`, which hardcodes
+        // one replica, so the ADR-023 §6 share-clamp was silently dropped on
+        // every swap.
+        let inputs = || {
+            vec![entry(
+                "rp_c",
+                "t_c",
+                r#"{"key":{"rate":{"requests_per_min":12}}}"#,
+            )]
+        };
+        let reg = LimitRegistry::build_with_replicas(inputs(), 4);
+        let now = 0;
+        let g = reg.resolve("rp_c", "t_c");
+        for _ in 0..3 {
+            assert!(matches!(g.admit(now), Admission::Allowed(_)));
+        }
+        assert!(matches!(g.admit(now), Admission::Denied(_)));
+
+        reg.replace_preserving_counters(inputs());
+
+        let g2 = reg.resolve("rp_c", "t_c");
+        let admitted = (0..12)
+            .filter(|_| matches!(g2.admit(now), Admission::Allowed(_)))
+            .count();
+        assert!(
+            admitted <= 3,
+            "post-swap cap must stay clamped to ceil(12/4)=3, admitted {admitted}"
+        );
+    }
+
+    #[test]
+    fn replace_keeps_the_per_replica_clamp() {
+        let reg = LimitRegistry::build_with_replicas(
+            vec![entry(
+                "rp_r",
+                "t_r",
+                r#"{"key":{"rate":{"requests_per_min":12}}}"#,
+            )],
+            4,
+        );
+        reg.replace(vec![entry(
+            "rp_r",
+            "t_r",
+            r#"{"key":{"rate":{"requests_per_min":12}}}"#,
+        )]);
+        let now = 0;
+        let g = reg.resolve("rp_r", "t_r");
+        let admitted = (0..12)
+            .filter(|_| matches!(g.admit(now), Admission::Allowed(_)))
+            .count();
+        assert_eq!(admitted, 3, "replace must preserve the 4-replica clamp");
     }
 
     #[test]
