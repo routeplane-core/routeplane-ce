@@ -88,7 +88,7 @@ static PHONE: LazyLock<Regex> = LazyLock::new(|| {
         r"(?x)
         (?:
             \+\d[\d\ \-\.]{6,18}\d           # E.164-ish: +CC then 8-15 digits
-          | \b\d{3}[-.]?\d{3}[-.]?\d{4}\b    # US 3-3-4, separators OPTIONAL (unchanged)
+          | \b\d{3}[-.\ ]?\d{3}[-.\ ]?\d{4}\b # US 3-3-4, separators OPTIONAL, SPACE included
           | \b[6-9]\d{4}[\ \-]\d{5}\b        # India domestic mobile 5-5, lead 6-9
         )",
     )
@@ -107,17 +107,38 @@ static PAN: LazyLock<Regex> = LazyLock::new(|| {
     // entity code the residency classifier already checked: recall AND precision up.
     Regex::new(r"(?i)\b[a-z]{5}[0-9]{4}[a-z]\b").expect("pan regex is valid")
 });
-// India Aadhaar: 12 digits, optionally space/dash grouped 4-4-4. Verhoeff-gated.
+// India Aadhaar: 12 digits, optionally whitespace/dot/dash grouped 4-4-4.
+// Verhoeff-gated. The separator class MIRRORS the residency recognizer's
+// `[\s.-]{0,2}` exactly — it previously accepted a single space/dot/dash while
+// the classifier accepted up to two and any whitespace, so a tab-separated or
+// double-spaced Aadhaar was region-locked for routing and then egressed
+// unmasked. `is_aadhaar` reduces via `digits()`, so the wider span still
+// Verhoeff-validates.
 static AADHAAR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b[2-9]\d{3}[ .-]?\d{4}[ .-]?\d{4}\b").expect("aadhaar regex is valid")
+    Regex::new(r"\b[2-9]\d{3}[\s.-]{0,2}\d{4}[\s.-]{0,2}\d{4}\b").expect("aadhaar regex is valid")
 });
 // Credit card: 13–19 digits, optional space/dash separators. Luhn-gated.
 static CARD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(?:\d[ -]?){13,19}\b").expect("card regex is valid"));
-// EU IBAN (GDPR). 2-letter country + 2 check + 11–30 BBAN. mod-97-gated. Mirrors
-// the residency recognizer so a detected-for-routing IBAN is also masked.
-static IBAN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b").expect("iban regex is valid"));
+// EU IBAN (GDPR). 2-letter country + 2 check + the BBAN, in BOTH the compact
+// electronic form (`GB82WEST12345698765432`) and the ISO 13616 print form of
+// space-separated 4-char groups (`GB82 WEST 1234 5698 7654 32`) — which is how
+// IBANs actually appear in invoices, bank letters and pasted text. mod-97-gated.
+//
+// This comment previously claimed to mirror the residency recognizer; it did
+// not. The classifier accepted the print form and this masker did not, so a
+// print-format IBAN was detected for routing and egressed unmasked.
+//
+// The `{3,8}` group bound is a strict superset of the old compact `{11,30}`:
+// every 11–30-char run splits into 3–8 groups of ≤4 (11 = 4+4+3, 30 = 4×7+2).
+// It is NOT the same range, though — three groups of one char match a 3-char
+// BBAN and eight of four match 32, so the PATTERN spans 3–32. What holds the
+// real bound is `is_iban`, which rejects anything outside 15–34 compact chars
+// before mod-97 runs. That length check is load-bearing, not redundant with the
+// regex — deleting it would widen the recognizer.
+static IBAN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{1,4}){3,8}\b").expect("iban regex is valid")
+});
 // Brazil CPF (LGPD): formatted `DDD.DDD.DDD-DD` (separators required). mod-11-gated.
 static CPF: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b\d{3}\.\d{3}\.\d{3}-\d{2}\b").expect("cpf regex is valid"));
@@ -1331,12 +1352,16 @@ fn is_ipv4(s: &str) -> bool {
 /// IBAN ISO-13616 mod-97 check (digit-by-digit; no big-int). Mirrors the
 /// residency recognizer so masking and routing agree on what an IBAN is.
 fn is_iban(s: &str) -> bool {
-    let b = s.as_bytes();
-    if b.len() < 15 || b.len() > 34 {
+    // Strip the ISO 13616 print-form grouping spaces FIRST. Without this the
+    // mod-97 loop hit its `_ => return false` arm on the first space, so a
+    // print-format IBAN could never validate — and widening the regex above
+    // alone would not have masked it.
+    let compact: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if compact.len() < 15 || compact.len() > 34 {
         return false;
     }
     let mut rem: u32 = 0;
-    for &c in b[4..].iter().chain(b[..4].iter()) {
+    for &c in compact[4..].iter().chain(compact[..4].iter()) {
         match c {
             b'0'..=b'9' => rem = (rem * 10 + u32::from(c - b'0')) % 97,
             b'A'..=b'Z' => rem = (rem * 100 + u32::from(c - b'A') + 10) % 97,
@@ -1618,6 +1643,63 @@ mod tests {
             "PAN [PAN_MASKED] here"
         );
         assert!(scan_pii("ABCDE1234F").contains(&CAT_PAN));
+    }
+
+    #[test]
+    fn separator_variants_the_classifier_accepts_are_also_masked() {
+        // REGRESSION (masker/classifier divergence). Each shape below is matched
+        // by the `routeplane_residency` recognizer — so it region-locks routing
+        // as regulated PII — but the masker's narrower separator class missed
+        // it, and it egressed to the provider IN THE CLEAR. Detected-for-routing
+        // and masked must be the same set; that is the whole contract.
+        assert_eq!(
+            redact("call 415-555-0123").as_ref(),
+            "call [PHONE_MASKED]",
+            "dashed phone (already worked) must keep working"
+        );
+        assert_eq!(
+            redact("call 415 555 0123").as_ref(),
+            "call [PHONE_MASKED]",
+            "space-separated phone is classified as PII and must be masked"
+        );
+        assert_eq!(
+            redact("id 2341  2341  2346 ok").as_ref(),
+            "id [AADHAAR_MASKED] ok",
+            "double-spaced Aadhaar is classified as PII and must be masked"
+        );
+        assert_eq!(
+            redact("id 2341\t2341\t2346 ok").as_ref(),
+            "id [AADHAAR_MASKED] ok",
+            "tab-separated Aadhaar is classified as PII and must be masked"
+        );
+        assert_eq!(
+            redact("pay GB82 WEST 1234 5698 7654 32 now").as_ref(),
+            "pay [IBAN_MASKED] now",
+            "print-format IBAN is classified as PII and must be masked"
+        );
+        assert!(scan_pii("call 415 555 0123").contains(&CAT_PHONE));
+        assert!(scan_pii("id 2341  2341  2346 ok").contains(&CAT_AADHAAR));
+        assert!(scan_pii("pay GB82 WEST 1234 5698 7654 32 now").contains(&CAT_IBAN));
+    }
+
+    #[test]
+    fn widened_separators_keep_their_checksum_gates() {
+        // The widening must not cost precision: Aadhaar stays Verhoeff-gated and
+        // IBAN stays mod-97-gated across the newly-accepted separator forms.
+        let bad_aadhaar = redact("id 2341  2341  2347 ok");
+        assert!(
+            !bad_aadhaar.contains("[AADHAAR_MASKED]"),
+            "Verhoeff-invalid double-spaced candidate must not mask, got {bad_aadhaar}"
+        );
+        let bad_iban = redact("pay GB82 WEST 1234 5698 7654 31 now");
+        assert!(
+            !bad_iban.contains("[IBAN_MASKED]"),
+            "mod-97-invalid print-form candidate must not mask, got {bad_iban}"
+        );
+        assert_eq!(
+            redact("pay GB82WEST12345698765432 now").as_ref(),
+            "pay [IBAN_MASKED] now"
+        );
     }
 
     #[test]
