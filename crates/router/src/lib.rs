@@ -1104,16 +1104,16 @@ mod tests {
     /// success on that provider then ran `clear_key`, an unconditional
     /// `store(0)`, erasing the victim's live 401 dead-key window mid-flight.
     ///
-    /// Fails on the pre-fix code (t_dvara's window reads back as 0).
+    /// Fails on the pre-fix code (t_zephyr's window reads back as 0).
     #[test]
     fn offline_computed_collision_cannot_clear_another_tenants_cooldown() {
         let h = HealthTracker::new(["openai"]);
-        // t_dvara's pool key 0 just returned 401 ⇒ a 10-minute dead-key window.
-        h.cool_key("t_dvara", "openai", 0, 600_000);
+        // t_zephyr's pool key 0 just returned 401 ⇒ a 10-minute dead-key window.
+        h.cool_key("t_zephyr", "openai", 0, 600_000);
 
         // t_acme searches offline for a custom-provider name that lands on
-        // t_dvara's cell. 4096 cells ⇒ a hit within a few thousand candidates.
-        let victim_cell = pre_fix_cell_index("t_dvara", "openai", 0);
+        // t_zephyr's cell. 4096 cells ⇒ a hit within a few thousand candidates.
+        let victim_cell = pre_fix_cell_index("t_zephyr", "openai", 0);
         let colliding = (0..1_000_000u32)
             .map(|n| format!("vllm-{n}"))
             .find(|name| pre_fix_cell_index("t_acme", name, 0) == victim_cell)
@@ -1123,12 +1123,12 @@ mod tests {
         h.clear_key("t_acme", &colliding, 0);
 
         assert_eq!(
-            h.key_cooled_until("t_dvara", "openai", 0),
+            h.key_cooled_until("t_zephyr", "openai", 0),
             600_000,
-            "t_acme cleared t_dvara's dead-key cooldown — t_dvara is now dispatched \
+            "t_acme cleared t_zephyr's dead-key cooldown — t_zephyr is now dispatched \
              back at a credential the gateway knows returns 401 (ADR-087 lockout)"
         );
-        assert!(!h.key_available("t_dvara", "openai", 0, 599_999));
+        assert!(!h.key_available("t_zephyr", "openai", 0, 599_999));
     }
 
     /// The same isolation property under a GENUINE, forced collision on the live
@@ -1138,36 +1138,36 @@ mod tests {
     #[test]
     fn tenants_forced_onto_one_cell_do_not_share_a_cooldown() {
         let h = HealthTracker::new(["openai"]);
-        let victim_cell = h.key_cell_index_for_test("t_dvara", "openai", 0);
+        let victim_cell = h.key_cell_index_for_test("t_zephyr", "openai", 0);
         let colliding = (0..1_000_000u32)
             .map(|n| format!("vllm-{n}"))
             .find(|name| h.key_cell_index_for_test("t_acme", name, 0) == victim_cell)
             .expect("a colliding tuple must exist within the search budget");
 
-        h.cool_key("t_dvara", "openai", 0, 600_000);
+        h.cool_key("t_zephyr", "openai", 0, 600_000);
         // The aliasing tenant must not READ the victim's window…
         assert_eq!(h.key_cooled_until("t_acme", &colliding, 0), 0);
         assert!(h.key_available("t_acme", &colliding, 0, 1));
         // …nor DESTROY it on its own success…
         h.clear_key("t_acme", &colliding, 0);
         assert_eq!(
-            h.key_cooled_until("t_dvara", "openai", 0),
+            h.key_cooled_until("t_zephyr", "openai", 0),
             600_000,
             "an aliasing tenant erased the victim's cooldown"
         );
         // …nor DICTATE it. t_acme controls its own upstream's `Retry-After`, and
         // the proxy multiplies that header by 1000 with no ceiling, so a 24-hour
         // window is entirely attacker-chosen — it must never be reported as
-        // t_dvara's. (Claiming the cell does EVICT t_dvara's stamp: one owner per
+        // t_zephyr's. (Claiming the cell does EVICT t_zephyr's stamp: one owner per
         // cell. That residual is no longer targetable, and it fails toward
-        // "not cooled", which t_dvara's next failure re-cools — as opposed to
+        // "not cooled", which t_zephyr's next failure re-cools — as opposed to
         // inheriting a stranger's 24-hour park, which is unrecoverable.)
         h.cool_key("t_acme", &colliding, 0, 86_400_000);
         assert_eq!(h.key_cooled_until("t_acme", &colliding, 0), 86_400_000);
         assert_ne!(
-            h.key_cooled_until("t_dvara", "openai", 0),
+            h.key_cooled_until("t_zephyr", "openai", 0),
             86_400_000,
-            "t_dvara inherited t_acme's attacker-chosen 24-hour cooldown"
+            "t_zephyr inherited t_acme's attacker-chosen 24-hour cooldown"
         );
     }
 
