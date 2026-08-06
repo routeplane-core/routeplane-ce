@@ -2322,13 +2322,23 @@ mod tests {
                 backoff_cap_ms: 300_000,
                 slots: 64,
             }));
+        // Source B has to be CHOSEN, not hard-coded: the slot seed is
+        // per-instance, so a fixed pair shares a slot on 1 run in `slots` -- at
+        // 64 slots that is 1.6%. A shared slot makes B legitimately throttled,
+        // so the test would be asserting something false rather than catching a
+        // regression.
+        let source_a = "1.1.1.1";
+        let source_b = (0..u8::MAX)
+            .map(|i| format!("2.2.2.{i}"))
+            .find(|s| tracker.slot_index(s) != tracker.slot_index(source_a))
+            .expect("64 slots and 255 candidates: some candidate misses A's slot");
         // Exhaust source A.
         for _ in 0..2 {
             let _ = run_auth(
                 state.clone(),
                 Some(tracker.clone()),
                 Some("rp_wrong"),
-                "1.1.1.1",
+                source_a,
             )
             .await;
         }
@@ -2336,7 +2346,7 @@ mod tests {
             state.clone(),
             Some(tracker.clone()),
             Some("rp_wrong"),
-            "1.1.1.1",
+            source_a,
         )
         .await;
         assert_eq!(a.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -2345,7 +2355,7 @@ mod tests {
             state.clone(),
             Some(tracker.clone()),
             Some("rp_valid_key"),
-            "2.2.2.2",
+            &source_b,
         )
         .await;
         assert_eq!(b.status(), StatusCode::OK);
