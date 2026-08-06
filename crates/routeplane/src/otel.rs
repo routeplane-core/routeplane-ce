@@ -23,8 +23,12 @@
 //!     `gen_ai.provider.name`, `gen_ai.request.model`,
 //!     `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`,
 //!     `gen_ai.usage.total_tokens`, plus the `routeplane.*` custom attributes
-//!     (`routeplane.tenant`, `routeplane.region`,
+//!     (`routeplane.virtual_key` — the virtual key NAME, which is explicitly
+//!     NOT a tenant identity — `routeplane.region`,
 //!     `routeplane.sovereign_routed`, `routeplane.cache_status`, …).
+//!     There is deliberately **no** `routeplane.tenant` attribute: a
+//!     [`UsageEvent`] carries no tenant id, and a span must never assert an
+//!     isolation key it cannot know (see [`event_to_otel_span`]).
 //!
 //! The attributes follow the [OpenTelemetry GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/)
 //! (the `gen_ai.*` namespace) for LLM observability — the stabilized token
@@ -119,6 +123,32 @@ fn operation_name(_event: &UsageEvent) -> &'static str {
     "chat"
 }
 
+/// The preimage the trace id is derived from — this event's identity tuple.
+///
+/// Each component is LENGTH-PREFIXED (`<len>:<value>`) rather than plainly
+/// joined on `:`. A plain join is not injective: `("a:b", "c")` and
+/// `("a", "b:c")` render to the identical string, so two *different* identity
+/// tuples can hash to one trace id and a collector is then free to stitch the
+/// two callers' spans into a single trace. Both `virtual_key_name` (operator
+/// registry) and `model` (straight off the request body — `llama3:8b` and
+/// friends routinely carry a colon) are externally chosen, so a plain join can
+/// promise nothing here. Length-prefixing makes the encoding unambiguous by
+/// construction. Pure function, no I/O, so the property is directly testable.
+fn trace_id_preimage(event: &UsageEvent) -> String {
+    let mut out = String::new();
+    for part in [
+        event.timestamp.to_rfc3339(),
+        event.virtual_key_name.clone(),
+        event.provider.clone(),
+        event.model.clone(),
+    ] {
+        out.push_str(&part.len().to_string());
+        out.push(':');
+        out.push_str(&part);
+    }
+    out
+}
+
 /// Translate a [`UsageEvent`] into an OTLP span aligned to the OTel GenAI
 /// semantic conventions. Pure function — no I/O.
 ///
@@ -134,10 +164,7 @@ pub fn event_to_otel_span(event: &UsageEvent) -> OtelSpan {
     // yet). The latency stats engine tracks real latency; a future enhancement
     // threads it onto UsageEvent. For now, the span is point-in-time.
     let end_nanos = start_nanos;
-    let trace_id = hex_hash(&format!(
-        "{}:{}:{}:{}",
-        event.timestamp, event.virtual_key_name, event.provider, event.model
-    ));
+    let trace_id = hex_hash(&trace_id_preimage(event));
     let span_id = hex_hash(&format!("{}:{}", trace_id, event.total_tokens));
 
     let sentinel = is_sentinel(event);
@@ -187,7 +214,29 @@ pub fn event_to_otel_span(event: &UsageEvent) -> OtelSpan {
     }
 
     // routeplane.* custom attributes — emitted for every event (LLM + sentinel).
-    attributes.push(attr_str("routeplane.tenant", &event.virtual_key_name));
+    //
+    // The virtual key NAME goes under `routeplane.virtual_key` and nowhere else.
+    // It used to be stamped as `routeplane.tenant`, which was wrong in a way
+    // that leaks across tenants: a key name is free-form and is NOT unique
+    // across tenants (a tenant's identity is `VirtualKey::resolved_tenant_id()`,
+    // and one tenant can own many keys), so two tenants that each name a key
+    // `"prod"` emitted the identical `routeplane.tenant="prod"`. In the
+    // collectors this module header names as the consumers (Tempo, Datadog LLM
+    // Observability, Langfuse), a per-tenant view or cost dashboard scoped on
+    // that attribute returned BOTH tenants' models, token counts, regions and
+    // errors interleaved — one tenant's spend billed to the other, one tenant's
+    // traffic visible in the other's view.
+    //
+    // No `routeplane.tenant` is emitted in its place: `UsageEvent` carries no
+    // tenant id, so this process genuinely cannot know the isolation key here,
+    // and fabricating one from the key name is exactly the defect. The
+    // key-ownership mapping that the read APIs use (`analytics_api`,
+    // `logs_api`, `finops_api`, `residency_api` all filter the key registry on
+    // `resolved_tenant_id`) has no equivalent inside a trace backend, so the
+    // honest export is the key name under a key-shaped name. When a tenant id
+    // is threaded onto `UsageEvent`, add `routeplane.tenant` from THAT field —
+    // never from this one.
+    attributes.push(attr_str("routeplane.virtual_key", &event.virtual_key_name));
     attributes.push(attr_bool(
         "routeplane.sovereign_routed",
         event.sovereign_routed,
@@ -657,7 +706,95 @@ mod tests {
         let has_gen_ai = span.attributes.iter().any(|a| a.key.starts_with("gen_ai."));
         assert!(!has_gen_ai, "sentinel spans must carry no gen_ai.* attrs");
         // The routeplane.* custom attributes are still present.
-        assert!(attr_value_str(&span, "routeplane.tenant").is_some());
+        assert!(attr_value_str(&span, "routeplane.virtual_key").is_some());
+    }
+
+    /// REGRESSION — cross-tenant isolation. `routeplane.tenant` was stamped with
+    /// the virtual key NAME. Key names are free-form and not unique across
+    /// tenants (a tenant's identity is `VirtualKey::resolved_tenant_id()`; one
+    /// tenant owns many keys), so two tenants that each call a key `"prod"`
+    /// emitted the identical `routeplane.tenant="prod"` — a per-tenant view or
+    /// cost dashboard scoped on that attribute in Tempo / Datadog / Langfuse
+    /// returned both tenants' models, token counts, regions and errors
+    /// interleaved.
+    ///
+    /// The span must therefore never assert a tenant identity it cannot know:
+    /// the key name is exported under its own key-shaped attribute, and no
+    /// attribute claims to be the isolation key.
+    #[test]
+    fn a_shared_key_name_is_never_exported_as_a_tenant_identity() {
+        // Tenant `t_garth` and tenant `t_dvara` each own a virtual key named
+        // "prod". Nothing forbids that — key names are per-registry labels, not
+        // an isolation boundary — and the UsageEvent carries only the name.
+        let ts = Utc::now();
+        let mk = |key: &str| {
+            let mut ev = sample_event();
+            ev.timestamp = ts;
+            ev.virtual_key_name = key.into();
+            event_to_otel_span(&ev)
+        };
+        let garth = mk("prod");
+        let dvara = mk("prod");
+
+        for (who, span) in [("t_garth", &garth), ("t_dvara", &dvara)] {
+            assert!(
+                attr_value_str(span, "routeplane.tenant").is_none(),
+                "{who}: no span attribute may claim to be the tenant/isolation \
+                 key — the key name is not one, and the event carries no tenant id"
+            );
+            assert_eq!(
+                attr_value_str(span, "routeplane.virtual_key"),
+                Some("prod"),
+                "{who}: the key name is still exported, under a key-shaped name"
+            );
+        }
+
+        // And nothing else smuggles the key name in under a tenant-ish key.
+        for span in [&garth, &dvara] {
+            assert!(
+                !span
+                    .attributes
+                    .iter()
+                    .any(|a| a.key.contains("tenant") || a.key.contains("customer")),
+                "no tenant-shaped attribute may be derived from the key name"
+            );
+        }
+    }
+
+    /// The trace-id preimage must be injective over the identity tuple, or two
+    /// different callers' spans can hash to one trace id and be stitched into a
+    /// single trace by the collector. Both `virtual_key_name` and `model` are
+    /// externally chosen and may contain the separator, so a plain `a:b:c` join
+    /// could not promise this.
+    #[test]
+    fn trace_id_preimage_is_injective_across_the_separator() {
+        let ts = Utc::now();
+        let mk = |key: &str, provider: &str, model: &str| {
+            let mut ev = sample_event();
+            ev.timestamp = ts;
+            ev.virtual_key_name = key.into();
+            ev.provider = provider.into();
+            ev.model = model.into();
+            ev
+        };
+        // Same characters, different tuple boundaries:
+        //   ("team:openai", "gpt-4o", "llama3") vs ("team", "openai", "gpt-4o:llama3")
+        // Under a plain `:` join both render to "…:team:openai:gpt-4o:llama3"
+        // and collide.
+        let a = mk("team:openai", "gpt-4o", "llama3");
+        let b = mk("team", "openai", "gpt-4o:llama3");
+        assert_ne!(trace_id_preimage(&a), trace_id_preimage(&b));
+        assert_ne!(
+            event_to_otel_span(&a).trace_id,
+            event_to_otel_span(&b).trace_id,
+            "distinct identity tuples must not derive the same trace id"
+        );
+
+        // Determinism is preserved: the same tuple still yields the same id.
+        assert_eq!(
+            event_to_otel_span(&mk("prod", "openai", "gpt-4o")).trace_id,
+            event_to_otel_span(&mk("prod", "openai", "gpt-4o")).trace_id
+        );
     }
 
     #[test]
