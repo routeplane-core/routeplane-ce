@@ -5,9 +5,11 @@
 //! Contract:
 //!   * `POST /v1/console/signup` → `{email, password}`. 201 + a session object
 //!     (auto-login). 400 on shape failures; 409 on a duplicate email.
-//!     **Open signup is intentional for a self-hosted CE** — the first (and
-//!     usually only) operator bootstraps their own account; invite/approval
-//!     gating is an Enterprise concern, not built here.
+//!     **DEFAULT OFF** — 403 `routeplane_signup_disabled` unless the operator
+//!     explicitly opts in with `RP_CONSOLE_SIGNUP` (see [`SignupEnabled`]).
+//!     Public self-service minting is the entry point to the console tenant's
+//!     entire authorization surface, so it is not something a self-hoster
+//!     should acquire merely by exposing the gateway's port.
 //!   * `POST /v1/console/login`  → `{email, password}`. 200 + a session object.
 //!     EVERY failure (unknown email, wrong password, malformed email) is the
 //!     SAME generic 401 after the SAME fixed delay — no enumeration oracle.
@@ -143,13 +145,71 @@ fn dummy_hash() -> &'static str {
         .as_str()
 }
 
-/// `POST /v1/console/signup` (PUBLIC) — create an account + auto-login.
+/// Is PUBLIC self-service console signup live on this gateway?
+///
+/// **Default OFF.** `POST /v1/console/signup` sits on the PUBLIC pre-auth
+/// router with no invite, no domain allowlist and no account cap — only a
+/// per-IP throttle. Combined with the process-global console→gateway-key
+/// binding (`ConsoleAuthBridge::console_key`), an account minted by ANYONE who
+/// can reach the port authorizes as the console tenant across the whole authed
+/// router: `/v1/logs`, `/v1/analytics`, `/v1/finops/usage`,
+/// `/v1/residency/ledger` and `/v1/chat/completions` — dispatched on that
+/// tenant's provider keys and billed to them — while `GET
+/// /v1/console/api-key` hands back their raw `rp_` credential verbatim. CE is
+/// the edition people self-host and expose, so open minting is the wrong
+/// default.
+///
+/// Resolved ONCE at boot ([`signup_enabled_from_env`]) and injected as a
+/// request extension, the `SharedConsoleThrottle` pattern — a security control
+/// fixed at router-wiring time, not re-read per request, and therefore
+/// provable in a router test without mutating process-global env.
+///
+/// Operators who genuinely want open self-service signup opt in explicitly
+/// with `RP_CONSOLE_SIGNUP=on`. Login, sessions and the rest of the console
+/// are untouched: this closes only unauthenticated account *minting*.
+#[derive(Clone, Copy, Debug)]
+pub struct SignupEnabled(pub bool);
+
+/// Read the opt-in from `RP_CONSOLE_SIGNUP`. Called once, at boot.
+pub fn signup_enabled_from_env() -> SignupEnabled {
+    SignupEnabled(signup_enabled_from(
+        &std::env::var("RP_CONSOLE_SIGNUP").unwrap_or_default(),
+    ))
+}
+
+/// The pure half, so the default-OFF semantics are testable without mutating
+/// process env (which races across parallel tests). Anything that is not an
+/// affirmative opt-in — including absent, empty, and unrecognised — reads as
+/// OFF.
+fn signup_enabled_from(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "on" | "true" | "1" | "yes" | "enable" | "enabled"
+    )
+}
+
+/// `POST /v1/console/signup` (PUBLIC, default-OFF) — create an account + auto-login.
 pub async fn signup(
     Extension(bridge): Extension<SharedConsoleAuth>,
     Extension(throttle): Extension<SharedConsoleThrottle>,
+    Extension(signup_enabled): Extension<SignupEnabled>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     OpenAiJson(req): OpenAiJson<CredentialsRequest>,
 ) -> Response {
+    // Default-OFF gate BEFORE any other work: unauthenticated account minting
+    // is the entry point to the console tenant's whole authorization surface.
+    // (A missing extension is a 500 from axum's extractor — also a refusal, so
+    // a mis-wired router cannot mint either.)
+    if !signup_enabled.0 {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "routeplane_signup_disabled",
+            "Self-service console signup is disabled on this gateway. An operator must \
+             enable it (RP_CONSOLE_SIGNUP) or provision the account directly.",
+            "invalid_request_error",
+            None,
+        );
+    }
     // Per-IP throttle FIRST (before any argon2 work) — bounds signup-flood
     // argon2 DoS and shares the login budget. Each attempt counts toward the IP.
     let source = throttle_key(&peer);
@@ -204,8 +264,9 @@ pub async fn signup(
     match tokio::spawn(async move { store.create(create_email, password_hash).await }).await {
         Ok(Ok(account)) => {
             // 409: signup necessarily reveals email existence (it must refuse
-            // the duplicate) — acceptable for an open self-host signup; LOGIN
-            // stays enumeration-safe.
+            // the duplicate). Acceptable now that reaching this point at all
+            // requires the operator's explicit `RP_CONSOLE_SIGNUP` opt-in;
+            // LOGIN stays enumeration-safe regardless.
             match bridge.issue(&account.email, account.session_version) {
                 Ok(token) => {
                     tracing::info!("console account created"); // no email/PII in logs
@@ -407,7 +468,16 @@ mod tests {
     /// me/logout AND a data-plane probe that echoes the resolved VirtualKey —
     /// proving a session authorizes a normal data-plane call as the console
     /// tenant without the browser ever seeing the rp_ key.
+    ///
+    /// Signup is default-OFF in production, so the functional tests below opt
+    /// in EXPLICITLY via the injected `SignupEnabled(true)` — no process env is
+    /// touched, so nothing here can mask the default for a parallel test.
     fn test_stack() -> (Router, SharedConsoleAuth) {
+        signup_stack(SignupEnabled(true))
+    }
+
+    /// `test_stack` with the signup gate pinned, for the default-OFF regression.
+    fn signup_stack(signup_enabled: SignupEnabled) -> (Router, SharedConsoleAuth) {
         let auth = AuthState::load_from_json(
             r#"{"keys":[
                 {"name":"Console Key","routeplane_key":"rp_console_test","provider_keys":{},"tenant_id":"t_console"},
@@ -452,6 +522,7 @@ mod tests {
             .route("/v1/console/login", post(login))
             .layer(axum::Extension(bridge.clone()))
             .layer(axum::Extension(throttle))
+            .layer(axum::Extension(signup_enabled))
             .layer(axum::extract::connect_info::MockConnectInfo(
                 "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
             ))
@@ -850,5 +921,90 @@ mod tests {
             "429 must carry a Retry-After"
         );
         assert_eq!(body_json(resp).await["error"]["code"], "too_many_attempts");
+    }
+
+    /// REGRESSION (cross-tenant isolation): `POST /v1/console/signup` sat on
+    /// the PUBLIC pre-auth router with no invite, no domain allowlist and no
+    /// account cap. The registry here holds TWO tenants — `t_console`
+    /// (`rp_console_test`) and `t_other` (`rp_other`) — and the console bridge
+    /// binds sessions to `t_console`. So any stranger who could reach the port
+    /// minted an account that authorized as `t_console` for the entire authed
+    /// router, spending `t_console`'s provider keys and reading its logs,
+    /// analytics and usage. `t_other`'s operator (and every unauthenticated
+    /// passer-by) must not be able to acquire `t_console`'s authority by
+    /// filling in a signup form.
+    ///
+    /// Minting is now opt-in. The refusal is asserted on the error CODE, not a
+    /// bare status: 403 is not otherwise used on this route.
+    #[tokio::test]
+    async fn default_off_signup_denies_a_stranger_the_console_tenants_authority() {
+        let (app, _) = signup_stack(SignupEnabled(false));
+
+        let resp = app
+            .clone()
+            .oneshot(json_post(
+                "/v1/console/signup",
+                serde_json::json!({"email":"stranger@example.com","password":"a-long-password"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "public signup must be refused unless the operator opted in"
+        );
+        assert_eq!(
+            body_json(resp).await["error"]["code"],
+            "routeplane_signup_disabled",
+            "gateway-original codes carry the routeplane_ prefix"
+        );
+
+        // The refusal is total: no account was created, so the stranger cannot
+        // log in either — and therefore never holds a session that would
+        // resolve to `t_console` on the authed router.
+        let resp = app
+            .clone()
+            .oneshot(json_post(
+                "/v1/console/login",
+                serde_json::json!({"email":"stranger@example.com","password":"a-long-password"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a refused signup must not have created an account"
+        );
+
+        // Control: the SAME request against a stack whose operator opted in
+        // succeeds, so the assertion above pins the gate and not a typo in the
+        // request body.
+        let (opted_in, _) = signup_stack(SignupEnabled(true));
+        let resp = opted_in
+            .oneshot(json_post(
+                "/v1/console/signup",
+                serde_json::json!({"email":"stranger@example.com","password":"a-long-password"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// The default is OFF and only an affirmative opt-in flips it. Pure, so no
+    /// parallel test mutating process env can mask it.
+    #[test]
+    fn signup_is_disabled_unless_explicitly_enabled() {
+        // An unset variable reads as the empty string — this IS the default.
+        assert!(!signup_enabled_from(""), "signup must default to OFF");
+        for off in [
+            "off", "false", "0", "no", "disable", "disabled", "maybe", " ", "onn",
+        ] {
+            assert!(!signup_enabled_from(off), "{off:?} must not enable signup");
+        }
+        for on in [
+            "on", "true", "1", "yes", "enable", "enabled", " On ", "TRUE",
+        ] {
+            assert!(signup_enabled_from(on), "{on:?} must enable signup");
+        }
     }
 }
