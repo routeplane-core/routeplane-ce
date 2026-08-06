@@ -207,6 +207,54 @@ use crate::guardrails::GuardrailEngine;
 use crate::guardrails::TokenizerKey;
 use crate::observability::ObservabilityEngine;
 
+/// Why the console→gateway-key binding was refused at boot.
+#[derive(Debug, PartialEq, Eq)]
+enum ConsoleKeyError {
+    /// The key registry holds nothing to bind to.
+    NoKeysRegistered,
+    /// `RP_CONSOLE_KEY` names a key that is not in the registry.
+    NotRegistered,
+    /// More than one key — i.e. potentially more than one TENANT — is
+    /// registered, the operator named none, and a console session can actually
+    /// be minted or presented. Picking one would hand the console an arbitrary
+    /// tenant's authority.
+    AmbiguousTenant { registered: usize },
+}
+
+/// Resolve the ONE gateway key a valid console session authorizes as.
+///
+/// `auth.rs` resolves the ENTIRE authed router through this key, so it is a
+/// cross-tenant authorization decision, not a convenience default. When the
+/// operator has not named a key and the registry holds several, there is no
+/// safe guess — refuse. `registered_sorted` must be sorted so the single-key
+/// and configured-key answers are deterministic across restarts (HashMap
+/// iteration order is not).
+///
+/// `console_can_authorize` is false when no console session could possibly
+/// exist (empty account store AND signup disabled); the binding is then inert
+/// and ambiguity cannot be exploited, so the gateway is allowed to serve its
+/// rp_-keyed traffic instead of refusing to boot over a dormant seam.
+fn resolve_console_key(
+    configured: Option<&str>,
+    registered_sorted: &[String],
+    console_can_authorize: bool,
+) -> Result<String, ConsoleKeyError> {
+    if let Some(k) = configured.map(str::trim).filter(|k| !k.is_empty()) {
+        return if registered_sorted.iter().any(|id| id == k) {
+            Ok(k.to_string())
+        } else {
+            Err(ConsoleKeyError::NotRegistered)
+        };
+    }
+    match registered_sorted.first() {
+        None => Err(ConsoleKeyError::NoKeysRegistered),
+        Some(only) if registered_sorted.len() == 1 || !console_can_authorize => Ok(only.clone()),
+        Some(_) => Err(ConsoleKeyError::AmbiguousTenant {
+            registered: registered_sorted.len(),
+        }),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Load .env file if it exists
@@ -498,46 +546,84 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // PUBLIC self-service signup, resolved ONCE here and injected into the
+    // console router below. Default OFF — see console_api::SignupEnabled.
+    let signup_enabled = crate::console_api::signup_enabled_from_env();
+    // Can a console session EVER authorize on this process? Only if an account
+    // can exist: `ConsoleAuthBridge::verify` requires a live account row, and
+    // the sole way to create one is `POST /v1/console/signup`. So an empty
+    // account store with signup OFF means no session can ever verify, and the
+    // console→key binding below is inert for this process lifetime.
+    let console_can_authorize = signup_enabled.0 || !console_accounts.is_empty();
+
     // The gateway key a valid console session authorizes as (single-tenant
     // CE). RP_CONSOLE_KEY must name a REGISTERED key when set (fail-closed at
     // boot — a console silently mapping to nothing, or to a guessed key, is an
-    // authz failure); default = the registry's only key, else the
-    // lexicographically-first routeplane_key (deterministic across restarts —
-    // HashMap iteration order is not). Only the key NAME is ever logged.
+    // authz failure); default = the registry's only key. Only the key NAME is
+    // ever logged.
     let console_key = {
         let snapshot = auth_state.load();
-        let resolved = match std::env::var("RP_CONSOLE_KEY") {
-            Ok(k) if !k.trim().is_empty() => {
-                let k = k.trim().to_string();
-                if !snapshot.keys.contains_key(&k) {
-                    tracing::error!(
-                        "RP_CONSOLE_KEY does not match any key in the registry (refusing to start)"
-                    );
-                    std::process::exit(1);
-                }
-                k
+        let mut ids: Vec<String> = snapshot.keys.keys().cloned().collect();
+        ids.sort_unstable();
+        let configured = std::env::var("RP_CONSOLE_KEY").ok();
+        let resolved = match resolve_console_key(configured.as_deref(), &ids, console_can_authorize)
+        {
+            Ok(k) => k,
+            Err(ConsoleKeyError::NotRegistered) => {
+                tracing::error!(
+                    "RP_CONSOLE_KEY does not match any key in the registry (refusing to start)"
+                );
+                std::process::exit(1);
             }
-            _ => {
-                let mut ids: Vec<&String> = snapshot.keys.keys().collect();
-                ids.sort_unstable();
-                match ids.first() {
-                    Some(id) => {
-                        if ids.len() > 1 {
-                            tracing::info!(
-                                "multiple gateway keys registered; console sessions default to the first (set RP_CONSOLE_KEY to choose)"
-                            );
-                        }
-                        (*id).clone()
-                    }
-                    // Unreachable in practice (an empty registry refuses to
-                    // start above) — but never panic on the boot path either.
-                    None => {
-                        tracing::error!("key registry is empty; cannot bind a console key");
-                        std::process::exit(1);
-                    }
-                }
+            // Unreachable in practice (an empty registry refuses to start
+            // above) — but never panic on the boot path either.
+            Err(ConsoleKeyError::NoKeysRegistered) => {
+                tracing::error!("key registry is empty; cannot bind a console key");
+                std::process::exit(1);
+            }
+            // FAIL CLOSED on ambiguity. This used to log INFO and silently bind
+            // every console session to the lexicographically-first key — i.e.
+            // to an ARBITRARY tenant that nothing in the console flow ever
+            // consulted. Because auth.rs resolves the whole authed router
+            // through `console_key`, that made a console session authorize as
+            // that tenant for /v1/logs, /v1/analytics, /v1/finops/usage,
+            // /v1/residency/ledger AND /v1/chat/completions — dispatched on
+            // their provider keys and billed to them — while
+            // GET /v1/console/api-key handed back their raw rp_ credential.
+            //
+            // Same doctrine as the RP_CONSOLE_KEY-names-no-key branch above:
+            // refuse to start rather than guess which tenant the operator
+            // meant. Booting into a cross-tenant authorization hole is worse
+            // than not booting.
+            Err(ConsoleKeyError::AmbiguousTenant { registered }) => {
+                tracing::error!(
+                    registered_keys = registered,
+                    "{} gateway keys are registered and RP_CONSOLE_KEY is unset — a console \
+                     session would bind to an ARBITRARY tenant and authorize as it across the \
+                     whole authed API. Set RP_CONSOLE_KEY to choose explicitly (refusing to \
+                     start).",
+                    registered
+                );
+                std::process::exit(1);
             }
         };
+        // Ambiguous, but no session can exist to exploit it (empty account
+        // store + signup off). Say so loudly rather than silently binding: the
+        // moment an account appears or signup is enabled, boot will refuse.
+        if ids.len() > 1
+            && configured
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        {
+            tracing::warn!(
+                registered_keys = ids.len(),
+                "multiple gateway keys registered and RP_CONSOLE_KEY is unset; console sessions \
+                 are unavailable (no console accounts and RP_CONSOLE_SIGNUP is off). Set \
+                 RP_CONSOLE_KEY before enabling the console."
+            );
+        }
         let key_name = snapshot
             .keys
             .get(&resolved)
@@ -1348,10 +1434,12 @@ async fn main() {
     // CE Console auth (PUBLIC): signup + login live OUTSIDE the auth layer —
     // they CREATE/EXCHANGE the credential. Both argon2-verify on the blocking
     // pool; login adds a fixed failure delay + dummy-verify (no enumeration /
-    // timing oracle). Open signup is intentional for a self-hosted CE (the
-    // operator bootstraps their own account); invite/approval gating is an
-    // Enterprise concern. Bodies are bounded by axum's default 2 MiB limit,
-    // and password length is capped before hashing (argon2-DoS guard).
+    // timing oracle). Signup is DEFAULT-OFF (RP_CONSOLE_SIGNUP): the route is
+    // reachable by anyone who can reach the port, and the account it mints
+    // authorizes as the console tenant across the whole authed API, so open
+    // minting is not something a self-hoster should get by accident. Bodies
+    // are bounded by axum's default 2 MiB limit, and password length is capped
+    // before hashing (argon2-DoS guard).
     // Always-on per-source-IP throttle for the PUBLIC credential routes (the
     // only unauthenticated password endpoints). Dedicated instance, tuned looser
     // than the keyed default so a fumbling operator isn't locked out, but tight
@@ -1367,11 +1455,23 @@ async fn main() {
                 slots: 4_096,
             },
         ));
+    if signup_enabled.0 {
+        tracing::warn!(
+            "public console signup is ENABLED (RP_CONSOLE_SIGNUP): anyone who can reach this \
+             gateway can mint an account that authorizes as the console tenant"
+        );
+    } else {
+        tracing::info!(
+            "public console signup: disabled (default; set RP_CONSOLE_SIGNUP=on to allow \
+             self-service account creation)"
+        );
+    }
     let console_public = Router::new()
         .route("/v1/console/signup", post(crate::console_api::signup))
         .route("/v1/console/login", post(crate::console_api::login))
         .layer(axum::Extension(console_bridge.clone()))
-        .layer(axum::Extension(console_throttle));
+        .layer(axum::Extension(console_throttle))
+        .layer(axum::Extension(signup_enabled));
 
     // Build our application. Security/hygiene response headers wrap the whole
     // app (public + authed + status) — 2026-06-12 dogfood found none were set.
@@ -1794,5 +1894,97 @@ mod tests {
         assert_eq!(shed.headers().get("x-routeplane-shed").unwrap(), "capacity");
         assert!(shed.headers().get("retry-after").is_some());
         assert!(shed_total() > before, "shed_total must increment");
+    }
+
+    /// REGRESSION (cross-tenant isolation): with two tenants registered and
+    /// `RP_CONSOLE_KEY` unset, the console→gateway-key binding used to fall
+    /// back to the LEXICOGRAPHICALLY-FIRST key and log it at INFO.
+    ///
+    /// Here that is `rp_acme` → tenant `t_acme`. `auth.rs` resolves the entire
+    /// authed router through this key, so every console session — including one
+    /// minted by Zephyr's operator, or by a stranger via public signup — would
+    /// have authorized as **Acme**: reading `/v1/logs`, `/v1/analytics` and
+    /// `/v1/finops/usage` for Acme, spending Acme's provider keys on
+    /// `/v1/chat/completions`, and collecting Acme's raw `rp_` credential from
+    /// `GET /v1/console/api-key`. Zephyr must never observe or spend Acme, and
+    /// sort order is not consent.
+    ///
+    /// The binding must now be REFUSED, not guessed.
+    #[test]
+    fn console_key_binding_refuses_to_pick_between_two_tenants() {
+        use super::{resolve_console_key, ConsoleKeyError};
+        use crate::auth::AuthState;
+
+        // Two tenants, deliberately named so `rp_acme` sorts before `rp_zephyr`.
+        let registry = AuthState::load_from_json(
+            r#"{"keys":[
+                {"name":"Acme","routeplane_key":"rp_acme","provider_keys":{},"tenant_id":"t_acme"},
+                {"name":"Zephyr","routeplane_key":"rp_zephyr","provider_keys":{},"tenant_id":"t_zephyr"}
+            ]}"#,
+            "test",
+        )
+        .expect("registry");
+        // The stake: these really are two different tenants.
+        assert_ne!(
+            registry.keys["rp_acme"].resolved_tenant_id(),
+            registry.keys["rp_zephyr"].resolved_tenant_id(),
+        );
+        let mut ids: Vec<String> = registry.keys.keys().cloned().collect();
+        ids.sort_unstable();
+        assert_eq!(ids.first().map(String::as_str), Some("rp_acme"));
+
+        // THE REGRESSION: no operator choice + a console that can authorize
+        // ⇒ refuse. Must NOT silently return Acme's key.
+        assert_eq!(
+            resolve_console_key(None, &ids, true),
+            Err(ConsoleKeyError::AmbiguousTenant { registered: 2 }),
+            "an unnamed console key must not silently bind to Acme just because it sorts first"
+        );
+        // Same for an env var that is present but blank/whitespace.
+        for blank in [Some(""), Some("   ")] {
+            assert_eq!(
+                resolve_console_key(blank, &ids, true),
+                Err(ConsoleKeyError::AmbiguousTenant { registered: 2 }),
+                "a blank RP_CONSOLE_KEY is not a choice"
+            );
+        }
+
+        // An EXPLICIT choice still binds — and binds to exactly what was named,
+        // for either tenant. This is the operator's consent, so it is honoured.
+        assert_eq!(
+            resolve_console_key(Some("rp_zephyr"), &ids, true).as_deref(),
+            Ok("rp_zephyr")
+        );
+        assert_eq!(
+            resolve_console_key(Some(" rp_acme "), &ids, true).as_deref(),
+            Ok("rp_acme")
+        );
+        // A named key that is not registered still fails closed, unchanged.
+        assert_eq!(
+            resolve_console_key(Some("rp_ghost"), &ids, true),
+            Err(ConsoleKeyError::NotRegistered)
+        );
+
+        // Single-tenant CE — the overwhelmingly common self-host shape — is
+        // unambiguous and keeps working with no configuration.
+        let one = ["rp_only".to_string()];
+        assert_eq!(
+            resolve_console_key(None, &one, true).as_deref(),
+            Ok("rp_only")
+        );
+
+        // Ambiguous but INERT (no console accounts and signup off ⇒ no session
+        // can ever verify) is allowed to boot: the seam is dormant, and the
+        // gateway must still serve its rp_-keyed traffic.
+        assert_eq!(
+            resolve_console_key(None, &ids, false).as_deref(),
+            Ok("rp_acme")
+        );
+
+        // An empty registry has nothing to bind to.
+        assert_eq!(
+            resolve_console_key(None, &[], true),
+            Err(ConsoleKeyError::NoKeysRegistered)
+        );
     }
 }
