@@ -23,13 +23,25 @@
 //!   cannot both reach the provider — the first wins the CAS and gets `Reserved`,
 //!   the loser observes the in-flight marker and is told `InFlight` (→ 409).
 //! - **Bounded + TTL**: entries expire after a configurable TTL and each shard is
-//!   capped by entry count (FIFO/TTL eviction at reserve time), so a hostile or
-//!   buggy client can never grow memory without bound.
+//!   capped by entry count (TTL-then-max-min-fair eviction at reserve time), so a
+//!   hostile or buggy client can never grow memory without bound.
 //!
 //! ## Tenant isolation
-//! `tenant_id` and the client key are STRUCTURAL fields of [`IdempotencyKey`]
-//! (they participate in `Eq`/`Hash`), so tenant A's key can never collide with
-//! tenant B's — isolation by construction, exactly like [`super::CacheKey`].
+//! Two separate properties, and BOTH are load-bearing:
+//! - **Lookup.** `tenant_id` and the client key are STRUCTURAL fields of
+//!   [`IdempotencyKey`] (they participate in `Eq`/`Hash`), so tenant A's key can
+//!   never collide with tenant B's — isolation by construction, exactly like
+//!   [`super::CacheKey`].
+//! - **Capacity.** Eviction is max-min fair — the tenant holding the most of a
+//!   shard pays first ([`IdempotencyStore::evict_if_needed`]). Shard placement is
+//!   a pure SHA-256 of `(tenant_id, key)`, so any tenant can grind client-key
+//!   strings offline until they all land in a victim's shard; under the plain
+//!   shard-wide FIFO this replaced, that flood flushed the victim's stored 2xx
+//!   responses (oldest first — exactly the ones a retry depends on). The victim's
+//!   next retry then re-dispatched to the provider and the victim was **charged
+//!   twice** for a call its idempotency key was supposed to make exactly-once.
+//!   Capacity is therefore a billing-integrity boundary here, not just a memory
+//!   knob.
 //!
 //! ## What is and isn't stored
 //! Only a **2xx** response is stored (status + body bytes + content-type) along
@@ -53,9 +65,10 @@ pub const IDEMP_SHARD_COUNT: usize = 64;
 /// Default time-to-live for a stored idempotent response: 24 hours
 /// (Stripe's window). Overridable at construction via [`IdempotencyStore::with_ttl`].
 pub const DEFAULT_IDEMPOTENCY_TTL_SECONDS: u64 = 24 * 60 * 60;
-/// Default cap on stored entries PER SHARD (so the whole store is bounded at
-/// `IDEMP_SHARD_COUNT * this`). Eviction at reserve time is TTL-first, then FIFO
-/// by creation time — the same approximate-LRU doctrine as the cache.
+/// Cap on stored entries PER SHARD across ALL tenants (so the whole store is
+/// bounded at `IDEMP_SHARD_COUNT * this`). Eviction at reserve time is TTL-first,
+/// then max-min fair: the tenant holding the MOST of the shard pays, oldest of
+/// its own entries first — see [`IdempotencyStore::evict_if_needed`].
 pub const DEFAULT_MAX_ENTRIES_PER_SHARD: usize = 4096;
 /// Per-body hard cap (256 KiB) — an oversize 2xx body is simply not stored (the
 /// reservation is released), so the response is still returned but a future
@@ -282,7 +295,9 @@ impl IdempotencyStore {
             let mut map: ShardMap = (**current).clone();
             // Drop the expired/stale slot for this key (if any) before inserting.
             map.remove(key);
-            self.evict_if_needed(&mut map, now);
+            // The inserting tenant is passed so eviction can charge the flooder
+            // first and never a smaller neighbour — see `evict_if_needed`.
+            self.evict_if_needed(&mut map, now, &key.tenant_id);
             map.insert(
                 key.clone(),
                 Slot::InFlight {
@@ -382,31 +397,82 @@ impl IdempotencyStore {
         }
     }
 
-    /// Evict to keep a shard map under its entry cap: TTL-first, then FIFO by
-    /// creation time. Called inside the reserve CoW (the writer already holds the
-    /// fresh clone), so it never races a reader. The cap is checked BEFORE the
-    /// new marker is inserted, leaving room for it.
-    fn evict_if_needed(&self, map: &mut ShardMap, now: u64) {
+    /// Evict to keep a shard map bounded — WITHOUT letting one tenant's insert
+    /// pressure flush another tenant's entries. Called inside the reserve CoW
+    /// (the writer already holds the fresh clone), so it never races a reader.
+    /// Caps are checked BEFORE the new marker is inserted, leaving room for it.
+    ///
+    /// Two stages, in order:
+    /// 1. **TTL sweep** (all tenants). An expired slot is unusable by anyone, so
+    ///    dropping it is not a cross-tenant action.
+    /// 2. **Max-min fair eviction.** The tenant holding the MOST entries in this
+    ///    shard pays, oldest of *its own* entries first, with ties going to the
+    ///    tenant doing the inserting (see [`eviction_victim`]). So a tenant is
+    ///    never evicted by a neighbour that holds at least as much of the shard
+    ///    as it does: a flooder always drains itself first, and can only push
+    ///    another tenant down to parity, never below it. Each tenant's floor is
+    ///    its equal share of the shard — the strongest floor a fixed-size shared
+    ///    store can offer, and work-conserving (a lone tenant still gets the
+    ///    whole shard).
+    ///
+    /// **Do not go back to a shard-wide FIFO.** Shard placement is a pure SHA-256
+    /// of `(tenant_id, key)`, so a tenant can grind its own client keys offline
+    /// until they all land in a victim's shard. A shard-wide FIFO then lets that
+    /// flood delete the victim's stored 2xx responses — oldest first, i.e.
+    /// precisely the long-lived ones a retry depends on. The victim's next retry
+    /// stops being a `Replay`, re-dispatches to the provider, and the victim is
+    /// **charged twice** for a call its idempotency key was supposed to make
+    /// exactly-once. Same for the `InFlight` markers: evicting one breaks the
+    /// "two concurrent identical requests cannot both reach the provider"
+    /// guarantee for that tenant. Capacity here is a billing-integrity boundary,
+    /// not just a memory knob.
+    ///
+    /// Cost is unchanged below the cap (one integer compare); the counting pass
+    /// only runs on a shard already at its ceiling, where `reserve` is in any
+    /// case already cloning the whole map.
+    fn evict_if_needed(&self, map: &mut ShardMap, now: u64, tenant_id: &str) {
         if map.len() < self.max_entries_per_shard {
             return;
         }
-        // 1) TTL-first: drop everything already expired.
+        // 1) TTL-first: drop everything already expired, whoever owns it.
         map.retain(|_, slot| !slot.expired(now));
         if map.len() < self.max_entries_per_shard {
             return;
         }
-        // 2) FIFO by creation time until we're back under the cap (leaving one
-        //    slot free for the marker about to be inserted).
-        let mut by_age: Vec<(IdempotencyKey, u64)> = map
+
+        // 2) Max-min fair eviction down to the cap (leaving one slot free for the
+        //    marker about to be inserted).
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for k in map.keys() {
+            *counts.entry(k.tenant_id.clone()).or_insert(0) += 1;
+        }
+        let mut oldest_first: Vec<(IdempotencyKey, u64)> = map
             .iter()
             .map(|(k, s)| (k.clone(), s.created_at_ms()))
             .collect();
-        by_age.sort_by_key(|(_, created)| *created);
-        for (k, _) in by_age {
-            if map.len() < self.max_entries_per_shard {
+        oldest_first.sort_by_key(|(_, created)| *created);
+        while map.len() >= self.max_entries_per_shard {
+            let Some(victim) = eviction_victim(&counts, tenant_id) else {
                 break;
-            }
+            };
+            // Take the victim's OLDEST remaining entry.
+            let Some(pos) = oldest_first.iter().position(|(k, _)| k.tenant_id == victim) else {
+                // Defensive: counts are derived from `map`, so this cannot
+                // happen — drop the stale tally rather than spin.
+                counts.remove(&victim);
+                continue;
+            };
+            let (k, _) = oldest_first.remove(pos);
             map.remove(&k);
+            // Read the tally out as a value (statement-scoped borrow) before
+            // mutating `counts`; drop the tenant once it holds nothing, so the
+            // next round picks a different victim.
+            let remaining = counts.get(&victim).copied().unwrap_or(0);
+            if remaining > 1 {
+                counts.insert(victim, remaining - 1);
+            } else {
+                counts.remove(&victim);
+            }
         }
     }
 
@@ -456,6 +522,30 @@ impl Default for IdempotencyStore {
     }
 }
 
+/// Pick which tenant pays when a shard is at its cap: the largest holder, with a
+/// tie going to `inserting_tenant`.
+///
+/// Extracted as a pure function so the fairness rule is unit-testable directly,
+/// without grinding thousands of shard-colliding keys. The tie-break is the whole
+/// point — because the inserter wins an equal count, eviction can only ever take
+/// from a tenant holding **strictly more** of the shard than the tenant doing the
+/// inserting. A tenant therefore cannot be flushed by a neighbour that is using no
+/// more of the shard than it is; a flooder drains itself down to parity first, and
+/// stops there. Lexicographic order is the final tie-break purely so the choice is
+/// deterministic (`HashMap` iteration order is not).
+fn eviction_victim(counts: &HashMap<String, usize>, inserting_tenant: &str) -> Option<String> {
+    counts
+        .iter()
+        .max_by(|a, b| {
+            a.1.cmp(b.1)
+                .then_with(|| {
+                    (a.0.as_str() == inserting_tenant).cmp(&(b.0.as_str() == inserting_tenant))
+                })
+                .then_with(|| a.0.cmp(b.0))
+        })
+        .map(|(tenant, _)| tenant.clone())
+}
+
 // =============================== tests ==========================================
 
 #[cfg(test)]
@@ -484,6 +574,18 @@ mod tests {
 
     fn fp(s: &str) -> [u8; 32] {
         request_fingerprint(s.as_bytes())
+    }
+
+    /// Grind client-key strings until `n` of them land in `shard` for `tenant` —
+    /// exactly what a hostile tenant does offline, since `IdempotencyKey::shard`
+    /// is a pure SHA-256 over `(tenant_id, key)` and every tenant knows its own
+    /// tenant id. ~64 candidates per hit, so this is cheap.
+    fn colliding_keys(tenant: &str, shard: usize, n: usize) -> Vec<IdempotencyKey> {
+        (0u32..)
+            .map(|i| IdempotencyKey::new(tenant, &format!("grind-{i}")))
+            .filter(|k| k.shard() == shard)
+            .take(n)
+            .collect()
     }
 
     #[test]
@@ -695,5 +797,157 @@ mod tests {
         // A late release (e.g. a dropped loser) must not delete the stored response.
         store.release(&key);
         assert!(matches!(store.reserve(&key, f), ReserveOutcome::Replay(_)));
+    }
+
+    #[test]
+    fn one_tenant_cannot_evict_another_tenants_safe_retry_window() {
+        // Regression (cross-tenant): eviction used to run FIFO across the whole
+        // TENANT-MIXED shard. `acme` can grind its own client keys into
+        // `beta_health`'s shard, and because FIFO takes the OLDEST first it
+        // deletes precisely the long-lived entries a retry depends on. Beta's
+        // retry then re-dispatches to the provider — a DOUBLE CHARGE.
+        let clock = FakeClock::at(1_000);
+        // Small per-shard cap so the eviction path is exercised deterministically.
+        let store = IdempotencyStore::with_clock(600, 32, Arc::clone(&clock) as Arc<dyn Clock>);
+
+        // Beta Health stores the payroll response its retry logic depends on.
+        let beta = IdempotencyKey::new("beta_health", "payroll-run-2026-08-05");
+        let f = fp("payroll-body");
+        assert!(matches!(store.reserve(&beta, f), ReserveOutcome::Reserved));
+        assert!(store.store(
+            &beta,
+            200,
+            "application/json".into(),
+            Bytes::from_static(b"PAYROLL"),
+            f,
+            None,
+            None,
+        ));
+
+        // Acme floods Beta's shard with 2x the whole-shard cap. Its entries are
+        // strictly NEWER, so a shard-wide FIFO evicts Beta's first.
+        clock.set(2_000);
+        for (i, k) in colliding_keys("acme", beta.shard(), 64)
+            .into_iter()
+            .enumerate()
+        {
+            let g = fp(&format!("acme-body-{i}"));
+            if let ReserveOutcome::Reserved = store.reserve(&k, g) {
+                store.store(
+                    &k,
+                    200,
+                    "application/json".into(),
+                    Bytes::from_static(b"A"),
+                    g,
+                    None,
+                    None,
+                );
+            }
+        }
+
+        // Beta's safe-retry window survived Acme's flood.
+        match store.reserve(&beta, f) {
+            ReserveOutcome::Replay(r) => assert_eq!(&r.body[..], b"PAYROLL"),
+            other => panic!(
+                "acme evicted beta_health's stored response — beta's next retry \
+                 would re-dispatch and double-charge; got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn one_tenant_cannot_evict_another_tenants_in_flight_marker() {
+        // The store's other guarantee — "two concurrent identical requests cannot
+        // both reach the provider" — is capacity-dependent too: evict Beta's
+        // InFlight marker and Beta's own duplicate sails through to the provider.
+        let clock = FakeClock::at(1_000);
+        let store = IdempotencyStore::with_clock(600, 32, Arc::clone(&clock) as Arc<dyn Clock>);
+        let beta = IdempotencyKey::new("beta_health", "invoice-8231");
+        let f = fp("invoice-body");
+        assert!(matches!(store.reserve(&beta, f), ReserveOutcome::Reserved));
+
+        clock.set(2_000);
+        for (i, k) in colliding_keys("acme", beta.shard(), 64)
+            .into_iter()
+            .enumerate()
+        {
+            store.reserve(&k, fp(&format!("acme-body-{i}")));
+        }
+
+        assert!(
+            matches!(store.reserve(&beta, f), ReserveOutcome::InFlight),
+            "acme evicted beta_health's in-flight marker — beta's concurrent \
+             duplicate would reach the provider a second time"
+        );
+    }
+
+    #[test]
+    fn a_lone_tenant_still_gets_the_whole_shard_and_evicts_its_own_oldest() {
+        // Max-min eviction must stay work-conserving: with no neighbour to be
+        // fair to, one tenant may fill the shard, and at the cap it pays out of
+        // its OWN entries, oldest first.
+        let clock = FakeClock::at(1_000);
+        let store = IdempotencyStore::with_clock(600, 8, Arc::clone(&clock) as Arc<dyn Clock>);
+        let keys = colliding_keys("acme", 11, 20);
+        for (i, k) in keys.iter().enumerate() {
+            clock.set(1_000 + i as u64);
+            store.reserve(k, fp(&format!("acme-body-{i}")));
+        }
+        let (entries, _) = store.stats_snapshot();
+        assert_eq!(entries, 8, "a lone tenant should get the whole shard");
+        // The oldest rolled off; the newest survived.
+        assert!(matches!(
+            store.reserve(&keys[0], fp("acme-body-0")),
+            ReserveOutcome::Reserved
+        ));
+        assert!(matches!(
+            store.reserve(&keys[19], fp("acme-body-19")),
+            ReserveOutcome::InFlight
+        ));
+    }
+
+    #[test]
+    fn shard_stays_bounded_across_many_tenants() {
+        // Fair eviction must not become a way to grow memory without bound: the
+        // cap holds no matter how many tenants pile into one shard.
+        let clock = FakeClock::at(1_000);
+        let store = IdempotencyStore::with_clock(600, 16, Arc::clone(&clock) as Arc<dyn Clock>);
+        let target = 7usize;
+        for t in 0..40u32 {
+            let tenant = format!("tenant-{t}");
+            for (i, k) in colliding_keys(&tenant, target, 3).into_iter().enumerate() {
+                store.reserve(&k, fp(&format!("{tenant}-{i}")));
+            }
+        }
+        // Every key landed in one shard, so the global count IS that shard's size.
+        let (entries, _) = store.stats_snapshot();
+        assert!(entries <= 16, "shard grew past its cap: {entries}");
+    }
+
+    #[test]
+    fn eviction_victim_is_the_largest_holder_and_ties_go_to_the_inserter() {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        counts.insert("beta_health".to_string(), 2);
+        counts.insert("acme".to_string(), 5);
+        // Acme holds more, so acme pays — whoever is inserting.
+        assert_eq!(
+            eviction_victim(&counts, "beta_health").as_deref(),
+            Some("acme")
+        );
+        assert_eq!(eviction_victim(&counts, "acme").as_deref(), Some("acme"));
+
+        // A TIE goes to the tenant doing the inserting. That is what makes the
+        // rule safe: eviction can only ever take from a tenant holding STRICTLY
+        // more of the shard than the inserter, so a neighbour using no more of
+        // the shard than you can never flush your entries.
+        counts.insert("beta_health".to_string(), 5);
+        assert_eq!(eviction_victim(&counts, "acme").as_deref(), Some("acme"));
+        assert_eq!(
+            eviction_victim(&counts, "beta_health").as_deref(),
+            Some("beta_health")
+        );
+
+        let empty: HashMap<String, usize> = HashMap::new();
+        assert!(eviction_victim(&empty, "acme").is_none());
     }
 }
