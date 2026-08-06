@@ -989,6 +989,13 @@ fn record_metrics_into(m: &crate::metrics::Metrics, event: &UsageEvent) {
 struct Deadline {
     expires_at: Instant,
     per_attempt: Duration,
+    /// True once a CALLER-supplied `x-routeplane-timeout-ms` actually SHORTENED
+    /// `expires_at`. Server-owned caps (the `DeadlineConfig` budget, the routing
+    /// config's `request_timeout_ms`) never set it; only the request header does,
+    /// and only when it won the MIN-fold. Read via
+    /// [`Deadline::attempt_bounded_by_client`] — see that method for why the
+    /// distinction is a cross-tenant isolation control, not bookkeeping.
+    client_capped: bool,
 }
 
 impl Deadline {
@@ -996,20 +1003,49 @@ impl Deadline {
         Self {
             expires_at: Instant::now() + cfg.request_deadline,
             per_attempt: cfg.per_attempt_timeout,
+            client_capped: false,
         }
     }
 
-    /// Narrow the request budget by a `timeout_ms` cap (PRD-006 §4.1d:
-    /// narrow-only). Used for BOTH the config-level `request_timeout_ms` and the
-    /// per-request `x-routeplane-timeout-ms` header — chain the calls to MIN-fold
-    /// them. Only ever SHRINKS `expires_at` (a larger cap is a no-op), so a client
-    /// can never extend the budget beyond the server `DeadlineConfig` maximum.
-    /// `None` leaves the deadline unchanged (legacy / absent / invalid header).
+    /// Narrow the request budget by a SERVER-owned `timeout_ms` cap (PRD-006
+    /// §4.1d: narrow-only) — the `DeadlineConfig` budget and the routing config's
+    /// `request_timeout_ms`. Chain the calls to MIN-fold them. Only ever SHRINKS
+    /// `expires_at` (a larger cap is a no-op).
+    /// `None` leaves the deadline unchanged (legacy / absent cap).
+    ///
+    /// The CALLER-supplied `x-routeplane-timeout-ms` header uses
+    /// [`Deadline::with_client_request_cap`] instead — same fold, but it records
+    /// that the budget in force is the caller's.
     fn with_request_cap(mut self, cap_ms: Option<u64>) -> Self {
         if let Some(ms) = cap_ms {
             let capped = Instant::now() + Duration::from_millis(ms);
             if capped < self.expires_at {
                 self.expires_at = capped;
+            }
+        }
+        self
+    }
+
+    /// Narrow the request budget by the CALLER-supplied `x-routeplane-timeout-ms`.
+    /// Identical narrow-only MIN-fold to [`Deadline::with_request_cap`], but it
+    /// also REMEMBERS that the budget now in force is the caller's own.
+    ///
+    /// That memory is a cross-tenant isolation control. The per-provider circuit
+    /// breaker and latency EWMA are SHARED across tenants — a built-in provider
+    /// lives in the single `GLOBAL_OWNER` health cell, deliberately, because a
+    /// built-in is one process-wide adapter talking to one real upstream. An
+    /// attempt that "timed out" only because the caller asked for a 50 ms budget
+    /// carries no information about that upstream; fed to the shared breaker it
+    /// opens the provider for EVERY tenant after the failure threshold is reached,
+    /// i.e. one tenant buys a fleet-wide outage for the price of five cheap
+    /// requests. [`Deadline::attempt_bounded_by_client`] is what keeps those
+    /// attempts out of the shared health state; this flag is how it knows.
+    fn with_client_request_cap(mut self, cap_ms: Option<u64>) -> Self {
+        if let Some(ms) = cap_ms {
+            let capped = Instant::now() + Duration::from_millis(ms);
+            if capped < self.expires_at {
+                self.expires_at = capped;
+                self.client_capped = true;
             }
         }
         self
@@ -1036,6 +1072,41 @@ impl Deadline {
             None => base,
         })
     }
+
+    /// The SERVER-owned bound on one attempt: the `DeadlineConfig` per-attempt
+    /// timeout, narrowed by the routing policy's per-target `timeout_ms`. Pure (no
+    /// clock read) — it is the yardstick [`Deadline::attempt_bounded_by_client`]
+    /// measures the effective attempt timeout against.
+    fn server_attempt_bound(&self, cap_ms: Option<u64>) -> Duration {
+        match cap_ms {
+            Some(ms) => self.per_attempt.min(Duration::from_millis(ms)),
+            None => self.per_attempt,
+        }
+    }
+
+    /// True when `attempt_timeout` — the value actually used to bound this
+    /// dispatch — came from the CALLER's `x-routeplane-timeout-ms` budget rather
+    /// than from any server-owned limit.
+    ///
+    /// A timeout under a caller-chosen budget is the CALLER's deadline firing, not
+    /// evidence that the provider is unhealthy, so it must never reach the shared
+    /// per-provider breaker or the shared latency EWMA (see
+    /// [`Deadline::with_client_request_cap`] for the cross-tenant consequence).
+    ///
+    /// The invariant this establishes, stated honestly: a caller-supplied deadline
+    /// can only WITHHOLD signal from the shared breaker/EWMA, never inject it. A
+    /// caller who sets a cap at or below the server's own attempt bound gives up
+    /// contributing health signal for that request — which is the safe direction
+    /// (their requests can no longer open a provider for anyone else, and the
+    /// tenants who send no header keep feeding the breaker normally). What it is
+    /// NOT is a precise "would the server have timed out too?" oracle: the
+    /// comparison is `<` against a bound that does not decay, while `attempt_timeout`
+    /// is derived from a remaining budget that does, so a cap set exactly AT the
+    /// server bound reads as client-bounded. That asymmetry is deliberate and
+    /// costs only signal, never isolation.
+    fn attempt_bounded_by_client(&self, attempt_timeout: Duration, cap_ms: Option<u64>) -> bool {
+        self.client_capped && attempt_timeout < self.server_attempt_bound(cap_ms)
+    }
 }
 
 /// Parse the optional `x-routeplane-timeout-ms` per-request deadline override
@@ -1052,8 +1123,20 @@ impl Deadline {
 /// - non-integer / 0  ⇒ `None` (ignored, request proceeds — never a 400)
 /// - negative         ⇒ `None` (un-parseable as `u64` → ignored)
 ///
-/// `Some(ms)` feeds straight into [`Deadline::with_request_cap`], which already
-/// enforces narrow-only by only shrinking `expires_at`.
+/// `Some(ms)` feeds straight into [`Deadline::with_client_request_cap`], which
+/// already enforces narrow-only by only shrinking `expires_at` — and, because the
+/// value is CALLER-controlled and unbounded below, marks the resulting budget as
+/// the caller's own so a timeout under it cannot be mistaken for upstream
+/// ill-health and fed to the fleet-shared breaker.
+///
+/// Deliberately still unbounded below (no server floor). A floor low enough not
+/// to break a legitimately latency-sensitive caller — one that genuinely wants to
+/// give up after 300 ms rather than hold a connection the server's whole budget —
+/// is far too low to stop the abuse (any cap under real model latency produces the
+/// same timeouts), and a floor high enough to stop it would silently hold callers'
+/// connections longer than they asked for AND make each abusive attempt occupy a
+/// half-open probe slot for longer. The bound that matters is on what a timeout is
+/// allowed to MEAN, not on the number.
 fn parse_request_timeout_header(headers: &HeaderMap) -> Option<u64> {
     headers
         .get("x-routeplane-timeout-ms")
@@ -1166,6 +1249,27 @@ pub(crate) fn counts_as_health_failure(e: &ProviderError) -> bool {
         e,
         ProviderError::RateLimited { .. } | ProviderError::BadRequest { .. }
     )
+}
+
+/// Is this failed attempt the CALLER's own deadline firing rather than an
+/// upstream fault? True only when the dispatch was bounded by the caller-supplied
+/// `x-routeplane-timeout-ms` (`client_bounded`, from
+/// [`Deadline::attempt_bounded_by_client`]) AND it actually timed out.
+///
+/// Such an attempt must not touch the SHARED per-provider health state — neither
+/// the circuit breaker nor the latency EWMA. Both live in the process-wide
+/// `GLOBAL_OWNER` cell for a built-in provider, so treating a caller-chosen
+/// deadline as upstream evidence is a cross-tenant control: tenant `acme` sending
+/// a handful of `x-routeplane-timeout-ms: 50` requests would otherwise open
+/// `openai` for tenant `beta-health` too (breaker), and drag the shared EWMA down
+/// toward 50ms so every `latency`-strategy tenant is steered AT the provider that
+/// is not answering (EWMA). One header, both directions, no entitlement needed.
+///
+/// The 429/400 carve-outs live in [`counts_as_health_failure`]; this is the same
+/// doctrine applied to the one fault class the caller can manufacture at will.
+/// Pure and clock-free so the decision can be tested directly.
+pub(crate) fn is_client_deadline_timeout(e: &ProviderError, client_bounded: bool) -> bool {
+    client_bounded && matches!(e, ProviderError::Timeout { .. })
 }
 
 // Bounds the accumulated streamed output kept for the enterprise-only post-stream
@@ -2810,9 +2914,12 @@ async fn chat_completions_pipeline(
     // Absent/invalid header ⇒ `None` ⇒ no change (byte-identical). Covers BOTH the
     // streaming and non-streaming paths and /v1/messages — all funnel through this
     // shared pipeline before the attempt loop.
+    // The header cap goes through `with_client_request_cap`, NOT `with_request_cap`:
+    // the value is caller-controlled, so a timeout under it must be excluded from
+    // the fleet-shared breaker/EWMA (see `Deadline::attempt_bounded_by_client`).
     let deadline = deadline
         .with_request_cap(routing_config.as_ref().and_then(|c| c.request_timeout_ms()))
-        .with_request_cap(parse_request_timeout_header(&headers));
+        .with_client_request_cap(parse_request_timeout_header(&headers));
     // One RNG per request for nested-pool weighted ordering + backoff jitter.
     let request_seed = backoff_seed();
     let mut rng = PolicyRng::seeded(request_seed);
@@ -4723,6 +4830,11 @@ async fn attempt_target(
                 }
             }
         };
+        // Is this dispatch bounded by the CALLER's own `x-routeplane-timeout-ms`
+        // budget rather than by a server limit? Captured here, next to the value it
+        // describes, so the failure arm below cannot drift from the timeout it
+        // actually used.
+        let client_bounded = deadline.attempt_bounded_by_client(attempt_timeout, target.timeout_ms);
 
         tracing::info!(
             "Attempting {} (sovereign={} try={}/{} timeout={}ms)",
@@ -4805,12 +4917,32 @@ async fn attempt_target(
                 // `latency` strategy stops preferring a timing-out provider. Without
                 // this the EWMA stayed stale-fast and re-selected the dead provider
                 // every request until the breaker opened (and again each half-open).
-                state
-                    .health
-                    .record_latency(tenant_id, provider_name, elapsed_ms);
+                //
+                // EXCEPT when the caller's own `x-routeplane-timeout-ms` is what
+                // bounded the attempt: `elapsed_ms` is then a TRUNCATED sample of a
+                // call that never finished, and the EWMA is shared fleet-wide, so
+                // folding it in makes the provider look FAST to every other tenant
+                // routing by the `latency` strategy — the mirror image of the
+                // breaker hazard below, from the same single header.
+                let client_deadline_timeout = is_client_deadline_timeout(&e, client_bounded);
+                if !client_deadline_timeout {
+                    state
+                        .health
+                        .record_latency(tenant_id, provider_name, elapsed_ms);
+                }
                 // F12 (ADR-021 A1): a 429 is the caller's throttle, not provider
                 // health — do not trip the breaker on it.
-                let health_failure = counts_as_health_failure(&e);
+                //
+                // Same doctrine, second instance: a timeout produced by the CALLER's
+                // own deadline is the caller's budget expiring, not the provider
+                // failing. The per-provider breaker for a built-in is the process-wide
+                // GLOBAL_OWNER cell, so without this carve-out any authenticated
+                // tenant opens `openai` (etc.) for the WHOLE FLEET by sending a
+                // threshold's worth of requests with a tiny `x-routeplane-timeout-ms`
+                // — cheap, repeatable, and every other tenant eats the 30s cooldown.
+                // Flows into the returned `health_failure` too, so the ADR-087
+                // pool-exhaustion tally in the caller inherits the same exclusion.
+                let health_failure = counts_as_health_failure(&e) && !client_deadline_timeout;
                 // ADR-087 §4: a POOL key (`key_index.is_some()`) must NOT feed the
                 // shared per-provider breaker per attempt — that is what let one
                 // tenant's dead/rate-limited key pool open the breaker for every
@@ -5412,6 +5544,12 @@ async fn stream_chat_completions(
                         break;
                     }
                 };
+                // Same cross-tenant carve-out as the buffered attempt loop: an
+                // establishment timeout under the CALLER's own
+                // `x-routeplane-timeout-ms` budget is not upstream-health evidence
+                // and must not reach the fleet-shared breaker/EWMA.
+                let client_bounded =
+                    deadline.attempt_bounded_by_client(attempt_timeout, target.timeout_ms);
 
                 let started = Instant::now();
                 let shaped_attempt = shaped.clone();
@@ -5457,15 +5595,26 @@ async fn stream_chat_completions(
                         // Feed the EWMA on stream-establishment FAILURE too (same
                         // contract as the buffered attempt + sibling endpoints):
                         // fold the elapsed establish time in so a slow/failing
-                        // provider is de-preferred by the `latency` strategy.
-                        state.health.record_latency(
-                            tenant,
-                            provider_name,
-                            started.elapsed().as_millis() as u64,
-                        );
+                        // provider is de-preferred by the `latency` strategy. Skipped
+                        // for a caller-budget timeout (truncated sample of a call that
+                        // never finished — it would make the provider look fast to
+                        // every tenant).
+                        let client_deadline_timeout =
+                            is_client_deadline_timeout(&e, client_bounded);
+                        if !client_deadline_timeout {
+                            state.health.record_latency(
+                                tenant,
+                                provider_name,
+                                started.elapsed().as_millis() as u64,
+                            );
+                        }
                         // F12 (ADR-021 A1): a 429 is the caller's key/quota throttle,
-                        // not provider health — do not trip the breaker on it.
-                        let health_failure = counts_as_health_failure(&e);
+                        // not provider health — do not trip the breaker on it. Nor is
+                        // the caller's own deadline expiring: the breaker for a
+                        // built-in is fleet-shared, so a client-budget timeout must
+                        // not count toward opening it for other tenants.
+                        let health_failure =
+                            counts_as_health_failure(&e) && !client_deadline_timeout;
                         // ADR-087 §4: a POOL key must NOT feed the shared breaker per
                         // attempt (the cross-tenant hazard) — cool THIS key by error
                         // class and defer the single provider failure to pool
@@ -5533,25 +5682,35 @@ async fn stream_chat_completions(
                         // EWMA must learn from: fold the (capped) elapsed time in so
                         // the `latency` strategy stops preferring this provider on
                         // the next request. Recorded before the breaker feed, matching
-                        // the buffered attempt loop + sibling endpoints.
-                        state.health.record_latency(
-                            tenant,
-                            provider_name,
-                            started.elapsed().as_millis() as u64,
-                        );
-                        // A stream-establishment timeout is a real health fault. ADR-087
-                        // §4: for a POOL key, cool it (transient) and defer the provider
-                        // failure to pool exhaustion; a single-key value trips the
-                        // breaker now (legacy, byte-identical).
+                        // the buffered attempt loop + sibling endpoints. Skipped when
+                        // the CALLER's `x-routeplane-timeout-ms` is what expired — the
+                        // sample then describes the caller's budget, not the provider,
+                        // and the EWMA is shared with every other tenant.
+                        if !client_bounded {
+                            state.health.record_latency(
+                                tenant,
+                                provider_name,
+                                started.elapsed().as_millis() as u64,
+                            );
+                        }
+                        // A stream-establishment timeout is a real health fault — UNLESS
+                        // the deadline that fired was the caller's own. The breaker for a
+                        // built-in provider is the process-wide GLOBAL_OWNER cell, so
+                        // counting a client-budget timeout would let one tenant open
+                        // `openai` for the whole fleet with a handful of tiny-timeout
+                        // stream requests. ADR-087 §4: for a POOL key, cool it (transient
+                        // — per-key cooldowns hash the tenant in, so they are already
+                        // tenant-private) and defer the provider failure to pool
+                        // exhaustion; a single-key value trips the breaker now.
                         if let Some(pool_idx) = key_index {
-                            pool_health_failure = true;
+                            pool_health_failure |= !client_bounded;
                             state.health.cool_key(
                                 tenant,
                                 provider_name,
                                 *pool_idx,
                                 unix_millis() + key_cooldown_ms(Some(500), None),
                             );
-                        } else {
+                        } else if !client_bounded {
                             state.health.record_failure(tenant, provider_name);
                         }
                         last_error = format!(
@@ -6811,13 +6970,17 @@ mod tests {
         };
         let base = Deadline::start(&cfg);
         let base_remaining = base.remaining();
-        let widened = base.with_request_cap(Some(60_000));
+        let widened = base.with_client_request_cap(Some(60_000));
         // expires_at unchanged ⇒ remaining still bounded by the server max.
         assert!(
             widened.remaining() <= base_remaining,
             "a larger header value must NOT extend the deadline beyond the server max"
         );
         assert!(widened.remaining() <= Duration::from_millis(200));
+        // A header that lost the MIN-fold changed nothing, so the budget in force
+        // is still the SERVER's — it must NOT be marked client-capped, or a caller
+        // could disable the shared-breaker feed for free by sending a huge value.
+        assert!(!widened.client_capped);
     }
 
     #[test]
@@ -6829,18 +6992,24 @@ mod tests {
         };
         let d = Deadline::start(&cfg)
             .with_request_cap(Some(5_000)) // config request_timeout_ms
-            .with_request_cap(Some(1_000)); // x-routeplane-timeout-ms
+            .with_client_request_cap(Some(1_000)); // x-routeplane-timeout-ms
         let remaining = d.remaining();
         assert!(
             remaining <= Duration::from_millis(1_000) && remaining > Duration::from_millis(500),
             "min of (10s, 5s, 1s) = 1s, got {remaining:?}"
         );
+        // The header won the fold ⇒ the budget in force is the caller's.
+        assert!(d.client_capped);
 
         // Order independence: a SMALLER config cap than the header still wins.
         let d2 = Deadline::start(&cfg)
             .with_request_cap(Some(800)) // config
-            .with_request_cap(Some(5_000)); // header (larger ⇒ no-op)
+            .with_client_request_cap(Some(5_000)); // header (larger ⇒ no-op)
         assert!(d2.remaining() <= Duration::from_millis(800));
+        assert!(
+            !d2.client_capped,
+            "the server cap bound the budget, not the header"
+        );
     }
 
     #[test]
@@ -6855,6 +7024,150 @@ mod tests {
         let unchanged = base.with_request_cap(None);
         assert_eq!(base.expires_at, unchanged.expires_at);
         assert_eq!(base.per_attempt, unchanged.per_attempt);
+        let no_header = base.with_client_request_cap(None);
+        assert_eq!(base.expires_at, no_header.expires_at);
+        assert!(!no_header.client_capped);
+    }
+
+    // --- Client-supplied deadlines must not move SHARED provider health ---------
+
+    #[test]
+    fn client_capped_attempt_is_recognised_only_when_it_actually_binds() {
+        // Server: 30s request budget, 10s per attempt.
+        let cfg = DeadlineConfig {
+            request_deadline: Duration::from_millis(30_000),
+            per_attempt_timeout: Duration::from_millis(10_000),
+        };
+
+        // `x-routeplane-timeout-ms: 50` ⇒ the attempt timeout (50ms) comes from the
+        // CALLER, far below the 10s server per-attempt bound.
+        let hostile = Deadline::start(&cfg).with_client_request_cap(Some(50));
+        assert!(hostile.attempt_bounded_by_client(Duration::from_millis(50), None));
+
+        // No header at all ⇒ never client-bounded, whatever the attempt timeout is.
+        let plain = Deadline::start(&cfg);
+        assert!(!plain.attempt_bounded_by_client(Duration::from_millis(50), None));
+
+        // A per-TARGET policy timeout is server-owned: when it is what bounds the
+        // attempt, the timeout is still real provider-health signal even though a
+        // header was present.
+        let both = Deadline::start(&cfg).with_client_request_cap(Some(5_000));
+        assert!(
+            !both.attempt_bounded_by_client(Duration::from_millis(200), Some(200)),
+            "the policy timeout_ms bound this attempt, not the caller"
+        );
+        // …and a header GENEROUS enough that the server's own 10s per-attempt
+        // timeout is what fires is server-bounded too: the header narrowed the
+        // request budget (30s → 20s) but not this attempt.
+        let generous = Deadline::start(&cfg).with_client_request_cap(Some(20_000));
+        assert!(generous.client_capped);
+        assert!(!generous.attempt_bounded_by_client(Duration::from_millis(10_000), None));
+
+        // Only a genuine TIMEOUT is excused — a client-bounded attempt that failed
+        // with a 5xx is still a real upstream fault.
+        let t = ProviderError::timeout("openai", "timed out after 50ms");
+        let five_xx = ProviderError::Upstream5xx {
+            provider: "openai".to_string(),
+            status: 503,
+            body: "unavailable".to_string(),
+        };
+        assert!(is_client_deadline_timeout(&t, true));
+        assert!(!is_client_deadline_timeout(&t, false));
+        assert!(!is_client_deadline_timeout(&five_xx, true));
+    }
+
+    #[test]
+    fn one_tenants_tiny_timeout_header_cannot_open_the_shared_breaker_on_another() {
+        // The isolation property, end to end over the real HealthTracker.
+        //
+        // `openai` is a BUILT-IN, so it is registered once under GLOBAL_OWNER and
+        // every tenant resolves to that one breaker. Tenant "acme" sends requests
+        // carrying `x-routeplane-timeout-ms: 50`; none of them can complete, so each
+        // attempt ends in ProviderError::Timeout. Before the fix each of those fed
+        // `record_failure`, and five of them (the failure threshold) opened the
+        // shared breaker — after which tenant "beta-health", who sent nothing
+        // unusual and shares no key, credential or config with acme, was refused
+        // openai for the 30s cooldown.
+        let health = HealthTracker::new(["openai"]);
+        let cfg = DeadlineConfig {
+            request_deadline: Duration::from_millis(30_000),
+            per_attempt_timeout: Duration::from_millis(10_000),
+        };
+        let acme_deadline = Deadline::start(&cfg).with_client_request_cap(Some(50));
+        let attempt_timeout = Duration::from_millis(50);
+        let client_bounded = acme_deadline.attempt_bounded_by_client(attempt_timeout, None);
+
+        // 20 abusive requests — four times the threshold.
+        for _ in 0..20 {
+            let e = ProviderError::timeout("openai", "timed out after 50ms");
+            // Exactly the attempt loop's decision.
+            let health_failure =
+                counts_as_health_failure(&e) && !is_client_deadline_timeout(&e, client_bounded);
+            if health_failure {
+                health.record_failure("acme", "openai");
+            }
+        }
+        assert!(
+            health.is_available("beta-health", "openai"),
+            "acme's own 50ms deadline expiring must not open the fleet-shared \
+             breaker that beta-health routes through"
+        );
+        assert!(
+            health.is_available("acme", "openai"),
+            "and it must not lock acme out of the provider either"
+        );
+
+        // Positive control: the SAME loop with a server-owned deadline (no header)
+        // still opens the breaker — the carve-out is scoped to caller-supplied
+        // budgets, it does not disable circuit breaking.
+        let honest = Deadline::start(&cfg);
+        let honest_bounded = honest.attempt_bounded_by_client(Duration::from_millis(10_000), None);
+        for _ in 0..20 {
+            let e = ProviderError::timeout("openai", "timed out after 10000ms");
+            let health_failure =
+                counts_as_health_failure(&e) && !is_client_deadline_timeout(&e, honest_bounded);
+            if health_failure {
+                health.record_failure("acme", "openai");
+            }
+        }
+        assert!(
+            !health.is_available("beta-health", "openai"),
+            "a genuine upstream timeout must still trip the shared breaker"
+        );
+    }
+
+    #[test]
+    fn client_capped_timeout_does_not_drag_the_shared_latency_ewma_down() {
+        // The same defect inverted: `elapsed_ms` for a client-capped timeout is a
+        // TRUNCATED sample (~the header value) of a call that never finished.
+        // Folding it into the shared EWMA makes the provider look FAST to every
+        // other tenant, so the `latency` strategy steers the whole fleet AT the
+        // provider that is not answering them.
+        let health = HealthTracker::new(["openai"]);
+        let cfg = DeadlineConfig {
+            request_deadline: Duration::from_millis(30_000),
+            per_attempt_timeout: Duration::from_millis(10_000),
+        };
+        // Establish an honest baseline first: openai really answers in ~4s.
+        for _ in 0..10 {
+            health.record_latency("beta-health", "openai", 4_000);
+        }
+        let baseline = health.latency_ms("beta-health", "openai");
+
+        let acme = Deadline::start(&cfg).with_client_request_cap(Some(50));
+        let client_bounded = acme.attempt_bounded_by_client(Duration::from_millis(50), None);
+        for _ in 0..50 {
+            let e = ProviderError::timeout("openai", "timed out after 50ms");
+            if !is_client_deadline_timeout(&e, client_bounded) {
+                health.record_latency("acme", "openai", 50);
+            }
+        }
+        assert_eq!(
+            health.latency_ms("beta-health", "openai"),
+            baseline,
+            "acme's 50ms budget must leave the shared latency estimate other \
+             tenants route on exactly where it was"
+        );
     }
 
     // --- Prometheus /metrics wiring (record_metrics_into classification) -------
