@@ -199,8 +199,15 @@ impl AuthFailureTracker {
     /// Stable *within* one process (a repeat offender must keep accumulating
     /// against one slot) and unpredictable *across* processes (see
     /// [`AuthFailureTracker::hasher`]).
+    ///
+    /// Public so a caller's test can pick sources that provably do not alias.
+    /// The seed is per-instance, so a test that hard-codes two sources and
+    /// assumes distinct slots fails `1 / slots` of the time -- at the 64 slots
+    /// such tests use, that is 1.6% per run. Exposing the mapping costs
+    /// nothing: an attacker is out-of-process and still cannot observe the
+    /// seed, which is the property the seed defends.
     #[inline]
-    fn slot_index(&self, source: &str) -> usize {
+    pub fn slot_index(&self, source: &str) -> usize {
         self.hasher.hash_one(source) as usize % self.slots.len()
     }
 
