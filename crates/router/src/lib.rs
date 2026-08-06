@@ -1,5 +1,7 @@
 use arc_swap::ArcSwap;
+use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -359,29 +361,76 @@ pub const GLOBAL_OWNER: &str = "";
 /// process-wide registry keyed by the bare name let one tenant's dead `myvllm`
 /// open the breaker for every other tenant's unrelated `myvllm` (the
 /// cross-tenant DoS this keying closes); the sibling `key_cooldowns` cells
-/// below were always tenant-keyed for the same reason.
+/// below are tenant-keyed for the same reason — though tenant-keying alone was
+/// NOT enough there, because they fold that key into a fixed-size array: see the
+/// per-instance seed and ownership fingerprint on that field.
 pub struct HealthTracker {
     /// `owner → provider name → health cells`. Nested (not a `(String, String)`
     /// tuple key) so the hot path probes with two borrowed `&str`s — a tuple key
     /// cannot be probed by reference and would force two `String` allocations
     /// per read, inside `sort_by_key` comparator closures on the ordering path.
     providers: ArcSwap<HashMap<String, HashMap<String, Arc<ProviderHealth>>>>,
-    /// ADR-087 multi-account: per-key rate-limit **cooldown** cells (`cooled_until`
-    /// epoch-millis; `0` = not cooled). A fixed-size array indexed by
-    /// `hash(tenant, provider, key_index)`, allocated once — lock-free reads/writes
-    /// over a single atomic, no dynamic map, no key-registry coupling, nothing to
-    /// rebuild on a key reload. Cross-tenant correct (tenant is in the hash); a rare
-    /// hash collision shares a cooldown benignly (a healthy key is briefly skipped,
-    /// self-heals at expiry — never a wrong-key-used). Distinct from the per-provider
-    /// `CircuitBreaker` (fault-detection); a cooldown cell cools a key on the FIRST
-    /// 429 and honors Retry-After.
+    /// ADR-087 multi-account: per-key rate-limit **cooldown** cells. A fixed-size
+    /// array indexed by `hash(tenant, provider, key_index)`, allocated once —
+    /// lock-free reads/writes over a single atomic, no dynamic map, no
+    /// key-registry coupling, nothing to rebuild on a key reload. Distinct from
+    /// the per-provider `CircuitBreaker` (fault-detection); a cooldown cell cools
+    /// a key on the FIRST 429 and honors Retry-After.
+    ///
+    /// Each cell is a packed `(fingerprint:22 | cooled_until_ms:42)` word (`0` =
+    /// vacant); see `KEY_COOLDOWN_UNTIL_BITS`. The fingerprint stamps WHICH
+    /// `(tenant, provider, key_index)` tuple owns the cell, and every accessor
+    /// checks it — a tuple that aliases someone else's cell reads "never cooled",
+    /// can never clear the occupant, and can never hand the occupant a cooldown
+    /// its own upstream chose. This doc used to claim a collision was "benign …
+    /// never a wrong-key-used": that was true of `cool_key` and FALSE of
+    /// `clear_key`, which was an unconditional `store(0)` and so let ANY colliding
+    /// tuple destroy a live dead-key window belonging to another tenant — and,
+    /// because the seed was fixed, the colliding tuple could be found offline.
     key_cooldowns: Box<[AtomicU64]>,
+    /// Per-instance hash seed for the cooldown cells. `DefaultHasher::new()` is
+    /// FIXED-seed, so an attacker could compute OFFLINE a `(tenant, provider,
+    /// key_index)` tuple of its own that lands on a victim's cell — and the
+    /// provider name is tenant-supplied free text (`providers_api::create`), so
+    /// it can search it freely. `RandomState` reseeds per process, which makes
+    /// that search infeasible. Read-only after construction ⇒ the hot path stays
+    /// lock-free.
+    key_hasher: RandomState,
 }
 
 /// Number of per-key cooldown cells (power of two so the hash maps with a mask).
-/// 4096 × 8 B = 32 KiB, allocated once; ample for the handful of `(tenant, provider,
-/// key)` tuples a deployment holds, so collisions are negligible.
-const KEY_COOLDOWN_CELLS: usize = 4096;
+/// 65536 × 8 B = 512 KiB, allocated once; ample for the handful of `(tenant,
+/// provider, key)` tuples a deployment holds. Sized up from 4096 alongside the
+/// per-instance seed, which are complementary and neither substitutes for the
+/// other: the seed makes a collision impossible to *target*, the count makes an
+/// ACCIDENTAL one rarer, and the fingerprint below makes one that happens anyway
+/// harmless (an aliasing tuple loses its own cooldown, never the occupant's).
+const KEY_COOLDOWN_CELLS: usize = 65_536;
+
+/// Bits of the packed cooldown word given to the `cooled_until` epoch-millis
+/// timestamp. 42 bits reaches ≈ year 2109, comfortably past any window this
+/// code can stamp; the remaining 22 bits hold the owning tuple's fingerprint.
+const KEY_COOLDOWN_UNTIL_BITS: u32 = 42;
+const KEY_COOLDOWN_UNTIL_MASK: u64 = (1u64 << KEY_COOLDOWN_UNTIL_BITS) - 1;
+const KEY_COOLDOWN_FP_MASK: u64 = (1u64 << (64 - KEY_COOLDOWN_UNTIL_BITS)) - 1;
+
+/// Pack an owning fingerprint + `cooled_until` into one cell word.
+#[inline]
+fn pack_cooldown(fp: u64, until_ms: u64) -> u64 {
+    ((fp & KEY_COOLDOWN_FP_MASK) << KEY_COOLDOWN_UNTIL_BITS) | (until_ms & KEY_COOLDOWN_UNTIL_MASK)
+}
+
+/// The fingerprint of whichever tuple currently owns a cell (`0` = vacant).
+#[inline]
+fn cooldown_fp(word: u64) -> u64 {
+    word >> KEY_COOLDOWN_UNTIL_BITS
+}
+
+/// The `cooled_until` epoch-millis stored in a cell word.
+#[inline]
+fn cooldown_until(word: u64) -> u64 {
+    word & KEY_COOLDOWN_UNTIL_MASK
+}
 
 impl HealthTracker {
     /// Construct with the built-in provider set, registered under
@@ -407,6 +456,7 @@ impl HealthTracker {
         Self {
             providers: ArcSwap::from_pointee(map),
             key_cooldowns,
+            key_hasher: RandomState::new(),
         }
     }
 
@@ -497,20 +547,43 @@ impl HealthTracker {
         self.providers.store(Arc::new(next));
     }
 
-    /// The per-key cooldown cell for `(tenant, provider, key_index)` (ADR-087).
-    fn key_cell(&self, tenant: &str, provider: &str, key_index: usize) -> &AtomicU64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        tenant.hash(&mut h);
-        provider.hash(&mut h);
-        key_index.hash(&mut h);
+    /// The per-key cooldown cell for `(tenant, provider, key_index)` (ADR-087),
+    /// plus the NON-ZERO fingerprint that stamps this tuple's ownership of it.
+    ///
+    /// Two properties matter here, and neither substitutes for the other:
+    /// - the seed is a per-instance [`RandomState`], so a colliding tuple cannot
+    ///   be computed offline (see the `key_hasher` field doc);
+    /// - the fingerprint is checked by every accessor, so even an ACCIDENTAL
+    ///   collision cannot leak or destroy the occupant's cooldown.
+    ///
+    /// Hashed as a TUPLE, not three sequential writes, so `("t", "ab")` and
+    /// `("ta", "b")` cannot be made to land on one cell by concatenation.
+    fn key_slot(&self, tenant: &str, provider: &str, key_index: usize) -> (&AtomicU64, u64) {
+        let h = self.key_hasher.hash_one((tenant, provider, key_index));
         // KEY_COOLDOWN_CELLS is a power of two, so `& (N-1)` == `% N`.
-        &self.key_cooldowns[(h.finish() as usize) & (KEY_COOLDOWN_CELLS - 1)]
+        let cell = &self.key_cooldowns[(h as usize) & (KEY_COOLDOWN_CELLS - 1)];
+        // Fingerprint from HIGH bits — the low bits already picked the cell, so
+        // reusing them would make the fingerprint constant within a cell. `0` is
+        // the vacant sentinel, so nudge it to `1`.
+        let fp = match (h >> 32) & KEY_COOLDOWN_FP_MASK {
+            0 => 1,
+            f => f,
+        };
+        (cell, fp)
+    }
+
+    /// Test-only: the cell index a tuple maps to under THIS instance's seed. The
+    /// seed is random per process precisely so this cannot be computed offline,
+    /// so a regression test that wants a genuine collision has to search for one.
+    #[cfg(test)]
+    fn key_cell_index_for_test(&self, tenant: &str, provider: &str, key_index: usize) -> usize {
+        (self.key_hasher.hash_one((tenant, provider, key_index)) as usize)
+            & (KEY_COOLDOWN_CELLS - 1)
     }
 
     /// Is pool key `key_index` of `(tenant, provider)` available (not cooled down)
     /// at `now_ms`? `now_ms` is passed in so the check is pure/testable (no stored
-    /// clock). A never-cooled key (cell `0`) is always available.
+    /// clock). A never-cooled key (vacant cell) is always available.
     pub fn key_available(
         &self,
         tenant: &str,
@@ -518,35 +591,77 @@ impl HealthTracker {
         key_index: usize,
         now_ms: u64,
     ) -> bool {
-        self.key_cell(tenant, provider, key_index)
-            .load(Ordering::Acquire)
-            <= now_ms
+        self.key_cooled_until(tenant, provider, key_index) <= now_ms
     }
 
     /// The `cooled_until` timestamp (epoch ms; `0` = never cooled) for a pool key.
     pub fn key_cooled_until(&self, tenant: &str, provider: &str, key_index: usize) -> u64 {
-        self.key_cell(tenant, provider, key_index)
-            .load(Ordering::Acquire)
+        let (cell, fp) = self.key_slot(tenant, provider, key_index);
+        let word = cell.load(Ordering::Acquire);
+        // A cell stamped by a DIFFERENT tuple is not ours to read: report "never
+        // cooled" rather than another tenant's window. Without this check an
+        // aliasing tenant would inherit — and could dictate, via an
+        // attacker-controlled upstream's `Retry-After` — how long the victim's
+        // pool key stays parked.
+        if cooldown_fp(word) == fp {
+            cooldown_until(word)
+        } else {
+            0
+        }
     }
 
-    /// Cool a pool key until `until_ms` (epoch ms). **Extend-only** (never shortens
-    /// an existing cooldown), so a transient `5xx` cannot cut short a `401` dead-key
-    /// window; an expired/absent cooldown (`cell <= until_ms`) is set fresh.
+    /// Cool a pool key until `until_ms` (epoch ms). **Extend-only** against this
+    /// tuple's OWN stamp (never shortens its existing cooldown), so a transient
+    /// `5xx` cannot cut short a `401` dead-key window; a vacant cell, an expired
+    /// stamp of our own, or a cell held by an aliasing tuple is claimed fresh.
+    ///
+    /// One owner per cell is deliberate. Sharing the cell — the pre-fingerprint
+    /// behaviour, where a collision simply took the max of both windows — meant a
+    /// tenant whose own upstream chose the `Retry-After` could *park another
+    /// tenant's* pool key for as long as it liked. Claiming instead means the
+    /// aliased-away tuple reads "not cooled" and re-cools on its next failure: a
+    /// bounded, self-healing, no-longer-targetable loss, rather than a cooldown
+    /// dictated by a stranger.
     pub fn cool_key(&self, tenant: &str, provider: &str, key_index: usize, until_ms: u64) {
-        let cell = self.key_cell(tenant, provider, key_index);
+        let (cell, fp) = self.key_slot(tenant, provider, key_index);
+        // Clamp so an absurd upstream `Retry-After` (the proxy multiplies the
+        // header by 1000 with no ceiling) cannot overflow the timestamp field into
+        // the fingerprint bits and re-stamp the cell as some other tuple's.
+        let until_ms = until_ms.min(KEY_COOLDOWN_UNTIL_MASK);
+        let next = pack_cooldown(fp, until_ms);
         let mut cur = cell.load(Ordering::Acquire);
-        while until_ms > cur {
-            match cell.compare_exchange_weak(cur, until_ms, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => break,
+        loop {
+            if cooldown_fp(cur) == fp && cooldown_until(cur) >= until_ms {
+                return; // our own stamp already covers this window
+            }
+            match cell.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return,
                 Err(observed) => cur = observed,
             }
         }
     }
 
     /// Clear a pool key's cooldown (a success — the key demonstrably works).
+    ///
+    /// ⚠️ Cross-tenant: this clears ONLY a cell this tuple owns. It used to be an
+    /// unconditional `store(0)`, so any tuple aliasing the cell erased whoever
+    /// held it — one tenant's routine success wiped another tenant's live
+    /// dead-key window and sent that tenant straight back at a credential the
+    /// gateway already knew was returning `401`, repeatedly, which is exactly the
+    /// provider-side account lockout ADR-087 exists to prevent. Do not "simplify"
+    /// this back into a bare store.
     pub fn clear_key(&self, tenant: &str, provider: &str, key_index: usize) {
-        self.key_cell(tenant, provider, key_index)
-            .store(0, Ordering::Release);
+        let (cell, fp) = self.key_slot(tenant, provider, key_index);
+        let mut cur = cell.load(Ordering::Acquire);
+        loop {
+            if cooldown_fp(cur) != fp {
+                return; // vacant, or owned by another tuple — not ours to clear
+            }
+            match cell.compare_exchange_weak(cur, 0, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return,
+                Err(observed) => cur = observed,
+            }
+        }
     }
 
     /// Record an observed latency sample (milliseconds) for `(owner, provider)`,
@@ -966,6 +1081,112 @@ mod tests {
         assert!(h.key_available("t_b", "openai", 0, 1));
         // Same tenant+provider, different index ⇒ independent.
         assert!(h.key_available("t_a", "openai", 1, 1));
+    }
+
+    /// The cell index `key_cell` used BEFORE the per-instance seed landed: a
+    /// fixed-seed `DefaultHasher` fold of `(tenant, provider, key_index)` over
+    /// 4096 cells. Reproduced here only so the regression test below can run the
+    /// attacker's OFFLINE search exactly as it was possible to run it then.
+    fn pre_fix_cell_index(tenant: &str, provider: &str, key_index: usize) -> usize {
+        use std::hash::{Hash, Hasher};
+        const PRE_FIX_CELLS: usize = 4096;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        tenant.hash(&mut h);
+        provider.hash(&mut h);
+        key_index.hash(&mut h);
+        (h.finish() as usize) & (PRE_FIX_CELLS - 1)
+    }
+
+    /// ⚠️ Cross-tenant regression. `DefaultHasher::new()` is FIXED-seed and the
+    /// provider name is tenant-supplied free text (`POST /v1/providers`), so an
+    /// attacker could compute OFFLINE — as this test does, with no access to the
+    /// gateway — a provider of its own that shares a victim's cooldown cell. One
+    /// success on that provider then ran `clear_key`, an unconditional
+    /// `store(0)`, erasing the victim's live 401 dead-key window mid-flight.
+    ///
+    /// Fails on the pre-fix code (t_dvara's window reads back as 0).
+    #[test]
+    fn offline_computed_collision_cannot_clear_another_tenants_cooldown() {
+        let h = HealthTracker::new(["openai"]);
+        // t_dvara's pool key 0 just returned 401 ⇒ a 10-minute dead-key window.
+        h.cool_key("t_dvara", "openai", 0, 600_000);
+
+        // t_acme searches offline for a custom-provider name that lands on
+        // t_dvara's cell. 4096 cells ⇒ a hit within a few thousand candidates.
+        let victim_cell = pre_fix_cell_index("t_dvara", "openai", 0);
+        let colliding = (0..1_000_000u32)
+            .map(|n| format!("vllm-{n}"))
+            .find(|name| pre_fix_cell_index("t_acme", name, 0) == victim_cell)
+            .expect("the offline search must find a colliding provider name");
+
+        // One ordinary success on t_acme's own upstream.
+        h.clear_key("t_acme", &colliding, 0);
+
+        assert_eq!(
+            h.key_cooled_until("t_dvara", "openai", 0),
+            600_000,
+            "t_acme cleared t_dvara's dead-key cooldown — t_dvara is now dispatched \
+             back at a credential the gateway knows returns 401 (ADR-087 lockout)"
+        );
+        assert!(!h.key_available("t_dvara", "openai", 0, 599_999));
+    }
+
+    /// The same isolation property under a GENUINE, forced collision on the live
+    /// (randomly-seeded) hasher — the accidental case the seed alone cannot rule
+    /// out. Two tenants sharing one cell must neither observe nor destroy each
+    /// other's cooldown; the ownership fingerprint is what makes that true.
+    #[test]
+    fn tenants_forced_onto_one_cell_do_not_share_a_cooldown() {
+        let h = HealthTracker::new(["openai"]);
+        let victim_cell = h.key_cell_index_for_test("t_dvara", "openai", 0);
+        let colliding = (0..1_000_000u32)
+            .map(|n| format!("vllm-{n}"))
+            .find(|name| h.key_cell_index_for_test("t_acme", name, 0) == victim_cell)
+            .expect("a colliding tuple must exist within the search budget");
+
+        h.cool_key("t_dvara", "openai", 0, 600_000);
+        // The aliasing tenant must not READ the victim's window…
+        assert_eq!(h.key_cooled_until("t_acme", &colliding, 0), 0);
+        assert!(h.key_available("t_acme", &colliding, 0, 1));
+        // …nor DESTROY it on its own success…
+        h.clear_key("t_acme", &colliding, 0);
+        assert_eq!(
+            h.key_cooled_until("t_dvara", "openai", 0),
+            600_000,
+            "an aliasing tenant erased the victim's cooldown"
+        );
+        // …nor DICTATE it. t_acme controls its own upstream's `Retry-After`, and
+        // the proxy multiplies that header by 1000 with no ceiling, so a 24-hour
+        // window is entirely attacker-chosen — it must never be reported as
+        // t_dvara's. (Claiming the cell does EVICT t_dvara's stamp: one owner per
+        // cell. That residual is no longer targetable, and it fails toward
+        // "not cooled", which t_dvara's next failure re-cools — as opposed to
+        // inheriting a stranger's 24-hour park, which is unrecoverable.)
+        h.cool_key("t_acme", &colliding, 0, 86_400_000);
+        assert_eq!(h.key_cooled_until("t_acme", &colliding, 0), 86_400_000);
+        assert_ne!(
+            h.key_cooled_until("t_dvara", "openai", 0),
+            86_400_000,
+            "t_dvara inherited t_acme's attacker-chosen 24-hour cooldown"
+        );
+    }
+
+    /// A hostile upstream can send an arbitrarily large `Retry-After`; the proxy
+    /// multiplies it by 1000 with no ceiling. The packed cell must clamp rather
+    /// than wrap — a wrapped timestamp would both cancel the cooldown and
+    /// re-stamp the cell as a different tuple's.
+    #[test]
+    fn absurd_cooldown_saturates_instead_of_wrapping() {
+        let h = HealthTracker::new(["openai"]);
+        h.cool_key("t_a", "openai", 0, u64::MAX);
+        assert_eq!(
+            h.key_cooled_until("t_a", "openai", 0),
+            KEY_COOLDOWN_UNTIL_MASK
+        );
+        assert!(!h.key_available("t_a", "openai", 0, 1_800_000_000_000));
+        // Still the OWNING tuple's cell — the fingerprint survived the clamp.
+        h.clear_key("t_a", "openai", 0);
+        assert_eq!(h.key_cooled_until("t_a", "openai", 0), 0);
     }
 
     #[test]
