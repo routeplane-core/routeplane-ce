@@ -27,14 +27,23 @@
 //!   into slots; a slot self-evicts when its window rolls (a fresh IP hashing into
 //!   a stale slot simply starts a new window). Slot collisions can only ever cause
 //!   a colliding IP to be throttled *sooner* (fail-closed), never later.
+//!
+//!   ⚠️ That "fail-closed" framing is correct about BRUTE FORCE and wrong about
+//!   TENANT ISOLATION — which is exactly why it stayed comfortable for so long.
+//!   This throttle runs PRE-AUTH, so the slot key structurally cannot carry a
+//!   tenant dimension; a shared slot therefore throttles a *different tenant's*
+//!   valid-key traffic, not just the offender's. Two defences, both required:
+//!   the slot count is sized so accidental aliasing is rare, and the hash seed
+//!   is PER-INSTANCE so the mapping cannot be computed offline and aimed at a
+//!   chosen victim.
 //! - **Injectable clock.** Every method takes `now_ms`; the tracker never reads
 //!   the clock itself. The caller uses [`crate::now_unix_ms`].
 //! - **Saturating arithmetic, never panics on a request thread.**
 //! - **Fail-closed & zero-cost-when-off.** The whole feature is an `Option` at the
 //!   call site; when unconfigured, `auth.rs` is byte-identical to today.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // Packed slot layout: (window_epoch:40 | count:24) in one AtomicU64.
@@ -88,7 +97,20 @@ impl Default for AuthFailureConfig {
             window_ms: 60_000,       // 1 minute
             backoff_base_ms: 1_000,  // 1s, doubling per overshoot
             backoff_cap_ms: 300_000, // 5 minutes
-            slots: 4_096,            // ~32 KiB of atomics, bounded
+            // 64Ki slots = 512 KiB of atomics, still trivially bounded. 4096
+            // was too few for the ACCIDENTAL half of the collision problem: a
+            // replica seeing ~100 distinct client IPs had a ~70% chance
+            // (birthday) that some pair shared a slot, and a shared slot means
+            // one tenant's failed-auth burst 429s a DIFFERENT tenant's
+            // valid-key traffic for up to `backoff_cap_ms`, with nothing in
+            // either tenant's view explaining why. 16x the slots is 16x less of
+            // that.
+            //
+            // This does NOT fix the TARGETED attack — only the per-instance
+            // `hasher` seed does, because an attacker who can compute the
+            // mapping offline just searches a bigger space. Both changes are
+            // needed; neither substitutes for the other.
+            slots: 65_536,
         }
     }
 }
@@ -132,6 +154,19 @@ impl AuthThrottle {
 pub struct AuthFailureTracker {
     cfg: AuthFailureConfig,
     slots: Box<[AtomicU64]>,
+    /// Per-instance hash seed. `DefaultHasher::new()` — what this used to
+    /// build — is FIXED-seed and therefore identical in every process, so an
+    /// attacker could compute OFFLINE which of its own egress IPs lands in the
+    /// same `hash % slots` slot as a victim's, then park that victim in
+    /// `Retry-After` backoff with a handful of deliberately-bad-key requests,
+    /// without ever touching the victim's traffic or guessing anything secret.
+    ///
+    /// This check is pre-auth, so the slot key CANNOT carry a tenant
+    /// dimension; the seed is the only thing standing between a shared slot
+    /// array and a targeted cross-tenant denial. `RandomState` reseeds per
+    /// process, which makes that offline search infeasible. Read-only after
+    /// construction ⇒ the hot path stays lock-free.
+    hasher: RandomState,
 }
 
 impl AuthFailureTracker {
@@ -143,6 +178,7 @@ impl AuthFailureTracker {
         Self {
             cfg,
             slots: v.into_boxed_slice(),
+            hasher: RandomState::new(),
         }
     }
 
@@ -159,13 +195,19 @@ impl AuthFailureTracker {
     /// Map a source key (the source IP string) to a slot index. A stable,
     /// allocation-free hash; the slot count is fixed so this is the *only* place
     /// the per-IP-to-memory mapping happens.
+    ///
+    /// Stable *within* one process (a repeat offender must keep accumulating
+    /// against one slot) and unpredictable *across* processes (see
+    /// [`AuthFailureTracker::hasher`]).
+    #[inline]
+    fn slot_index(&self, source: &str) -> usize {
+        self.hasher.hash_one(source) as usize % self.slots.len()
+    }
+
     #[inline]
     fn slot_for(&self, source: &str) -> &AtomicU64 {
-        let mut h = DefaultHasher::new();
-        source.hash(&mut h);
-        let idx = (h.finish() as usize) % self.slots.len();
         // Index is always in range (modulo slots.len(), which is >= 1).
-        &self.slots[idx]
+        &self.slots[self.slot_index(source)]
     }
 
     /// Current failure count for `source` in the active window (0 if its slot is
@@ -336,10 +378,17 @@ mod tests {
         t.record_failure("10.0.0.1", now);
         t.record_failure("10.0.0.1", now);
         assert!(t.check("10.0.0.1", now).is_throttled());
-        // A different source (different slot, overwhelmingly likely) is untouched.
-        // We assert on a source we can show hashes elsewhere by checking it is
-        // allowed after the first failure only.
-        assert_eq!(t.check("10.0.0.99", now), AuthThrottle::Allow);
+        // A source in a DIFFERENT slot is untouched. The peer is resolved
+        // against this instance rather than hard-coded: the seed is
+        // per-instance now, so a fixed peer string would alias the exhausted
+        // slot on 1-in-`slots` runs and flake. Resolving it keeps the assertion
+        // about *independence*, which is what this test is for.
+        let busy = t.slot_index("10.0.0.1");
+        let peer = (0..1_000)
+            .map(|i| format!("10.0.1.{i}"))
+            .find(|s| t.slot_index(s) != busy)
+            .expect("a non-colliding peer must exist among 1000 candidates");
+        assert_eq!(t.check(&peer, now), AuthThrottle::Allow);
     }
 
     #[test]
@@ -403,5 +452,125 @@ mod tests {
             t.record_failure(&format!("src-{i}"), 0);
         }
         assert_eq!(t.slots.len(), 64); // never grew
+    }
+
+    /// REGRESSION (cross-tenant control) — the TARGETED half.
+    ///
+    /// `slot_for` used to build `DefaultHasher::new()`, which is FIXED-seed and
+    /// therefore produces the identical `source -> slot` mapping in every
+    /// process on every host. This throttle runs PRE-AUTH, so the slot key
+    /// cannot carry a tenant dimension; the seed is the only thing preventing
+    /// one tenant from aiming the shared slot array at another.
+    ///
+    /// The scenario, with two named tenants. Tenant `acme` is the victim, whose
+    /// fleet egresses from 198.51.100.7. Tenant `globex` is the attacker, and
+    /// controls the 203.0.0.0/16 elastic-IP pool.
+    ///
+    /// `globex` computes OFFLINE (no requests, nothing secret) which of its own
+    /// addresses lands in `acme`'s slot, then sends `threshold` bad-key requests
+    /// from it. With a fixed seed that answer transfers to EVERY replica, so
+    /// `acme`'s next VALID-key request is 429'd for up to `backoff_cap_ms`.
+    ///
+    /// This asserts the offline answer does NOT transfer to freshly-seeded
+    /// processes. On the old code all 16 transfer (deterministic failure); with
+    /// a per-instance `RandomState` each has an independent 1/`slots` chance, so
+    /// `>= 2` transferring has probability ~C(16,2)/4096^2 ~= 7e-6.
+    ///
+    /// `slots` is pinned small here on purpose: it makes the attacker's search
+    /// cheap enough to run in a unit test, and it proves the SEED alone carries
+    /// this property — raising the slot count does not (an attacker just
+    /// searches a bigger space). The slot count defends the accidental half,
+    /// asserted separately below.
+    #[test]
+    fn a_tenants_offline_slot_search_does_not_transfer_to_other_instances() {
+        const VICTIM: &str = "198.51.100.7"; // tenant `acme`
+        let attack_cfg = AuthFailureConfig {
+            threshold: 2,
+            window_ms: 60_000,
+            backoff_base_ms: 1_000,
+            backoff_cap_ms: 300_000,
+            slots: 4_096,
+        };
+        let now = 0;
+
+        // Step 1 — the offline search, done once against one instance. Expected
+        // depth is ~`slots` (4096) into a 65536-address pool, so "not found" has
+        // probability e^-16 ~= 1e-7.
+        let recon = AuthFailureTracker::new(attack_cfg);
+        let victim_slot = recon.slot_index(VICTIM);
+        let weapon = (0..65_536u32) // tenant `globex`'s own 203.0.0.0/16
+            .map(|i| format!("203.0.{}.{}", i / 256, i % 256))
+            .find(|ip| recon.slot_index(ip) == victim_slot)
+            .expect("a colliding source must exist in a /16 search");
+
+        // It works against the instance it was computed on — that is the
+        // capability being denied, not a property we want.
+        for _ in 0..attack_cfg.threshold {
+            recon.record_failure(&weapon, now);
+        }
+        assert!(
+            recon.check(VICTIM, now).is_throttled(),
+            "sanity: the search must actually find a colliding source"
+        );
+
+        // Step 2 — fire the SAME address at independently-constructed trackers,
+        // standing in for other replicas / restarts.
+        let transferred = (0..16)
+            .filter(|_| {
+                let replica = AuthFailureTracker::new(attack_cfg);
+                for _ in 0..attack_cfg.threshold {
+                    replica.record_failure(&weapon, now);
+                }
+                replica.check(VICTIM, now).is_throttled()
+            })
+            .count();
+
+        assert!(
+            transferred <= 1,
+            "an offline-computed slot collision transferred to {transferred}/16 \
+             freshly-seeded instances — the slot hash is process-stable again, \
+             which lets one tenant park another tenant's valid traffic in \
+             Retry-After backoff"
+        );
+    }
+
+    /// The direction this fix could plausibly break: the mapping must still be
+    /// STABLE within one instance, or a repeat offender would spray across
+    /// slots and never accumulate to the threshold.
+    #[test]
+    fn slot_mapping_is_stable_within_an_instance() {
+        let t = AuthFailureTracker::new(AuthFailureConfig::default());
+        let first = t.slot_index("198.51.100.4");
+        for _ in 0..1_000 {
+            assert_eq!(t.slot_index("198.51.100.4"), first);
+        }
+    }
+
+    /// REGRESSION (cross-tenant control) — the ACCIDENTAL half, which the seed
+    /// does NOT address.
+    ///
+    /// At 4096 slots a replica seeing ~100 distinct client IPs had a ~70%
+    /// birthday chance that some pair aliased. Then tenant `acme` rotates a key,
+    /// its fleet emits a burst of stale-key 401s, and tenant `globex`'s next
+    /// VALID request is 429'd — with nothing in either tenant's view explaining
+    /// why.
+    #[test]
+    fn default_slot_count_keeps_accidental_collisions_rare() {
+        let cfg = AuthFailureConfig::default().sanitized();
+        assert!(
+            cfg.slots >= 65_536,
+            "default slots {} is too few — accidental cross-tenant aliasing",
+            cfg.slots
+        );
+        let t = AuthFailureTracker::new(cfg);
+        let idx: std::collections::HashSet<usize> = (0..100)
+            .map(|i| t.slot_index(&format!("203.0.113.{i}")))
+            .collect();
+        // 100 distinct sources should almost always occupy ~100 distinct slots.
+        assert!(
+            idx.len() >= 97,
+            "100 sources collapsed into {} slots — aliasing is too likely",
+            idx.len()
+        );
     }
 }
