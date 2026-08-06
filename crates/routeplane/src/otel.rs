@@ -723,7 +723,7 @@ mod tests {
     /// attribute claims to be the isolation key.
     #[test]
     fn a_shared_key_name_is_never_exported_as_a_tenant_identity() {
-        // Tenant `t_garth` and tenant `t_dvara` each own a virtual key named
+        // Tenant `t_acme` and tenant `t_zephyr` each own a virtual key named
         // "prod". Nothing forbids that — key names are per-registry labels, not
         // an isolation boundary — and the UsageEvent carries only the name.
         let ts = Utc::now();
@@ -733,10 +733,10 @@ mod tests {
             ev.virtual_key_name = key.into();
             event_to_otel_span(&ev)
         };
-        let garth = mk("prod");
-        let dvara = mk("prod");
+        let acme = mk("prod");
+        let zephyr = mk("prod");
 
-        for (who, span) in [("t_garth", &garth), ("t_dvara", &dvara)] {
+        for (who, span) in [("t_acme", &acme), ("t_zephyr", &zephyr)] {
             assert!(
                 attr_value_str(span, "routeplane.tenant").is_none(),
                 "{who}: no span attribute may claim to be the tenant/isolation \
@@ -750,7 +750,7 @@ mod tests {
         }
 
         // And nothing else smuggles the key name in under a tenant-ish key.
-        for span in [&garth, &dvara] {
+        for span in [&acme, &zephyr] {
             assert!(
                 !span
                     .attributes
