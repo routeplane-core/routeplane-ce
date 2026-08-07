@@ -152,6 +152,7 @@ fn data_class_label(entity: &EntityType) -> Label {
         EntityType::EmiratesId => Label::known("emirates_id"),
         EntityType::SaudiId => Label::known("saudi_id"),
         EntityType::Ifsc => Label::known("ifsc"),
+        EntityType::Gstin => Label::known("gstin"),
         EntityType::Tfn => Label::known("tfn"),
         EntityType::MyNumber => Label::known("my_number"),
     }
