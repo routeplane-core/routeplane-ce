@@ -107,6 +107,13 @@ lazy_static! {
     // is the structural discriminator (RBI-assigned, not free-form).
     static ref IFSC: Regex = Regex::new(r"\b[A-Z]{4}0[A-Z0-9]{6}\b").unwrap();
 
+    // India GSTIN — GST registration id (DPDP + tax identifier). 2-digit state
+    // code + the registrant's 10-char PAN + entity number + literal `Z` + a
+    // mod-36 check character (`is_valid_gstin`). The checksum makes this the
+    // highest-precision India recognizer here; no cue or context is needed.
+    static ref GSTIN: Regex =
+        Regex::new(r"\b\d{2}[A-Z]{5}\d{4}[A-Z][A-Z0-9]Z[A-Z0-9]\b").unwrap();
+
     // Australia TFN — Privacy Act profile. 9 digits (commonly 3-3-3 grouped);
     // validated by the ATO weighted mod-11 checksum (`is_valid_tfn`). Separators
     // optional; the checksum is the gate, so a bare 9-digit run only matches if it
@@ -326,6 +333,34 @@ fn is_valid_saudi_id(candidate: &str) -> bool {
 /// the mandatory reserved `0` at position 5, then 6 alphanumeric branch chars.
 /// The fixed `0` is RBI-assigned (not free-form), which is the discriminator that
 /// keeps an arbitrary 11-char alnum token from matching.
+/// True if `candidate` is a valid India GSTIN: 15 chars whose final character is
+/// the GST Network mod-36 check over the first 14. Positions 0..13 are weighted
+/// 1,2,1,2,… over the base-36 alphabet and each product contributes
+/// `quotient + remainder`; the check character is the complement of that sum.
+///
+/// Mirrors `routeplane_guardrails::detect::is_gstin` — the two MUST agree, or a
+/// GSTIN classified for routing would egress unmasked. Validated against
+/// published GSTINs (`27AAPFU0939F1ZV`, `29AAGCB7383J1Z4`, `07AAACS1429B1ZX`).
+fn is_valid_gstin(candidate: &str) -> bool {
+    const ALPHABET: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let b = candidate.as_bytes();
+    if b.len() != 15 {
+        return false;
+    }
+    let mut sum = 0usize;
+    for (i, &c) in b[..14].iter().enumerate() {
+        let Some(v) = ALPHABET.iter().position(|&a| a == c) else {
+            return false;
+        };
+        let product = v * if i % 2 == 0 { 1 } else { 2 };
+        sum += product / 36 + product % 36;
+    }
+    let Some(expected) = ALPHABET.get((36 - (sum % 36)) % 36) else {
+        return false;
+    };
+    b[14] == *expected
+}
+
 fn is_valid_ifsc(candidate: &str) -> bool {
     let b = candidate.as_bytes();
     if b.len() != 11 {
@@ -401,6 +436,8 @@ pub enum EntityType {
     SaudiId,
     /// India IFSC bank-branch code (RBI profile).
     Ifsc,
+    /// India GSTIN — GST registration id (DPDP / tax profile).
+    Gstin,
     /// Australia Tax File Number (Privacy Act profile).
     Tfn,
     /// Japan My Number / Individual Number (APPI profile).
@@ -490,6 +527,10 @@ impl ResidencyEngine {
         // India IFSC: 4 letters + reserved `0` + 6 alnum (structural).
         if IFSC.find_iter(text).any(|m| is_valid_ifsc(m.as_str())) {
             entities.push(EntityType::Ifsc);
+        }
+        // India GSTIN: shape THEN the mod-36 check character.
+        if GSTIN.find_iter(text).any(|m| is_valid_gstin(m.as_str())) {
+            entities.push(EntityType::Gstin);
         }
         // Australia TFN: shape THEN ATO weighted mod-11 checksum.
         if TFN.find_iter(text).any(|m| is_valid_tfn(m.as_str())) {

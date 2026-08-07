@@ -133,17 +133,22 @@ static CARD: LazyLock<Regex> =
 // code + a reserved `0` + a 6-char branch code, e.g. `HDFC0001234`. Always
 // uppercase in issued form.
 //
-// There is NO check digit, and the shape alone is NOT distinctive — an 11-char
-// build id (`ABCD0123456`) or commit-ish token (`HEAD0ABC123`) matches it
-// exactly. That is the same false-positive class the lowercase-PAN rule already
-// solves, so IFSC takes the same remedy: the shape must co-occur with an
-// explicit IFSC/NEFT/RTGS/IMPS cue in the text. Precision over recall — masking
-// legitimate text is a visible product defect.
+// There is no check digit, and the reserved `0` is a weaker discriminator than
+// it looks — an 11-char build id that happens to carry `0` in slot 5
+// (`ABCD0123456`) matches too.
+//
+// This recognizer nonetheless MIRRORS `routeplane_residency`'s IFSC exactly,
+// shape for shape, with no cue gate. It briefly had one (requiring an
+// IFSC/NEFT/RTGS/IMPS word nearby) on false-positive grounds, and that was
+// wrong: the classifier is shape-only, so a bare IFSC was region-locked for
+// routing and then egressed in CLEARTEXT — precisely the drift the Aadhaar and
+// IBAN comments above were written about. A masker that is narrower than the
+// classifier is a leak; the safe asymmetry only ever runs the other way.
+//
+// The false-positive fear was also unmeasured. Shape-only IFSC costs ZERO false
+// positives across the eval corpus's pii negatives and injection benign set.
 static IFSC: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b[A-Z]{4}0[A-Z0-9]{6}\b").expect("ifsc regex is valid"));
-static IFSC_CUE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:ifsc|neft|rtgs|imps)\b").expect("ifsc cue regex is valid")
-});
 // India GSTIN (GST registration, DPDP + tax identifier): 2-digit state code +
 // the 10-char PAN of the registrant + entity number + a literal `Z` + a check
 // character. 15 chars, mod-36-gated by `is_gstin`, so unlike IFSC it needs no
@@ -455,15 +460,13 @@ pub fn redact(text: &str) -> Cow<'_, str> {
             mask_if(&c[0], is_gstin, "[GSTIN_MASKED]")
         })
         .into_owned();
-    // IFSC is structure-only (no RBI check digit), so it masks ONLY when an
-    // IFSC/NEFT/RTGS/IMPS cue is present — see the recognizer comment.
-    if IFSC_CUE.is_match(&out) {
-        out = IFSC
-            .replace_all(&out, |c: &Captures| {
-                mask_if(&c[0], is_ifsc, "[IFSC_MASKED]")
-            })
-            .into_owned();
-    }
+    // IFSC is structure-only (no RBI check digit) and unconditional, mirroring
+    // the residency classifier — see the recognizer comment.
+    out = IFSC
+        .replace_all(&out, |c: &Captures| {
+            mask_if(&c[0], is_ifsc, "[IFSC_MASKED]")
+        })
+        .into_owned();
     out = EMIRATES_ID
         .replace_all(&out, |c: &Captures| {
             mask_if(&c[0], is_emirates_id, "[EMIRATES_ID_MASKED]")
@@ -767,12 +770,7 @@ pub fn scan_pii(text: &str) -> Vec<&'static str> {
         GSTIN.find_iter(text).any(|m| is_gstin(m.as_str())),
         CAT_GSTIN,
     );
-    // Same cue rule the masker applies — a scan that reported IFSC on shape
-    // alone would disagree with what actually gets redacted.
-    push(
-        IFSC_CUE.is_match(text) && IFSC.find_iter(text).any(|m| is_ifsc(m.as_str())),
-        CAT_IFSC,
-    );
+    push(IFSC.find_iter(text).any(|m| is_ifsc(m.as_str())), CAT_IFSC);
     push(CARD.find_iter(text).any(|m| is_card(m.as_str())), CAT_CARD);
     push(IPV4.find_iter(text).any(|m| is_ipv4(m.as_str())), CAT_IPV4);
     push(IBAN.find_iter(text).any(|m| is_iban(m.as_str())), CAT_IBAN);
@@ -1418,8 +1416,9 @@ fn is_gstin(s: &str) -> bool {
 }
 
 /// India IFSC: 4 alphabetic bank code, reserved `0`, 6-char branch code.
-/// Structure-gated only — the RBI publishes no check digit, so the caller MUST
-/// also require an `IFSC_CUE` (see the recognizer comment) to keep precision.
+/// Structure-gated only — the RBI publishes no check digit. Applied
+/// unconditionally, mirroring the residency classifier (see the recognizer
+/// comment): a masker narrower than the classifier is an unmasked-egress leak.
 fn is_ifsc(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 11
@@ -1971,9 +1970,7 @@ mod tests {
     }
 
     #[test]
-    fn ifsc_masks_only_with_a_cue() {
-        // RBI publishes no IFSC check digit, so the 11-char shape is not
-        // distinctive — it must co-occur with an IFSC/NEFT/RTGS/IMPS cue.
+    fn ifsc_masks_on_shape_alone() {
         assert_eq!(
             redact("IFSC code HDFC0001234 for the transfer").as_ref(),
             "IFSC code [IFSC_MASKED] for the transfer"
@@ -1982,11 +1979,17 @@ mod tests {
             redact("NEFT to SBIN0000456 today").as_ref(),
             "NEFT to [IFSC_MASKED] today"
         );
-        // Same shape, no cue: a build id must survive untouched.
-        let build_id = "artifact ABCD0123456 published";
-        assert_eq!(redact(build_id).as_ref(), build_id);
-        assert!(scan_pii("IFSC HDFC0001234").contains(&CAT_IFSC));
-        assert!(!scan_pii("artifact ABCD0123456").contains(&CAT_IFSC));
+        // No cue word anywhere: still masked. The residency classifier is
+        // shape-only, so anything narrower here is a region-locked-but-unmasked
+        // leak.
+        assert_eq!(
+            redact("transfer to HDFC0001234 please").as_ref(),
+            "transfer to [IFSC_MASKED] please"
+        );
+        assert!(scan_pii("HDFC0001234").contains(&CAT_IFSC));
+        // The reserved `0` still discriminates: no `0` in slot 5 -> not an IFSC.
+        let not_ifsc = "token HDFCX000043 here";
+        assert_eq!(redact(not_ifsc).as_ref(), not_ifsc);
     }
 
     #[test]
