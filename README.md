@@ -338,6 +338,58 @@ the dialect directly where they don't.
 strategies, and circuit breaking exactly like a hosted provider, so `self_hosted,openai`
 (local first, cloud fallback) is a one-header setup.
 
+### Any other OpenAI-compatible endpoint: custom providers
+
+The 15 adapters above are the *built-in* names. You are not limited to them. Register any
+OpenAI-compatible endpoint under a name of your choosing — at runtime, no restart — and it
+becomes a first-class provider with its own key, its own model list, and its own circuit
+breaker.
+
+This is how you point Routeplane at Azure OpenAI behind a custom domain, a corporate egress
+proxy, an internal vLLM/Ollama/LocalAI deployment, a regional endpoint, or any vendor that
+speaks the OpenAI wire format but isn't in the table.
+
+```bash
+# Register it (write-only api_key — echoed back only as "…last4", never in full)
+curl -X POST http://localhost:8080/v1/providers \
+  -H "Authorization: Bearer rp_your_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "myvllm",
+    "base_url": "https://vllm.internal.example.com",
+    "api_key": "sk-upstream-key",
+    "models": ["llama3-70b"]
+  }'
+
+# Route to it explicitly...
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer rp_your_key" \
+  -H "x-routeplane-provider: myvllm" \
+  -d '{"model":"llama3-70b","messages":[{"role":"user","content":"hi"}]}'
+
+# ...or just name the model: a request whose `model` matches one it serves routes there
+# automatically, with no provider header at all.
+```
+
+`GET /v1/providers` lists them, `DELETE /v1/providers/{name}` removes one. They also show up
+in `/v1/models` and in the Console's **Provider Integrations** page, where you can do the same
+thing without curl.
+
+Two things worth knowing:
+
+- **`base_url` is the server root, without `/v1`** — the gateway appends the path itself
+  (same convention as `SELF_HOSTED_BASE_URL`).
+- **Private and loopback addresses are refused by default.** Pointing a custom provider at
+  `localhost`, `127.0.0.1`, or a private-range address returns `provider_ssrf_blocked`. For a
+  local Ollama or an in-VPC server, opt in with `RP_CUSTOM_PROVIDER_ALLOW_PRIVATE=on`.
+  Link-local and cloud-metadata addresses (`169.254.x.x`) stay blocked either way — that guard
+  has no off switch.
+
+Registrations persist to `configs/providers.json` (written `0600` — it holds upstream keys),
+so they survive a restart. Point `RP_PROVIDERS_FILE` elsewhere to relocate it, or ship that
+file pre-populated to declare a fixed fleet at boot without calling the API at all — the
+better fit for immutable deployments.
+
 ## Features
 
 Everything below ships in this repo under Apache-2.0 and runs on a single node with no external
