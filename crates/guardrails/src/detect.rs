@@ -34,6 +34,8 @@ pub const CAT_SSN: &str = "ssn";
 pub const CAT_IPV4: &str = "ipv4";
 pub const CAT_PAN: &str = "pan";
 pub const CAT_AADHAAR: &str = "aadhaar";
+pub const CAT_IFSC: &str = "ifsc";
+pub const CAT_GSTIN: &str = "gstin";
 pub const CAT_CARD: &str = "credit_card";
 pub const CAT_IBAN: &str = "iban";
 pub const CAT_CPF: &str = "cpf";
@@ -118,8 +120,37 @@ static AADHAAR: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b[2-9]\d{3}[\s.-]{0,2}\d{4}[\s.-]{0,2}\d{4}\b").expect("aadhaar regex is valid")
 });
 // Credit card: 13–19 digits, optional space/dash separators. Luhn-gated.
+//
+// The last digit is matched OUTSIDE the repetition so the span can never end on
+// a separator. The old `(?:\d[ -]?){13,19}` let the final `[ -]?` swallow the
+// space AFTER the card — `\b` still held (space→letter is a boundary) — so
+// `card 4111 1111 1111 1111 exp` masked to `[CARD_MASKED]exp`, deleting the
+// word break and corrupting the text handed to the provider. `{12,18}` + a
+// trailing `\d` keeps the 13–19-digit range exactly.
 static CARD: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b(?:\d[ -]?){13,19}\b").expect("card regex is valid"));
+    LazyLock::new(|| Regex::new(r"\b(?:\d[ -]?){12,18}\d\b").expect("card regex is valid"));
+// India IFSC (RBI bank-branch code, DPDP financial identifier): 4-letter bank
+// code + a reserved `0` + a 6-char branch code, e.g. `HDFC0001234`. Always
+// uppercase in issued form.
+//
+// There is NO check digit, and the shape alone is NOT distinctive — an 11-char
+// build id (`ABCD0123456`) or commit-ish token (`HEAD0ABC123`) matches it
+// exactly. That is the same false-positive class the lowercase-PAN rule already
+// solves, so IFSC takes the same remedy: the shape must co-occur with an
+// explicit IFSC/NEFT/RTGS/IMPS cue in the text. Precision over recall — masking
+// legitimate text is a visible product defect.
+static IFSC: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[A-Z]{4}0[A-Z0-9]{6}\b").expect("ifsc regex is valid"));
+static IFSC_CUE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:ifsc|neft|rtgs|imps)\b").expect("ifsc cue regex is valid")
+});
+// India GSTIN (GST registration, DPDP + tax identifier): 2-digit state code +
+// the 10-char PAN of the registrant + entity number + a literal `Z` + a check
+// character. 15 chars, mod-36-gated by `is_gstin`, so unlike IFSC it needs no
+// cue — the checksum carries the precision on its own.
+static GSTIN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b\d{2}[A-Z]{5}\d{4}[A-Z][A-Z0-9]Z[A-Z0-9]\b").expect("gstin regex is valid")
+});
 // EU IBAN (GDPR). 2-letter country + 2 check + the BBAN, in BOTH the compact
 // electronic form (`GB82WEST12345698765432`) and the ISO 13616 print form of
 // space-separated 4-char groups (`GB82 WEST 1234 5698 7654 32`) — which is how
@@ -251,6 +282,8 @@ static ANY_PII_OR_SECRET: LazyLock<RegexSet> = LazyLock::new(|| {
         IPV4.as_str(),
         PAN.as_str(),
         AADHAAR.as_str(),
+        IFSC.as_str(),
+        GSTIN.as_str(),
         CARD.as_str(),
         IBAN.as_str(),
         CPF.as_str(),
@@ -412,6 +445,25 @@ pub fn redact(text: &str) -> Cow<'_, str> {
     // (TFN 9-digit, phone 10-digit) can't claim a substring of a longer ID. Each
     // is gated by its checksum/structure, mirroring the residency recognizers so
     // a region-locked ID is also redacted before it can reach the provider.
+    //
+    // GSTIN runs FIRST and specifically ahead of the PAN pass below: a GSTIN
+    // *embeds* the registrant's PAN at chars 2..12, so letting PAN mask first
+    // would carve `27[PAN_MASKED]1ZV` out of the middle of a GSTIN and destroy
+    // both the span and the category label.
+    out = GSTIN
+        .replace_all(&out, |c: &Captures| {
+            mask_if(&c[0], is_gstin, "[GSTIN_MASKED]")
+        })
+        .into_owned();
+    // IFSC is structure-only (no RBI check digit), so it masks ONLY when an
+    // IFSC/NEFT/RTGS/IMPS cue is present — see the recognizer comment.
+    if IFSC_CUE.is_match(&out) {
+        out = IFSC
+            .replace_all(&out, |c: &Captures| {
+                mask_if(&c[0], is_ifsc, "[IFSC_MASKED]")
+            })
+            .into_owned();
+    }
     out = EMIRATES_ID
         .replace_all(&out, |c: &Captures| {
             mask_if(&c[0], is_emirates_id, "[EMIRATES_ID_MASKED]")
@@ -711,6 +763,16 @@ pub fn scan_pii(text: &str) -> Vec<&'static str> {
         AADHAAR.find_iter(text).any(|m| is_aadhaar(m.as_str())),
         CAT_AADHAAR,
     );
+    push(
+        GSTIN.find_iter(text).any(|m| is_gstin(m.as_str())),
+        CAT_GSTIN,
+    );
+    // Same cue rule the masker applies — a scan that reported IFSC on shape
+    // alone would disagree with what actually gets redacted.
+    push(
+        IFSC_CUE.is_match(text) && IFSC.find_iter(text).any(|m| is_ifsc(m.as_str())),
+        CAT_IFSC,
+    );
     push(CARD.find_iter(text).any(|m| is_card(m.as_str())), CAT_CARD);
     push(IPV4.find_iter(text).any(|m| is_ipv4(m.as_str())), CAT_IPV4);
     push(IBAN.find_iter(text).any(|m| is_iban(m.as_str())), CAT_IBAN);
@@ -795,7 +857,7 @@ fn mask_invisible_smuggled(text: &str) -> Cow<'_, str> {
     }
     let (stripped, map) = strip_invisible_with_map(text);
     type V = fn(&str) -> bool;
-    let recognizers: [(&Regex, Option<V>, &'static str); 23] = [
+    let recognizers: [(&Regex, Option<V>, &'static str); 25] = [
         (&PRIVATE_KEY, None, "[PRIVATE_KEY_MASKED]"),
         (&JWT, None, "[JWT_MASKED]"),
         (&OPENAI_KEY, None, "[OPENAI_KEY_MASKED]"),
@@ -819,6 +881,14 @@ fn mask_invisible_smuggled(text: &str) -> Cow<'_, str> {
         (&SAUDI_ID, Some(is_saudi_id as V), "[SAUDI_ID_MASKED]"),
         (&TFN, Some(is_tfn as V), "[TFN_MASKED]"),
         (&SSN, None, "[SSN_MASKED]"),
+        // GSTIN stays ahead of PAN here for the same reason as in the masker: a
+        // GSTIN embeds a PAN, so PAN must not claim the span first.
+        (&GSTIN, Some(is_gstin as V), "[GSTIN_MASKED]"),
+        // IFSC is deliberately NOT cue-gated in this table — it only fires on a
+        // span that was actually obfuscated, which is adversarial regardless of
+        // whether an IFSC cue was written out. (The validator signature also
+        // sees only the candidate, never the surrounding text.)
+        (&IFSC, Some(is_ifsc as V), "[IFSC_MASKED]"),
         (&PAN, None, "[PAN_MASKED]"),
         (&IPV4, Some(is_ipv4 as V), "[IP_MASKED]"),
         (&EMAIL, None, "[EMAIL_MASKED]"),
@@ -1320,6 +1390,44 @@ fn is_aadhaar(s: &str) -> bool {
     c == 0
 }
 
+/// GSTIN mod-36 check character (GST Network spec).
+///
+/// Positions 0..13 are weighted 1,2,1,2,… over the base-36 alphabet; each
+/// product contributes `quotient + remainder` (mod 36), and the check character
+/// is the complement of the running sum. Validated against published GSTINs
+/// (`27AAPFU0939F1ZV`, `29AAGCB7383J1Z4`, `07AAACS1429B1ZX`).
+fn is_gstin(s: &str) -> bool {
+    const ALPHABET: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let b = s.as_bytes();
+    if b.len() != 15 {
+        return false;
+    }
+    let value = |c: u8| ALPHABET.iter().position(|&a| a == c);
+    let mut sum = 0usize;
+    for (i, &c) in b[..14].iter().enumerate() {
+        let Some(v) = value(c) else {
+            return false;
+        };
+        let product = v * if i % 2 == 0 { 1 } else { 2 };
+        sum += product / 36 + product % 36;
+    }
+    let Some(expected) = ALPHABET.get((36 - (sum % 36)) % 36) else {
+        return false;
+    };
+    b[14] == *expected
+}
+
+/// India IFSC: 4 alphabetic bank code, reserved `0`, 6-char branch code.
+/// Structure-gated only — the RBI publishes no check digit, so the caller MUST
+/// also require an `IFSC_CUE` (see the recognizer comment) to keep precision.
+fn is_ifsc(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 11
+        && b[..4].iter().all(u8::is_ascii_uppercase)
+        && b[4] == b'0'
+        && b[5..].iter().all(u8::is_ascii_alphanumeric)
+}
+
 /// Luhn (mod-10) checksum for credit-card candidates.
 fn is_card(s: &str) -> bool {
     let ds: Vec<u8> = digits(s).collect();
@@ -1811,6 +1919,74 @@ mod tests {
         );
         let bad = "4111 1111 1111 1112";
         assert_eq!(redact(bad).as_ref(), bad);
+    }
+
+    #[test]
+    fn credit_card_span_does_not_eat_the_trailing_separator() {
+        // Regression: `(?:\d[ -]?){13,19}` let the final optional separator
+        // swallow the space AFTER the card (`\b` still held), so the mask ran
+        // into the next word and deleted the break — `[CARD_MASKED]exp`.
+        assert_eq!(
+            redact("card 4111 1111 1111 1111 exp 12/28").as_ref(),
+            "card [CARD_MASKED] exp 12/28"
+        );
+        assert_eq!(
+            redact("card 4111-1111-1111-1111 done").as_ref(),
+            "card [CARD_MASKED] done"
+        );
+        assert_eq!(
+            redact("card 4111111111111111").as_ref(),
+            "card [CARD_MASKED]"
+        );
+    }
+
+    #[test]
+    fn gstin_mod36_gated() {
+        // Published-format GSTINs; the check character is mod-36 over the first 14.
+        assert_eq!(
+            redact("Our GSTIN is 27AAPFU0939F1ZV for billing").as_ref(),
+            "Our GSTIN is [GSTIN_MASKED] for billing"
+        );
+        assert_eq!(
+            redact("GSTIN 29AAGCB7383J1Z4 filed").as_ref(),
+            "GSTIN [GSTIN_MASKED] filed"
+        );
+        // Flip the check character -> invalid -> untouched.
+        let bad = "GSTIN 27AAPFU0939F1ZQ filed";
+        assert_eq!(redact(bad).as_ref(), bad);
+        assert!(scan_pii("27AAPFU0939F1ZV").contains(&CAT_GSTIN));
+    }
+
+    #[test]
+    fn gstin_masks_before_pan_claims_its_embedded_pan() {
+        // A GSTIN embeds the registrant's PAN at chars 2..12 (`AAPFU0939F`).
+        // If PAN ran first the output would be `27[PAN_MASKED]1ZV`, splitting one
+        // identifier into a mislabelled fragment.
+        let out = redact("GSTIN 27AAPFU0939F1ZV ok");
+        assert_eq!(out.as_ref(), "GSTIN [GSTIN_MASKED] ok");
+        assert!(
+            !out.contains("[PAN_MASKED]"),
+            "PAN claimed the GSTIN: {out}"
+        );
+    }
+
+    #[test]
+    fn ifsc_masks_only_with_a_cue() {
+        // RBI publishes no IFSC check digit, so the 11-char shape is not
+        // distinctive — it must co-occur with an IFSC/NEFT/RTGS/IMPS cue.
+        assert_eq!(
+            redact("IFSC code HDFC0001234 for the transfer").as_ref(),
+            "IFSC code [IFSC_MASKED] for the transfer"
+        );
+        assert_eq!(
+            redact("NEFT to SBIN0000456 today").as_ref(),
+            "NEFT to [IFSC_MASKED] today"
+        );
+        // Same shape, no cue: a build id must survive untouched.
+        let build_id = "artifact ABCD0123456 published";
+        assert_eq!(redact(build_id).as_ref(), build_id);
+        assert!(scan_pii("IFSC HDFC0001234").contains(&CAT_IFSC));
+        assert!(!scan_pii("artifact ABCD0123456").contains(&CAT_IFSC));
     }
 
     #[test]
