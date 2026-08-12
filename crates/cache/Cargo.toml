@@ -5,12 +5,19 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-# Rung-0 exact-match response cache (G2.5: PRD-007 + ADR-022 §2/§3).
-# In-memory, per-replica, $0 standing cost. 64 shards published through
-# `ArcSwap`: reads are lock-free (one SHA-256 + one atomic load + one map
-# lookup); ALL writes are serialized through a single off-path writer thread,
-# so readers never wait and writers never race. Eviction is TTL-first, then
-# FIFO by insert time ("approximate-LRU" — ADR-022 §2 declines true LRU).
+[features]
+default = []
+# Enables the doc-hidden deterministic admission harness used only by the
+# Criterion target below. Production builds never enable this feature.
+bench-internals = []
+
+# Rung-0 exact-match response cache (G2.5: PRD-007 + ADR-022 §2/§3). In-memory,
+# per-replica, $0 standing cost. 64 shards are
+# published through `ArcSwap`: reads are lock-free (one SHA-256 + one atomic
+# load + one map lookup); ALL writes are serialized through a single off-path
+# writer thread. Queued and stored byte envelopes are divided into immutable,
+# non-borrowable tenant shares; eviction is tenant-local TTL-first, then FIFO by
+# insert time ("approximate-LRU" — ADR-022 §2 declines true LRU).
 #
 # Boundary: storage + keying ONLY. The `cache` config directive is parsed by
 # `crates/policy` (config surface); participation/bypass policy lives in the
@@ -23,6 +30,16 @@ serde_json = { workspace = true }
 arc-swap = { workspace = true }
 sha2 = { workspace = true }
 bytes = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = [
+  "cargo_bench_support",
+] }
+
+[[bench]]
+name = "cache_admission"
+harness = false
+required-features = ["bench-internals"]
 
 # Opt in to the workspace lint policy (deny warnings) — see root Cargo.toml.
 [lints]

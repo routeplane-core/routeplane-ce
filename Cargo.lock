@@ -1922,6 +1922,7 @@ version = "0.3.4"
 dependencies = [
  "arc-swap",
  "bytes",
+ "criterion",
  "routeplane-types",
  "serde",
  "serde_json",

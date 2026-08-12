@@ -207,6 +207,23 @@ use crate::guardrails::GuardrailEngine;
 use crate::guardrails::TokenizerKey;
 use crate::observability::ObservabilityEngine;
 
+/// Build the immutable tenant universe used by tenant-owned in-process cache
+/// lanes. Invalid legacy identities continue serving, but remain storage-inert.
+/// Sorting and deduplication ensure multiple keys for one tenant consume one
+/// capacity share.
+fn canonical_tenant_ids(auth: &AuthState) -> Vec<routeplane_types::TenantId> {
+    let mut tenant_ids = std::collections::BTreeSet::new();
+    for key in auth.keys.values() {
+        if let Some(tenant_id) = key
+            .canonical_tenant_id()
+            .and_then(|id| routeplane_types::TenantId::new(id).ok())
+        {
+            tenant_ids.insert(tenant_id);
+        }
+    }
+    tenant_ids.into_iter().collect()
+}
+
 /// Why the console→gateway-key binding was refused at boot.
 #[derive(Debug, PartialEq, Eq)]
 enum ConsoleKeyError {
@@ -386,6 +403,23 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // Exact-cache admission is fixed at boot from explicit canonical tenant
+    // identities. Legacy/display-name and invalid identities keep serving but
+    // can neither consume cache capacity nor purge cache state.
+    let cache_tenant_ids = canonical_tenant_ids(&loaded_auth);
+    let cache_tenant_count = cache_tenant_ids.len();
+    let storage_inert_key_count = loaded_auth
+        .keys
+        .values()
+        .filter(|key| key.canonical_tenant_id().is_none())
+        .count();
+    if storage_inert_key_count > 0 {
+        tracing::warn!(
+            storage_inert_key_count,
+            "gateway keys without an explicit canonical tenant_id remain authorized but exact-cache read/write/purge is disabled; migrate each key to [A-Za-z0-9_-]{{1,64}}"
+        );
+    }
 
     // Budgets & rate limits (PRD-008 / ADR-023 Mode L): build the counter
     // registry from the SAME loaded keys, before wrapping AuthState in its
@@ -890,7 +924,7 @@ async fn main() {
     // 16 MiB pool-free). Scale-to-zero resets it — accepted, documented.
     let cache_settings = CacheSettings::from_env();
     tracing::info!(
-        "server limits: max_concurrency={} request_timeout={}ms max_body_bytes={} audio_max_body_bytes={} | deadline: request={}ms per_attempt={}ms | guardrail webhook: timeout={}ms max_bytes={} | exact cache: budget_bytes={}",
+        "server limits: max_concurrency={} request_timeout={}ms max_body_bytes={} audio_max_body_bytes={} | deadline: request={}ms per_attempt={}ms | guardrail webhook: timeout={}ms max_bytes={} | exact cache: budget_bytes={} canonical_tenants={}",
         limits_server.max_concurrency,
         limits_server.request_timeout.as_millis(),
         limits_server.max_body_bytes,
@@ -900,6 +934,7 @@ async fn main() {
         webhook_limits.timeout.as_millis(),
         webhook_limits.max_response_bytes,
         cache_settings.budget_bytes,
+        cache_tenant_count,
     );
 
     // SIEM/warehouse export (R1.5 / ADR-054) — ship-dark by default. With no
@@ -1017,11 +1052,14 @@ async fn main() {
         ledger,
         telemetry,
         policies,
-        cache: routeplane_cache::ExactCache::new(cache_settings.budget_bytes),
+        cache: routeplane_cache::ExactCache::new(
+            cache_settings.budget_bytes,
+            cache_tenant_ids.clone(),
+        ),
         // FR-19 cache-purge flush-generation registry: always constructed, $0
-        // standing cost, empty (every scope at generation 0 ⇒ byte-identical
-        // legacy key) until a tenant issues a purge.
-        cache_flush: routeplane_cache::FlushRegistry::new(),
+        // standing cost, with empty per-tenant scope maps (every scope at
+        // generation 0 ⇒ byte-identical legacy key) until a purge is issued.
+        cache_flush: routeplane_cache::FlushRegistry::new(cache_tenant_ids),
         // Idempotency-key store (Stripe/Portkey safe-retry): always constructed,
         // $0 standing cost, in-memory + per-replica (scale-to-zero resets it like
         // the cache). TTL overridable via RP_IDEMPOTENCY_TTL_SECONDS (default 24h);
@@ -1821,7 +1859,7 @@ async fn handle_middleware_error(err: BoxError) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::with_security_headers;
+    use super::{canonical_tenant_ids, with_security_headers};
     use axum::body::Body;
     use axum::http::Request;
     use axum::{routing::get, Router};
@@ -1894,6 +1932,28 @@ mod tests {
         assert_eq!(shed.headers().get("x-routeplane-shed").unwrap(), "capacity");
         assert!(shed.headers().get("retry-after").is_some());
         assert!(shed_total() > before, "shed_total must increment");
+    }
+
+    #[test]
+    fn cache_tenant_universe_deduplicates_and_excludes_legacy_or_invalid_ids() {
+        use crate::auth::AuthState;
+        use routeplane_types::TenantId;
+
+        let registry = AuthState::load_from_json(
+            r#"{"keys":[
+                {"name":"Acme primary","routeplane_key":"rp_acme_1","provider_keys":{},"tenant_id":"t_acme"},
+                {"name":"Acme secondary","routeplane_key":"rp_acme_2","provider_keys":{},"tenant_id":"t_acme"},
+                {"name":"Legacy display","routeplane_key":"rp_legacy","provider_keys":{}},
+                {"name":"Invalid explicit","routeplane_key":"rp_invalid","provider_keys":{},"tenant_id":"bad.tenant"}
+            ]}"#,
+            "test",
+        )
+        .expect("registry");
+
+        assert_eq!(
+            canonical_tenant_ids(&registry),
+            vec![TenantId::new("t_acme").expect("canonical test tenant")]
+        );
     }
 
     /// REGRESSION (cross-tenant isolation): with two tenants registered and

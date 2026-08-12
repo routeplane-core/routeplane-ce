@@ -480,7 +480,7 @@ pub struct CacheDirective {
     pub max_response_bytes: usize,
 }
 
-fn is_valid_cache_namespace(s: &str) -> bool {
+pub fn is_valid_cache_namespace(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && s.bytes()

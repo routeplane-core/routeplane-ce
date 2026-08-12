@@ -3,6 +3,7 @@
     {
       "name": "Default Development Key",
       "routeplane_key": "rp_dev_REPLACE_ME",
+      "tenant_id": "t_default",
       "provider_keys": {
         "openai": "env:OPENAI_API_KEY",
         "anthropic": "env:ANTHROPIC_API_KEY",

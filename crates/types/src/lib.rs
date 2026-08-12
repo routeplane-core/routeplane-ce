@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+mod tenant;
+pub use tenant::{TenantId, ValueError};
+
 /// A data-residency jurisdiction (e.g. "IN", "EU", "US"). Kept as a free-form
 /// code so adding a jurisdiction is configuration, not a code change — this is
 /// what lets the sovereign-routing engine generalize past India (DPDP) to

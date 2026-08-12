@@ -201,8 +201,8 @@ impl GuardrailWebhookLimits {
 /// documented; the lost-continuity telemetry is the rung-1 trigger input.
 #[derive(Debug, Clone, Copy)]
 pub struct CacheSettings {
-    /// Total per-replica budget in bytes, enforced at write time across the
-    /// cache's 64 shards. Never grows unbounded (PRD-007 NFR-3).
+    /// Total per-replica retained-response envelope, split between stored
+    /// entries and bounded write-behind lanes. Never grows unbounded.
     pub budget_bytes: usize,
 }
 

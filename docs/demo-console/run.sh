@@ -17,6 +17,7 @@ cat > "$WORK/configs/keys.json" <<'EOF'
     {
       "name": "CE Demo Key",
       "routeplane_key": "rp_ce_demo_2f8a1c9d4e6b0357",
+      "tenant_id": "t_ce_demo",
       "provider_keys": {}
     }
   ]

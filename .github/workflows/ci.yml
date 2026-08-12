@@ -50,5 +50,44 @@ jobs:
       - name: Test (Community Edition)
         run: cargo test --locked --workspace --no-default-features
 
+      # Exact-cache writes are admitted on the request thread. Keep the
+      # production tenant-map/lane seam under the same required quality job on
+      # pull requests and main pushes, and fail closed on a missing or malformed
+      # evidence artifact as well as on the benchmark's own 50-us p99 ceiling.
+      - name: Exact-cache admission performance gate
+        env:
+          RP_CACHE_PERF_OUT: ${{ github.workspace }}/cache-perf-metrics.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo bench --locked --quiet -p routeplane-cache --features bench-internals \
+            --bench cache_admission
+          jq -e '
+            (keys | sort) == ([
+              "cache_admission_admitted_1_tenants",
+              "cache_admission_admitted_8_tenants",
+              "cache_admission_admitted_64_tenants",
+              "cache_admission_saturated_drop_1_tenants",
+              "cache_admission_saturated_drop_8_tenants",
+              "cache_admission_saturated_drop_64_tenants"
+            ] | sort)
+            and all(.[];
+              (.p50_ns | type) == "number"
+              and (.p99_ns | type) == "number"
+              and (.ceiling_ns | type) == "number"
+              and .within_budget == true
+              and .p99_ns <= .ceiling_ns
+            )
+          ' "$RP_CACHE_PERF_OUT" >/dev/null
+
+      - name: Upload exact-cache performance evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cache-admission-${{ github.job }}-${{ github.run_attempt }}
+          path: cache-perf-metrics.json
+          if-no-files-found: error
+          retention-days: 14
+
 # The identity/content gate runs as its own required workflow
 # (.github/workflows/identity-guard.yml) on the same pull_request / push events.

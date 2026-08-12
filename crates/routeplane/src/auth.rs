@@ -248,6 +248,19 @@ impl VirtualKey {
         self.tenant_id.clone().unwrap_or_else(|| self.name.clone())
     }
 
+    /// The explicit immutable tenant identity when it satisfies the canonical
+    /// grammar. Display-name fallback is deliberately excluded even when the
+    /// name happens to look canonical: mutable names are not durable authority.
+    pub(crate) fn canonical_tenant_id(&self) -> Option<&str> {
+        self.tenant_id.as_deref().filter(|tenant_id| {
+            !tenant_id.is_empty()
+                && tenant_id.len() <= routeplane_types::TenantId::MAX_LEN
+                && tenant_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
+    }
+
     /// Resolve this key's [`CapabilitySet`]:
     /// `tier_baseline(tier) ∪ capability_overrides − (global_holdbacks ∪ rollout_holdbacks)`
     /// ([ADR-012] §3). The effective holdback set is the gateway-level
