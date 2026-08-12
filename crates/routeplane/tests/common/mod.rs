@@ -47,6 +47,7 @@ fn vk() -> VirtualKey {
     serde_json::from_value(json!({
         "name": "test-key",
         "routeplane_key": RP_KEY,
+        "tenant_id": TENANT,
         "provider_keys": {
             "openai": "test-api-key",
             "anthropic": "test-api-key",

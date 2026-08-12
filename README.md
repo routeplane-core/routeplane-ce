@@ -98,7 +98,7 @@ No clone, no config files — pull the published image and hand it a minimal key
 ```bash
 docker run -d -p 8080:8080 \
   -e OPENAI_API_KEY=sk-your-key \
-  -e RP_KEYS_JSON='{"keys":[{"name":"default","routeplane_key":"rp_local_dev","provider_keys":{"openai":"env:OPENAI_API_KEY"}}]}' \
+  -e RP_KEYS_JSON='{"keys":[{"name":"default","routeplane_key":"rp_local_dev","tenant_id":"t_local","provider_keys":{"openai":"env:OPENAI_API_KEY"}}]}' \
   ghcr.io/routeplane-core/routeplane-ce:latest
 ```
 
@@ -639,6 +639,7 @@ Kept short here — the full reference lives at [docs.routeplane.ai](https://doc
     {
       "name": "default",
       "routeplane_key": "rp_generate_your_own",
+      "tenant_id": "t_default",
       "provider_keys": {
         "openai": "env:OPENAI_API_KEY",
         "anthropic": "env:ANTHROPIC_API_KEY",
@@ -649,8 +650,13 @@ Kept short here — the full reference lives at [docs.routeplane.ai](https://doc
 }
 ```
 
-`env:` values resolve from the gateway's environment at request time; comma-separated values form
-a failover pool. Optional per-key fields add `limits` (rate + budget) and `rollout_holdbacks`.
+`tenant_id` is the stable cache-isolation authority: 1–64 characters from
+`[A-Za-z0-9_-]`. Do not use a mutable display name. `env:` values resolve from the gateway's
+environment at request time; comma-separated values form a failover pool. Optional per-key fields
+add `limits` (rate + budget) and `rollout_holdbacks`.
+Upgrading an older registry without `tenant_id` does not break authentication, but that key is
+deliberately exact-cache storage-inert and cannot purge. Add one stable canonical `tenant_id` per
+tenant before relying on caching; startup logs the count of keys that still need migration.
 Alternatives to the file mount: `RP_KEYS_JSON` (inline JSON, raw or base64) or `RP_KEYS_FILE`
 (alternate path).
 

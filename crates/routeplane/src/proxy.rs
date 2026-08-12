@@ -70,7 +70,7 @@ use routeplane_semantic_cache::{
 };
 #[cfg(feature = "enterprise")]
 use routeplane_telemetry::{TelemetryEvent, TelemetryHandle};
-use routeplane_types::{ChatCompletionChunk, ChatCompletionRequest, Region};
+use routeplane_types::{ChatCompletionChunk, ChatCompletionRequest, Region, TenantId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -584,8 +584,13 @@ impl AppState {
             policies: routeplane_policy::new_shared_registry(
                 routeplane_policy::PolicyRegistry::new(),
             ),
-            cache: ExactCache::new(routeplane_cache::DEFAULT_BUDGET_BYTES),
-            cache_flush: FlushRegistry::new(),
+            cache: ExactCache::new(
+                routeplane_cache::DEFAULT_BUDGET_BYTES,
+                vec![TenantId::new("t_test").expect("canonical test tenant")],
+            ),
+            cache_flush: FlushRegistry::new(vec![
+                TenantId::new("t_test").expect("canonical test tenant")
+            ]),
             idempotency: IdempotencyStore::new(),
             semantic_cache: SemanticCache::new(0.95, 1024),
             #[cfg(feature = "enterprise")]
@@ -3108,6 +3113,9 @@ async fn chat_completions_pipeline(
         .map(|v| v.eq_ignore_ascii_case("no-store"))
         .unwrap_or(false);
 
+    // Populated only in the final participating arm. Cache-off and safety
+    // bypass paths do not probe the tenant registry.
+    let mut cache_tenant_id: Option<TenantId> = None;
     let cache_plan: CachePlan = match &cache_directive {
         None => CachePlan::Off,
         // Client opt-out: `x-routeplane-cache-control: no-store` bypasses the
@@ -3130,49 +3138,45 @@ async fn chat_completions_pipeline(
         // side: synthesized-SSE serve is a sanctioned v1.1 enhancement).
         Some(_) if is_stream => CachePlan::Bypass,
         Some(d) => {
-            // FR-5: key = SHA-256(canonical(shaping-resolved request) ‖ chain),
-            // tenant/namespace structural. Chain = the flattened eligible
-            // providers, normalized (trim + lowercase), order-preserving.
-            let chain: Vec<String> = flat_targets
-                .iter()
-                .map(|t| t.provider.trim().to_ascii_lowercase())
-                .collect();
-            // FR-19: fold the per-(tenant, namespace) flush generation into the
-            // key. Wait-free read (one ArcSwap::load + map probe). gen == 0 (the
-            // default — no purge ever issued) is byte-identical to the legacy key,
-            // so golden/ab_parity stay stable and pre-existing entries are
-            // reachable. A purge bumps the generation, making prior entries miss.
-            // `generation_effective` also folds the tenant-wide wildcard scope, so
-            // a no-namespace ("flush-all") purge actually invalidates THIS
-            // namespace too (otherwise it would be a silent no-op).
-            let generation = state
-                .cache_flush
-                .generation_effective(&tenant_ctx.tenant_id, &d.namespace);
-            let key = match flat_targets.first().filter(|t| !t.params.is_noop()) {
-                Some(t) => {
-                    let shaped = t.params.apply(payload.clone());
-                    exact_key_gen(
-                        &tenant_ctx.tenant_id,
-                        &d.namespace,
-                        &shaped,
-                        &chain,
-                        generation,
-                    )
-                }
-                None => exact_key_gen(
-                    &tenant_ctx.tenant_id,
-                    &d.namespace,
-                    &payload,
-                    &chain,
-                    generation,
-                ),
-            };
-            CachePlan::Active {
-                key,
-                refresh: d.force_refresh,
-                ttl_seconds: d.ttl_seconds,
-                max_response_bytes: d.max_response_bytes,
-            }
+            // Storage authority is the VirtualKey's explicit validated
+            // tenant_id. TenantContext retains a legacy display-name fallback
+            // for non-storage surfaces and must never authorize cache state.
+            cache_tenant_id = virtual_key
+                .canonical_tenant_id()
+                .and_then(|id| TenantId::new(id).ok())
+                .filter(|tenant_id| state.cache.owns_tenant(tenant_id));
+            cache_tenant_id
+                .as_ref()
+                .map_or(CachePlan::Bypass, |tenant_id| {
+                    // FR-5: key = SHA-256(canonical(shaping-resolved request) ‖
+                    // chain), with tenant/namespace structural.
+                    let chain: Vec<String> = flat_targets
+                        .iter()
+                        .map(|t| t.provider.trim().to_ascii_lowercase())
+                        .collect();
+                    let generation = state
+                        .cache_flush
+                        .generation_effective(tenant_id, &d.namespace);
+                    let key = match flat_targets.first().filter(|t| !t.params.is_noop()) {
+                        Some(t) => {
+                            let shaped = t.params.apply(payload.clone());
+                            exact_key_gen(tenant_id, &d.namespace, &shaped, &chain, generation)
+                        }
+                        None => {
+                            exact_key_gen(tenant_id, &d.namespace, &payload, &chain, generation)
+                        }
+                    };
+                    CachePlan::Active {
+                        key,
+                        refresh: d.force_refresh,
+                        ttl_seconds: d.ttl_seconds,
+                        max_response_bytes: d.max_response_bytes.min(
+                            state
+                                .cache
+                                .max_response_bytes_for_tenant(tenant_id, payload.model.len()),
+                        ),
+                    }
+                })
         }
     };
 
@@ -3193,28 +3197,32 @@ async fn chat_completions_pipeline(
     #[cfg(not(feature = "enterprise"))]
     let semantic_active = false;
     let semantic_plan: SemanticPlan = match (&cache_plan, &cache_directive, semantic_active) {
-        (CachePlan::Active { refresh, .. }, Some(d), true) => {
-            // Structural tenant/namespace isolation, like the exact key. The
-            // model is the canonical request model (not the embedding model) so
-            // two requests to different completion models never collide.
-            let chain: Vec<String> = flat_targets
-                .iter()
-                .map(|t| t.provider.trim().to_ascii_lowercase())
-                .collect();
-            let key = SemanticKey::new(&tenant_ctx.tenant_id, &d.namespace, &payload.model, &chain);
-            let threshold = d
-                .similarity_threshold
-                .map(|t| t as f32)
-                .unwrap_or_else(|| state.semantic_cache.threshold());
-            SemanticPlan::Active {
-                key,
-                refresh: *refresh,
-                ttl_seconds: d.ttl_seconds,
-                max_response_bytes: d.max_response_bytes,
-                threshold,
-                embed_model: semantic_embed_model(),
+        (CachePlan::Active { refresh, .. }, Some(d), true) => match &cache_tenant_id {
+            Some(tenant_id) => {
+                // Structural tenant/namespace isolation, like the exact key. The
+                // model is the canonical request model (not the embedding model) so
+                // two requests to different completion models never collide.
+                let chain: Vec<String> = flat_targets
+                    .iter()
+                    .map(|t| t.provider.trim().to_ascii_lowercase())
+                    .collect();
+                let key =
+                    SemanticKey::new(tenant_id.as_str(), &d.namespace, &payload.model, &chain);
+                let threshold = d
+                    .similarity_threshold
+                    .map(|t| t as f32)
+                    .unwrap_or_else(|| state.semantic_cache.threshold());
+                SemanticPlan::Active {
+                    key,
+                    refresh: *refresh,
+                    ttl_seconds: d.ttl_seconds,
+                    max_response_bytes: d.max_response_bytes,
+                    threshold,
+                    embed_model: semantic_embed_model(),
+                }
             }
-        }
+            None => SemanticPlan::Off,
+        },
         _ => SemanticPlan::Off,
     };
 
@@ -4545,7 +4553,14 @@ async fn chat_completions_pipeline(
                     } => match serde_json::to_vec(&response) {
                         Ok(body) => {
                             let body = Bytes::from(body);
-                            if body.len() <= *max_response_bytes {
+                            if body.len()
+                                <= (*max_response_bytes).min(
+                                    state.cache.max_response_bytes_for_tenant(
+                                        key.tenant_id(),
+                                        response.model.len(),
+                                    ),
+                                )
+                            {
                                 state.cache.insert(CacheWrite {
                                     key: key.clone(),
                                     body: body.clone(),
@@ -7556,8 +7571,8 @@ mod tests {
             policies: routeplane_policy::new_shared_registry(
                 routeplane_policy::PolicyRegistry::new(),
             ),
-            cache: ExactCache::new(routeplane_cache::DEFAULT_BUDGET_BYTES),
-            cache_flush: FlushRegistry::new(),
+            cache: ExactCache::new(routeplane_cache::DEFAULT_BUDGET_BYTES, Vec::new()),
+            cache_flush: FlushRegistry::new(Vec::new()),
             idempotency: routeplane_cache::idempotency::IdempotencyStore::new(),
             semantic_cache: SemanticCache::new(0.95, 1024),
             #[cfg(feature = "enterprise")]
@@ -7749,8 +7764,8 @@ mod tests {
             policies: routeplane_policy::new_shared_registry(
                 routeplane_policy::PolicyRegistry::new(),
             ),
-            cache: ExactCache::new(routeplane_cache::DEFAULT_BUDGET_BYTES),
-            cache_flush: FlushRegistry::new(),
+            cache: ExactCache::new(routeplane_cache::DEFAULT_BUDGET_BYTES, Vec::new()),
+            cache_flush: FlushRegistry::new(Vec::new()),
             idempotency: routeplane_cache::idempotency::IdempotencyStore::new(),
             semantic_cache: SemanticCache::new(0.95, 1024),
             #[cfg(feature = "enterprise")]
@@ -8010,8 +8025,8 @@ mod tests {
             policies: routeplane_policy::new_shared_registry(
                 routeplane_policy::PolicyRegistry::new(),
             ),
-            cache: ExactCache::new(routeplane_cache::DEFAULT_BUDGET_BYTES),
-            cache_flush: FlushRegistry::new(),
+            cache: ExactCache::new(routeplane_cache::DEFAULT_BUDGET_BYTES, Vec::new()),
+            cache_flush: FlushRegistry::new(Vec::new()),
             idempotency: routeplane_cache::idempotency::IdempotencyStore::new(),
             semantic_cache: SemanticCache::new(0.95, 1024),
             #[cfg(feature = "enterprise")]
@@ -8140,8 +8155,8 @@ mod tests {
             policies: routeplane_policy::new_shared_registry(
                 routeplane_policy::PolicyRegistry::new(),
             ),
-            cache: ExactCache::new(routeplane_cache::DEFAULT_BUDGET_BYTES),
-            cache_flush: FlushRegistry::new(),
+            cache: ExactCache::new(routeplane_cache::DEFAULT_BUDGET_BYTES, Vec::new()),
+            cache_flush: FlushRegistry::new(Vec::new()),
             idempotency: routeplane_cache::idempotency::IdempotencyStore::new(),
             semantic_cache: SemanticCache::new(0.95, 1024),
             #[cfg(feature = "enterprise")]
@@ -8434,8 +8449,8 @@ mod tests {
             policies: routeplane_policy::new_shared_registry(
                 routeplane_policy::PolicyRegistry::new(),
             ),
-            cache: ExactCache::new(routeplane_cache::DEFAULT_BUDGET_BYTES),
-            cache_flush: FlushRegistry::new(),
+            cache: ExactCache::new(routeplane_cache::DEFAULT_BUDGET_BYTES, Vec::new()),
+            cache_flush: FlushRegistry::new(Vec::new()),
             idempotency: routeplane_cache::idempotency::IdempotencyStore::new(),
             semantic_cache: SemanticCache::new(0.95, 1024),
             #[cfg(feature = "enterprise")]
@@ -8517,8 +8532,8 @@ mod tests {
             policies: routeplane_policy::new_shared_registry(
                 routeplane_policy::PolicyRegistry::new(),
             ),
-            cache: ExactCache::new(routeplane_cache::DEFAULT_BUDGET_BYTES),
-            cache_flush: FlushRegistry::new(),
+            cache: ExactCache::new(routeplane_cache::DEFAULT_BUDGET_BYTES, Vec::new()),
+            cache_flush: FlushRegistry::new(Vec::new()),
             idempotency: routeplane_cache::idempotency::IdempotencyStore::new(),
             semantic_cache: SemanticCache::new(0.95, 1024),
             #[cfg(feature = "enterprise")]
@@ -9167,8 +9182,8 @@ mod tests {
             policies: routeplane_policy::new_shared_registry(
                 routeplane_policy::PolicyRegistry::new(),
             ),
-            cache: ExactCache::new(routeplane_cache::DEFAULT_BUDGET_BYTES),
-            cache_flush: FlushRegistry::new(),
+            cache: ExactCache::new(routeplane_cache::DEFAULT_BUDGET_BYTES, Vec::new()),
+            cache_flush: FlushRegistry::new(Vec::new()),
             idempotency: routeplane_cache::idempotency::IdempotencyStore::new(),
             semantic_cache: SemanticCache::new(0.95, 1024),
             #[cfg(feature = "enterprise")]
@@ -9435,8 +9450,8 @@ mod tests {
             policies: routeplane_policy::new_shared_registry(
                 routeplane_policy::PolicyRegistry::new(),
             ),
-            cache: ExactCache::new(routeplane_cache::DEFAULT_BUDGET_BYTES),
-            cache_flush: FlushRegistry::new(),
+            cache: ExactCache::new(routeplane_cache::DEFAULT_BUDGET_BYTES, Vec::new()),
+            cache_flush: FlushRegistry::new(Vec::new()),
             idempotency: routeplane_cache::idempotency::IdempotencyStore::new(),
             semantic_cache: SemanticCache::new(0.95, 1024),
             #[cfg(feature = "enterprise")]

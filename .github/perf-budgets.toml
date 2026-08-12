@@ -1,0 +1,18 @@
+# Community Edition hot-path latency budget ledger.
+#
+# Ceilings are generous absolute p99 limits intended to catch structural
+# regressions without turning ordinary shared-runner noise into CI failures.
+# Budgets may only tighten; loosening one requires explicit justification.
+
+# --- exact-cache admission (ADR-022) -----------------------------------------
+# The synchronous request-thread portion only: immutable canonical-tenant map
+# lookup, cache-entry construction, tenant-local bounded lane try_send, and the
+# coalesced wake signal. Shard cloning and eviction stay on the single writer
+# thread. The Criterion target emits p50/p99 JSON and self-enforces this ceiling
+# for admitted + saturated-lane-drop paths at 1/8/64 configured tenants.
+# Measurement: `cargo bench -p routeplane-cache --features bench-internals
+# --bench cache_admission`.
+
+[cache.admission]
+ceiling_us = 50
+note = "immutable tenant lookup + entry build + tenant-local lane/wake try_send; admitted and saturated-drop paths"

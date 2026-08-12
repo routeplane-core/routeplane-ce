@@ -21,7 +21,7 @@ use routeplane_adapters::openai::OpenAIProvider;
 use routeplane_adapters::Provider;
 use routeplane_entitlements::{CapabilitySet, Tier};
 use routeplane_router::HealthTracker;
-use routeplane_types::{ChatCompletionRequest, Message};
+use routeplane_types::{ChatCompletionRequest, Message, TenantId};
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -42,8 +42,30 @@ fn build_state(openai_base_url: &str) -> Arc<AppState> {
         "openai",
         Arc::new(OpenAIProvider::with_base_url(openai_base_url)) as Arc<dyn Provider>,
     );
+    let cache_tenant_ids = [
+        "t_a",
+        "t_b",
+        "t_free",
+        "t_sem",
+        "tenant_a",
+        "tenant_b",
+        "t_noembed",
+        "t_ns",
+        "t_purge",
+        "t_flushall",
+        "t_rf",
+        "t_acme",
+    ]
+    .into_iter()
+    .map(|id| TenantId::new(id).expect("canonical test tenant"))
+    .collect::<Vec<_>>();
     Arc::new(AppState {
         health: HealthTracker::new(["openai"]),
+        cache: routeplane_cache::ExactCache::new(
+            routeplane_cache::DEFAULT_BUDGET_BYTES,
+            cache_tenant_ids.clone(),
+        ),
+        cache_flush: routeplane_cache::FlushRegistry::new(cache_tenant_ids),
         ..AppState::for_tests(providers)
     })
 }
@@ -56,6 +78,15 @@ fn vk(tenant: &str) -> VirtualKey {
         "tenant_id": tenant
     }))
     .expect("virtual key deserializes")
+}
+
+fn legacy_vk_with_name(name: &str) -> VirtualKey {
+    serde_json::from_value(json!({
+        "name": name,
+        "routeplane_key": format!("rp_legacy_{name}"),
+        "provider_keys": { "openai": "test-api-key" }
+    }))
+    .expect("legacy virtual key deserializes")
 }
 
 fn ctx(tenant: &str, tier: Tier) -> TenantContext {
@@ -113,6 +144,26 @@ async fn invoke(
     chat_completions(
         State(state),
         Extension(vk(tenant)),
+        Extension(ctx(tenant, tier)),
+        Extension(TenantGuardrails(None)),
+        h,
+        routeplane::api_error::OpenAiJson(body),
+    )
+    .await
+    .into_response()
+}
+
+async fn invoke_with_key(
+    state: Arc<AppState>,
+    virtual_key: VirtualKey,
+    tenant: &str,
+    tier: Tier,
+    h: HeaderMap,
+    body: ChatCompletionRequest,
+) -> Response {
+    chat_completions(
+        State(state),
+        Extension(virtual_key),
         Extension(ctx(tenant, tier)),
         Extension(TenantGuardrails(None)),
         h,
@@ -845,13 +896,170 @@ async fn no_store_header_bypasses_read_and_write() {
 async fn call_purge(state: Arc<AppState>, tenant: &str, body: serde_json::Value) -> Response {
     let req: routeplane::cache_api::PurgeRequest =
         serde_json::from_value(body).expect("purge body deserializes");
-    routeplane::cache_api::purge(
-        State(state),
-        Extension(ctx(tenant, Tier::Free)),
-        Some(axum::Json(req)),
+    routeplane::cache_api::purge(State(state), Extension(vk(tenant)), Some(axum::Json(req)))
+        .await
+        .into_response()
+}
+
+#[tokio::test]
+async fn legacy_display_name_collision_cannot_read_or_write_explicit_tenant_cache() {
+    let server = MockServer::start().await;
+    mount_openai_ok(&server, "explicit tenant answer").await;
+    let state = build_state(&server.uri());
+
+    let (warm_status, warm_cache, warm_body) = split(
+        invoke(
+            state.clone(),
+            "t_a",
+            Tier::Free,
+            headers(CACHE_CFG),
+            payload("collision proof"),
+        )
+        .await,
     )
-    .await
-    .into_response()
+    .await;
+    assert_eq!(warm_status, StatusCode::OK);
+    assert_eq!(warm_cache.as_deref(), Some("miss"));
+    state.cache.flush();
+
+    let (legacy_status, legacy_cache, _) = split(
+        invoke_with_key(
+            state.clone(),
+            legacy_vk_with_name("t_a"),
+            "t_a",
+            Tier::Free,
+            headers(CACHE_CFG),
+            payload("collision proof"),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(legacy_status, StatusCode::OK);
+    assert_eq!(legacy_cache.as_deref(), Some("bypass"));
+    state.cache.flush();
+    assert_eq!(upstream_calls(&server).await, 2);
+
+    let (hit_status, hit_cache, hit_body) = split(
+        invoke(
+            state.clone(),
+            "t_a",
+            Tier::Free,
+            headers(CACHE_CFG),
+            payload("collision proof"),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(hit_status, StatusCode::OK);
+    assert_eq!(hit_cache.as_deref(), Some("hit"));
+    assert_eq!(hit_body, warm_body);
+    assert_eq!(upstream_calls(&server).await, 2);
+
+    let (_, legacy_write_cache, _) = split(
+        invoke_with_key(
+            state.clone(),
+            legacy_vk_with_name("t_a"),
+            "t_a",
+            Tier::Free,
+            headers(CACHE_CFG),
+            payload("legacy write proof"),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(legacy_write_cache.as_deref(), Some("bypass"));
+    state.cache.flush();
+
+    let (_, explicit_miss_cache, _) = split(
+        invoke(
+            state,
+            "t_a",
+            Tier::Free,
+            headers(CACHE_CFG),
+            payload("legacy write proof"),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(explicit_miss_cache.as_deref(), Some("miss"));
+    assert_eq!(upstream_calls(&server).await, 4);
+}
+
+#[tokio::test]
+async fn legacy_display_name_collision_cannot_purge_explicit_tenant_cache() {
+    let state = build_state("http://127.0.0.1:9");
+    let tenant_a = TenantId::new("t_a").expect("canonical test tenant");
+    assert_eq!(state.cache_flush.generation(&tenant_a, "default"), 0);
+
+    let response = routeplane::cache_api::purge(
+        State(state.clone()),
+        Extension(legacy_vk_with_name("t_a")),
+        Some(axum::Json(routeplane::cache_api::PurgeRequest {
+            namespace: Some("default".into()),
+        })),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(state.cache_flush.generation(&tenant_a, "default"), 0);
+}
+
+#[tokio::test]
+async fn invalid_explicit_tenant_id_is_read_write_and_purge_inert() {
+    let server = MockServer::start().await;
+    mount_openai_ok(&server, "uncached answer").await;
+    let state = build_state(&server.uri());
+
+    let (status, cache, _) = split(
+        invoke(
+            state.clone(),
+            "bad.tenant",
+            Tier::Free,
+            headers(CACHE_CFG),
+            payload("invalid identity proof"),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cache.as_deref(), Some("bypass"));
+    state.cache.flush();
+    assert_eq!(state.cache.stats_snapshot(), (0, 0));
+
+    let purge = routeplane::cache_api::purge(
+        State(state),
+        Extension(vk("bad.tenant")),
+        Some(axum::Json(routeplane::cache_api::PurgeRequest {
+            namespace: Some("default".into()),
+        })),
+    )
+    .await;
+    assert_eq!(purge.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn purge_rejects_invalid_namespace_without_mutation_or_reflection() {
+    let state = build_state("http://127.0.0.1:9");
+    let tenant_a = TenantId::new("t_a").expect("canonical test tenant");
+    let attacker_namespace = "Bad.Namespace/<script>";
+
+    let response = call_purge(
+        state.clone(),
+        "t_a",
+        json!({ "namespace": attacker_namespace }),
+    )
+    .await;
+    let (status, _, body) = split(response).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        state.cache_flush.generation(&tenant_a, attacker_namespace),
+        0
+    );
+    assert!(
+        !String::from_utf8_lossy(&body).contains(attacker_namespace),
+        "rejected namespaces must not be reflected in the response"
+    );
 }
 
 /// After a purge, a previously-cached key MISSES, and a fresh entry is stored

@@ -51,6 +51,9 @@ export interface CacheStats {
   hit_rate: number;
   hits: number;
   misses: number;
+  storage_budget_bytes: number;
+  queued_bytes: number;
+  min_effective_entry_bytes: number;
   oversize_drops: number;
   write_drops: number;
 }

@@ -118,7 +118,7 @@
                 },
                 {
                   "name": "RP_KEYS_JSON",
-                  "value": "[concat('{\"keys\":[{\"name\":\"default\",\"routeplane_key\":\"', parameters('gatewayKey'), '\",\"provider_keys\":{\"openai\":\"env:OPENAI_API_KEY\"}}]}')]"
+                  "value": "[concat('{\"keys\":[{\"name\":\"default\",\"routeplane_key\":\"', parameters('gatewayKey'), '\",\"tenant_id\":\"t_default\",\"provider_keys\":{\"openai\":\"env:OPENAI_API_KEY\"}}]}')]"
                 }
               ]
             }
