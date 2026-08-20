@@ -95,6 +95,7 @@ fn vk_for(tenant_id: &str) -> VirtualKey {
 fn ctx_for(tenant_id: &str) -> TenantContext {
     TenantContext {
         tenant_id: tenant_id.to_string(),
+        resource_tenant_id: None,
         tier: Tier::Standard,
         capabilities: CapabilitySet::resolve(
             Tier::Standard,

@@ -62,6 +62,7 @@ fn ctx() -> TenantContext {
     // this build — a Free tenant's platform/key caps must still bite.
     TenantContext {
         tenant_id: TENANT.into(),
+        resource_tenant_id: None,
         tier: Tier::Free,
         capabilities: CapabilitySet::resolve(Tier::Free, &BTreeSet::new(), &BTreeSet::new()),
         compliance_frameworks: Vec::new(),

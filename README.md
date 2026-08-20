@@ -650,13 +650,15 @@ Kept short here — the full reference lives at [docs.routeplane.ai](https://doc
 }
 ```
 
-`tenant_id` is the stable cache-isolation authority: 1–64 characters from
+`tenant_id` is the stable tenant-owned cache and observability isolation authority: 1–64 characters from
 `[A-Za-z0-9_-]`. Do not use a mutable display name. `env:` values resolve from the gateway's
 environment at request time; comma-separated values form a failover pool. Optional per-key fields
 add `limits` (rate + budget) and `rollout_holdbacks`.
-Upgrading an older registry without `tenant_id` does not break authentication, but that key is
-deliberately exact-cache storage-inert and cannot purge. Add one stable canonical `tenant_id` per
-tenant before relying on caching; startup logs the count of keys that still need migration.
+Upgrading an older registry without a valid `tenant_id` does not break authentication or inference,
+but that key is deliberately inert for all tenant-owned in-process resources: it cannot read, write,
+or purge exact-cache state and its usage events are not retained by the tenant observability ring.
+Add one stable canonical `tenant_id` per tenant before relying on caching or in-process analytics;
+startup logs the count of keys that still need migration.
 Alternatives to the file mount: `RP_KEYS_JSON` (inline JSON, raw or base64) or `RP_KEYS_FILE`
 (alternate path).
 

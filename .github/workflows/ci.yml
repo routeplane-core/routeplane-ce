@@ -89,5 +89,43 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      # Tenant-owned observability admission stays on the synchronous request
+      # seam. Require closed p50/p99 evidence for admitted and full-share-drop
+      # paths at 1/8/64 canonical tenants; missing/malformed evidence fails.
+      - name: Observability admission performance gate
+        env:
+          RP_OBSERVABILITY_PERF_OUT: ${{ github.workspace }}/observability-perf-metrics.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo bench --locked --quiet -p routeplane --features bench-internals \
+            --bench observability_admission
+          jq -e '
+            (keys | sort) == ([
+              "observability_admission_admitted_1_tenants",
+              "observability_admission_admitted_8_tenants",
+              "observability_admission_admitted_64_tenants",
+              "observability_admission_full_share_drop_1_tenants",
+              "observability_admission_full_share_drop_8_tenants",
+              "observability_admission_full_share_drop_64_tenants"
+            ] | sort)
+            and all(.[];
+              (.p50_ns | type) == "number"
+              and (.p99_ns | type) == "number"
+              and (.ceiling_ns | type) == "number"
+              and .within_budget == true
+              and .p99_ns <= .ceiling_ns
+            )
+          ' "$RP_OBSERVABILITY_PERF_OUT" >/dev/null
+
+      - name: Upload observability performance evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: observability-admission-${{ github.job }}-${{ github.run_attempt }}
+          path: observability-perf-metrics.json
+          if-no-files-found: error
+          retention-days: 14
+
 # The identity/content gate runs as its own required workflow
 # (.github/workflows/identity-guard.yml) on the same pull_request / push events.

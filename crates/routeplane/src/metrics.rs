@@ -120,6 +120,14 @@ const CACHE_TYPES: &[&str] = &["exact", "semantic"];
 /// Cache result label space.
 const CACHE_RESULTS: &[&str] = &["hit", "miss"];
 
+/// Fixed-cardinality bridge for tenant-owned observability drop/eviction counters.
+/// The renderer deliberately excludes tenant counts and share posture from CE's
+/// unauthenticated metrics endpoint.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ObservabilityMetrics {
+    pub snapshot: crate::observability::ObservabilityMetricsSnapshot,
+}
+
 /// Per-provider latency histogram: one atomic per finite bucket. Buckets are
 /// recorded NON-cumulatively here (each observation falls in exactly one bucket
 /// or the implicit `+Inf` overflow); the render path accumulates them into the
@@ -356,7 +364,7 @@ impl Metrics {
     /// is zero are still emitted (a stable scrape surface is friendlier to
     /// dashboards than series that blink in and out), except `provider`-labeled
     /// series are emitted for every known provider so the label set is stable.
-    pub fn render(&self, shed_total: u64) -> String {
+    pub fn render(&self, shed_total: u64, observability: Option<&ObservabilityMetrics>) -> String {
         let mut out = String::with_capacity(4096);
 
         // rp_requests_total
@@ -508,6 +516,54 @@ impl Metrics {
         let _ = writeln!(out, "# TYPE shed_total counter");
         let _ = writeln!(out, "shed_total {shed_total}");
 
+        if let Some(observability) = observability {
+            let s = observability.snapshot;
+            let _ = writeln!(
+                out,
+                "# HELP rp_observability_dropped_total Legacy aggregate observability admissions dropped by fixed fail-closed reason."
+            );
+            let _ = writeln!(out, "# TYPE rp_observability_dropped_total counter");
+            for (reason, value) in [
+                ("unregistered", s.drops_unregistered),
+                ("capacity", s.drops_capacity),
+                ("closed", s.drops_closed),
+            ] {
+                let _ = writeln!(
+                    out,
+                    "rp_observability_dropped_total{{reason=\"{reason}\"}} {value}"
+                );
+            }
+            let _ = writeln!(
+                out,
+                "# HELP rp_observability_admission_dropped_total Observability admissions dropped by fixed resource and fail-closed reason."
+            );
+            let _ = writeln!(
+                out,
+                "# TYPE rp_observability_admission_dropped_total counter"
+            );
+            for resource in crate::observability::ObservabilityAdmissionResource::ALL {
+                for reason in crate::observability::ObservabilityAdmissionDropReason::ALL {
+                    let value = s.admission_drop(resource, reason);
+                    let _ = writeln!(
+                        out,
+                        "rp_observability_admission_dropped_total{{resource=\"{}\",reason=\"{}\"}} {value}",
+                        resource.label(),
+                        reason.label(),
+                    );
+                }
+            }
+            let _ = writeln!(
+                out,
+                "# HELP rp_observability_evicted_total Tenant-local retained observability records evicted by fixed resource."
+            );
+            let _ = writeln!(out, "# TYPE rp_observability_evicted_total counter");
+            let _ = writeln!(
+                out,
+                "rp_observability_evicted_total{{resource=\"usage\"}} {}",
+                s.usage_evictions
+            );
+        }
+
         out
     }
 }
@@ -653,7 +709,7 @@ mod tests {
         m.inc_provider_error("anthropic");
         m.inc_hedged_win();
 
-        let body = m.render(7);
+        let body = m.render(7, None);
 
         // Valid exposition: HELP + TYPE for each metric family.
         for family in [
@@ -704,5 +760,33 @@ mod tests {
         // values are from the bounded set (no sentinel string leaked through).
         assert!(!body.contains("model="));
         assert!(!body.contains("(sovereign_block)"));
+    }
+
+    #[test]
+    fn observability_metrics_have_fixed_resource_and_reason_cardinality() {
+        let mut snapshot = crate::observability::ObservabilityMetricsSnapshot::default();
+        snapshot.drops_unregistered = 2;
+        snapshot.drops_capacity = 3;
+        snapshot.drops_closed = 5;
+        snapshot.usage_evictions = 7;
+        let body = Metrics::new().render(0, Some(&ObservabilityMetrics { snapshot }));
+
+        assert!(!body.contains("rp_observability_capacity"));
+        assert!(!body.contains("canonical_tenants"));
+        assert!(!body.contains("positive_share_tenants"));
+        assert!(!body.contains("zero_share_tenants"));
+        assert!(!body.contains("minimum_positive_share"));
+        assert_eq!(
+            body.lines()
+                .filter(|line| line.starts_with("rp_observability_admission_dropped_total{"))
+                .count(),
+            4
+        );
+        assert!(body.contains(
+            "rp_observability_admission_dropped_total{resource=\"usage_ingest\",reason=\"full\"} 0"
+        ));
+        assert!(body.contains("rp_observability_dropped_total{reason=\"capacity\"} 3"));
+        assert!(!body.contains("rp_observability_dropped_total{reason=\"full\"}"));
+        assert!(!body.contains("tenant="));
     }
 }

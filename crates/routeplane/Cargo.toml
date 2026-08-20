@@ -83,6 +83,9 @@ enterprise = []
 # ACTIVE when ROUTEPLANE_REDIS_URL is configured at startup. Orthogonal to
 # `enterprise` (a CE build may enable it).
 redis-limits = ["routeplane-limits/redis-limits"]
+# Exposes only deterministic Criterion harness plumbing for the production
+# observability-admission seam. Never enabled in a gateway artifact.
+bench-internals = []
 
 [dev-dependencies]
 tokio = { workspace = true }
@@ -93,6 +96,14 @@ wiremock = { workspace = true }
 # green in the commit stage.
 reqwest = { workspace = true }
 serde_json = { workspace = true }
+criterion = { version = "0.8", default-features = false, features = [
+  "cargo_bench_support",
+] }
+
+[[bench]]
+name = "observability_admission"
+harness = false
+required-features = ["bench-internals"]
 
 # Opt in to the workspace lint policy (deny warnings) — see root Cargo.toml.
 [lints]

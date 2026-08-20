@@ -140,13 +140,15 @@ pub async fn image_generation(
                 region.as_str(),
                 classification.entities
             );
-            state
-                .observability_engine
-                .record_usage(UsageEvent::sovereign_block(
+            state.observability_engine.record_usage(
+                tenant_ctx.resource_tenant_id.as_ref(),
+                UsageEvent::sovereign_block(
+                    tenant_ctx.tenant_id.clone(),
                     virtual_key.name.clone(),
                     model_label.clone(),
                     Some(region.0.clone()),
-                ));
+                ),
+            );
             ledger_sink::record_decision(&state.ledger, &tenant_ctx.capabilities, || {
                 ledger_sink::decision_draft(
                     &tenant_ctx.tenant_id,
@@ -208,18 +210,22 @@ pub async fn image_generation(
             breach.scope_header(),
             breach.policy_id()
         );
-        state.observability_engine.record_usage(UsageEvent::failure(
-            virtual_key.name.clone(),
-            format!("({})", breach.kind_header()),
-            model_label.clone(),
-            required_region.as_ref().map(|r| r.0.clone()),
-            sovereign,
-            if breach.is_budget() {
-                "budget_exceeded".to_string()
-            } else {
-                "rate_limit_exceeded".to_string()
-            },
-        ));
+        state.observability_engine.record_usage(
+            tenant_ctx.resource_tenant_id.as_ref(),
+            UsageEvent::failure(
+                tenant_ctx.tenant_id.clone(),
+                virtual_key.name.clone(),
+                format!("({})", breach.kind_header()),
+                model_label.clone(),
+                required_region.as_ref().map(|r| r.0.clone()),
+                sovereign,
+                if breach.is_budget() {
+                    "budget_exceeded".to_string()
+                } else {
+                    "rate_limit_exceeded".to_string()
+                },
+            ),
+        );
         return crate::embeddings::limit_rejection_response(&breach);
     }
 
@@ -316,16 +322,20 @@ pub async fn image_generation(
                     )
                 });
 
-                state.observability_engine.record_usage(UsageEvent::success(
-                    virtual_key.name.clone(),
-                    provider_name.clone(),
-                    model_label.clone(),
-                    units,
-                    0,
-                    units,
-                    required_region.as_ref().map(|r| r.0.clone()),
-                    sovereign,
-                ));
+                state.observability_engine.record_usage(
+                    tenant_ctx.resource_tenant_id.as_ref(),
+                    UsageEvent::success(
+                        tenant_ctx.tenant_id.clone(),
+                        virtual_key.name.clone(),
+                        provider_name.clone(),
+                        model_label.clone(),
+                        units,
+                        0,
+                        units,
+                        required_region.as_ref().map(|r| r.0.clone()),
+                        sovereign,
+                    ),
+                );
 
                 let settle_now = now_unix_ms();
                 let cost = estimate_cost_micro_usd(&model_label, units, 0);
@@ -369,14 +379,18 @@ pub async fn image_generation(
                 }
                 last_not_supported = this_not_supported;
                 last_error = e.to_string();
-                state.observability_engine.record_usage(UsageEvent::failure(
-                    virtual_key.name.clone(),
-                    provider_name.clone(),
-                    model_label.clone(),
-                    required_region.as_ref().map(|r| r.0.clone()),
-                    sovereign,
-                    last_error.clone(),
-                ));
+                state.observability_engine.record_usage(
+                    tenant_ctx.resource_tenant_id.as_ref(),
+                    UsageEvent::failure(
+                        tenant_ctx.tenant_id.clone(),
+                        virtual_key.name.clone(),
+                        provider_name.clone(),
+                        model_label.clone(),
+                        required_region.as_ref().map(|r| r.0.clone()),
+                        sovereign,
+                        last_error.clone(),
+                    ),
+                );
                 tracing::warn!(
                     "Image generation via {} failed: {}. Trying fallback...",
                     provider_name,

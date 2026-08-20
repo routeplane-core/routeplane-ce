@@ -584,6 +584,7 @@ mod tests {
         UsageEvent {
             timestamp: Utc::now(),
             virtual_key_name: "rp_test_key".into(),
+            tenant_id: String::new(),
             provider: "openai".into(),
             model: "gpt-4o".into(),
             prompt_tokens: 10,

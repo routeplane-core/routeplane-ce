@@ -8,9 +8,11 @@ use axum::{
     routing::{get, post},
     BoxError, Router,
 };
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer, ServiceBuilder};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -208,9 +210,9 @@ use crate::guardrails::TokenizerKey;
 use crate::observability::ObservabilityEngine;
 
 /// Build the immutable tenant universe used by tenant-owned in-process cache
-/// lanes. Invalid legacy identities continue serving, but remain storage-inert.
-/// Sorting and deduplication ensure multiple keys for one tenant consume one
-/// capacity share.
+/// and observability lanes. Missing or invalid identities continue serving
+/// inference, but remain resource-inert. Sorting and deduplication ensure
+/// multiple keys for one tenant consume one capacity share.
 fn canonical_tenant_ids(auth: &AuthState) -> Vec<routeplane_types::TenantId> {
     let mut tenant_ids = std::collections::BTreeSet::new();
     for key in auth.keys.values() {
@@ -270,6 +272,93 @@ fn resolve_console_key(
             registered: registered_sorted.len(),
         }),
     }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            // Losing the signal listener is itself a reason to begin a safe
+            // drain instead of leaving accepted telemetry indefinitely queued.
+            tracing::error!("failed to install Ctrl-C handler: {error}");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                tracing::error!("failed to install SIGTERM handler: {error}");
+            }
+        }
+    };
+
+    #[cfg(unix)]
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
+
+    #[cfg(not(unix))]
+    ctrl_c.await;
+
+    tracing::info!("shutdown signal received; draining in-flight requests");
+}
+
+const REQUEST_DRAIN_BOUND: Duration = Duration::from_secs(10);
+const OBSERVABILITY_DRAIN_BOUND: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestDrainOutcome {
+    Completed,
+    Forced,
+}
+
+/// Coordinate process shutdown within the platform termination window.
+///
+/// The first signal stops Axum from accepting new connections. Existing
+/// requests get a bounded graceful-drain window; after that the server future
+/// is dropped so main can continue toward runtime teardown instead of allowing
+/// an unbounded SSE body to consume the whole ACA grace period. Observability
+/// shutdown always runs afterward, including on server error or forced drain.
+async fn serve_and_shutdown_observability<S, F>(
+    server: S,
+    start_graceful: tokio::sync::oneshot::Sender<()>,
+    signal: F,
+    request_drain_bound: Duration,
+    observability: &ObservabilityEngine,
+    observability_drain_bound: Duration,
+) -> (std::io::Result<()>, RequestDrainOutcome)
+where
+    S: Future<Output = std::io::Result<()>>,
+    F: Future<Output = ()>,
+{
+    let mut server = Box::pin(server);
+    let (serve_result, outcome) = tokio::select! {
+        result = server.as_mut() => (result, RequestDrainOutcome::Completed),
+        () = signal => {
+            let _ = start_graceful.send(());
+            match tokio::time::timeout(request_drain_bound, server.as_mut()).await {
+                Ok(result) => (result, RequestDrainOutcome::Completed),
+                Err(_) => {
+                    // Axum spawns connection tasks. Dropping its server future
+                    // releases the accept/drain coordinator; returning from main
+                    // then drops the Tokio runtime and cancels any held streams.
+                    drop(server);
+                    tracing::warn!(
+                        shutdown_bound = ?request_drain_bound,
+                        "HTTP request drain exceeded its bound; forcing runtime teardown"
+                    );
+                    (Ok(()), RequestDrainOutcome::Forced)
+                }
+            }
+        }
+    };
+
+    observability.shutdown(observability_drain_bound).await;
+    (serve_result, outcome)
 }
 
 #[tokio::main]
@@ -404,20 +493,25 @@ async fn main() {
         }
     };
 
-    // Exact-cache admission is fixed at boot from explicit canonical tenant
-    // identities. Legacy/display-name and invalid identities keep serving but
-    // can neither consume cache capacity nor purge cache state.
-    let cache_tenant_ids = canonical_tenant_ids(&loaded_auth);
-    let cache_tenant_count = cache_tenant_ids.len();
-    let storage_inert_key_count = loaded_auth
+    // Tenant-owned cache and observability admission is fixed at boot from
+    // explicit canonical tenant identities. Missing/display-name-only and
+    // invalid identities keep serving inference but cannot consume tenant-owned
+    // in-process capacity or purge cache state.
+    let tenant_resource_ids = canonical_tenant_ids(&loaded_auth);
+    let cache_tenant_count = tenant_resource_ids.len();
+    let resource_inert_key_count = loaded_auth
         .keys
         .values()
-        .filter(|key| key.canonical_tenant_id().is_none())
+        .filter(|key| {
+            key.canonical_tenant_id()
+                .and_then(|id| routeplane_types::TenantId::new(id).ok())
+                .is_none()
+        })
         .count();
-    if storage_inert_key_count > 0 {
+    if resource_inert_key_count > 0 {
         tracing::warn!(
-            storage_inert_key_count,
-            "gateway keys without an explicit canonical tenant_id remain authorized but exact-cache read/write/purge is disabled; migrate each key to [A-Za-z0-9_-]{{1,64}}"
+            resource_inert_key_count,
+            "gateway keys without a valid explicit tenant_id remain authorized for inference but tenant-owned in-process cache read/write/purge and observability retention are disabled; migrate each key to [A-Za-z0-9_-]{{1,64}}"
         );
     }
 
@@ -1021,7 +1115,7 @@ async fn main() {
         // MOAT (ADR-088): reversible tokenization rides `enterprise`.
         #[cfg(feature = "enterprise")]
         tokenizer_key: TokenizerKey::from_env(),
-        observability_engine: ObservabilityEngine::new(),
+        observability_engine: ObservabilityEngine::new(tenant_resource_ids.clone()),
         residency_engine: ResidencyEngine::new(),
         health: HealthTracker::new([
             "openai",
@@ -1054,12 +1148,12 @@ async fn main() {
         policies,
         cache: routeplane_cache::ExactCache::new(
             cache_settings.budget_bytes,
-            cache_tenant_ids.clone(),
+            tenant_resource_ids.clone(),
         ),
         // FR-19 cache-purge flush-generation registry: always constructed, $0
         // standing cost, with empty per-tenant scope maps (every scope at
         // generation 0 ⇒ byte-identical legacy key) until a purge is issued.
-        cache_flush: routeplane_cache::FlushRegistry::new(cache_tenant_ids),
+        cache_flush: routeplane_cache::FlushRegistry::new(tenant_resource_ids),
         // Idempotency-key store (Stripe/Portkey safe-retry): always constructed,
         // $0 standing cost, in-memory + per-replica (scale-to-zero resets it like
         // the cache). TTL overridable via RP_IDEMPOTENCY_TTL_SECONDS (default 24h);
@@ -1210,8 +1304,13 @@ async fn main() {
         .route(
             "/analytics/latency",
             get(
-                |axum::extract::State(state): axum::extract::State<Arc<AppState>>| async move {
-                    axum::Json(state.observability_engine.latency_stats())
+                |axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+                 axum::Extension(tenant_ctx): axum::Extension<crate::auth::TenantContext>| async move {
+                    axum::Json(
+                        state
+                            .observability_engine
+                            .latency_stats(tenant_ctx.resource_tenant_id.as_ref()),
+                    )
                 },
             ),
         )
@@ -1560,7 +1659,7 @@ async fn main() {
         // `build_cors_layer`). This layer is OUTERMOST so the preflight
         // short-circuits here before auth / reliability ever run.
         .layer(build_cors_layer())
-        .with_state(state);
+        .with_state(state.clone());
 
     // Run it
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
@@ -1576,12 +1675,25 @@ async fn main() {
     // `into_make_service_with_connect_info` surfaces the TCP peer address to
     // handlers via `ConnectInfo<SocketAddr>` — the non-spoofable key the console
     // credential-route throttle uses.
-    axum::serve(
+    let (start_graceful, graceful) = tokio::sync::oneshot::channel();
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .await
-    .unwrap();
+    .with_graceful_shutdown(async move {
+        let _ = graceful.await;
+    });
+    let (serve_result, _drain_outcome) = serve_and_shutdown_observability(
+        async move { server.await },
+        start_graceful,
+        shutdown_signal(),
+        REQUEST_DRAIN_BOUND,
+        &state.observability_engine,
+        OBSERVABILITY_DRAIN_BOUND,
+    )
+    .await;
+
+    serve_result.unwrap();
 }
 
 /// Build the opt-in distributed (Redis) rate limiter (ADR-056 Mode D). Returns
@@ -1770,13 +1882,18 @@ async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 /// content data in any label. The body string is allocated here (off the hot
 /// path), never under a lock. The `shed_total` counter lives at the binary level
 /// (`SHED_TOTAL`), so it is threaded in alongside the request-path metrics table.
-async fn metrics_handler() -> impl IntoResponse {
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
         )],
-        metrics::metrics().render(shed_total()),
+        metrics::metrics().render(
+            shed_total(),
+            Some(&metrics::ObservabilityMetrics {
+                snapshot: state.observability_engine.metrics_snapshot(),
+            }),
+        ),
     )
 }
 
@@ -1859,10 +1976,14 @@ async fn handle_middleware_error(err: BoxError) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_tenant_ids, with_security_headers};
+    use super::{
+        canonical_tenant_ids, serve_and_shutdown_observability, with_security_headers,
+        RequestDrainOutcome,
+    };
     use axum::body::Body;
     use axum::http::Request;
     use axum::{routing::get, Router};
+    use futures::StreamExt;
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -1876,6 +1997,94 @@ mod tests {
         assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
         assert_eq!(h.get("x-frame-options").unwrap(), "DENY");
         assert_eq!(h.get("referrer-policy").unwrap(), "no-referrer");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn held_stream_cannot_skip_bounded_observability_shutdown() {
+        let app = Router::new().route(
+            "/stream",
+            get(|| async {
+                let body = futures::stream::once(async {
+                    Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"open"))
+                })
+                .chain(futures::stream::pending());
+                Body::from_stream(body)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (start_graceful, graceful) = tokio::sync::oneshot::channel();
+        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let _ = graceful.await;
+        });
+
+        let tenant = routeplane_types::TenantId::new("t_a").unwrap();
+        let observability = crate::observability::ObservabilityEngine::new(vec![tenant.clone()]);
+        observability.record_usage(
+            &tenant,
+            crate::observability::UsageEvent::success(
+                "spoofed".into(),
+                "k".into(),
+                "openai".into(),
+                "gpt-4o".into(),
+                1,
+                1,
+                2,
+                None,
+                false,
+            ),
+        );
+
+        let (response_started_tx, response_started_rx) = tokio::sync::oneshot::channel();
+        let client = tokio::spawn(async move {
+            let response = reqwest::get(format!("http://{addr}/stream")).await.unwrap();
+            assert!(response.status().is_success());
+            let _ = response_started_tx.send(());
+            let _held_stream = response;
+            std::future::pending::<()>().await;
+        });
+        let signal = async move {
+            let _ = response_started_rx.await;
+        };
+
+        let started = std::time::Instant::now();
+        let (serve_result, outcome) = serve_and_shutdown_observability(
+            async move { server.await },
+            start_graceful,
+            signal,
+            std::time::Duration::from_millis(25),
+            &observability,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(serve_result.is_ok());
+        assert_eq!(outcome, RequestDrainOutcome::Forced);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(observability.shutdown_is_settled_for_test());
+        assert_eq!(observability.recent_events_owned(&tenant).len(), 1);
+        assert_eq!(observability.metrics_snapshot().drops_closed, 0);
+
+        // The same engine is now producer-closed; a completion racing after the
+        // forced request cutoff is explicitly settled Closed, not silently lost.
+        observability.record_usage(
+            &tenant,
+            crate::observability::UsageEvent::success(
+                "spoofed".into(),
+                "late".into(),
+                "openai".into(),
+                "gpt-4o".into(),
+                1,
+                1,
+                2,
+                None,
+                false,
+            ),
+        );
+        assert_eq!(observability.metrics_snapshot().drops_closed, 1);
+
+        client.abort();
+        let _ = client.await;
     }
 
     // ADR-025 §3: under capacity saturation the gateway sheds FAST (before

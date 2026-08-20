@@ -243,13 +243,15 @@ async fn run_audio_text(
                 op.label(),
                 region.as_str()
             );
-            state
-                .observability_engine
-                .record_usage(UsageEvent::sovereign_block(
+            state.observability_engine.record_usage(
+                tenant_ctx.resource_tenant_id.as_ref(),
+                UsageEvent::sovereign_block(
+                    tenant_ctx.tenant_id.clone(),
                     virtual_key.name.clone(),
                     model_label.clone(),
                     Some(region.0.clone()),
-                ));
+                ),
+            );
             ledger_sink::record_decision(&state.ledger, &tenant_ctx.capabilities, || {
                 ledger_sink::decision_draft(
                     &tenant_ctx.tenant_id,
@@ -313,18 +315,22 @@ async fn run_audio_text(
             breach.scope_header(),
             breach.policy_id()
         );
-        state.observability_engine.record_usage(UsageEvent::failure(
-            virtual_key.name.clone(),
-            format!("({})", breach.kind_header()),
-            model_label.clone(),
-            required_region.as_ref().map(|r| r.0.clone()),
-            sovereign,
-            if breach.is_budget() {
-                "budget_exceeded".to_string()
-            } else {
-                "rate_limit_exceeded".to_string()
-            },
-        ));
+        state.observability_engine.record_usage(
+            tenant_ctx.resource_tenant_id.as_ref(),
+            UsageEvent::failure(
+                tenant_ctx.tenant_id.clone(),
+                virtual_key.name.clone(),
+                format!("({})", breach.kind_header()),
+                model_label.clone(),
+                required_region.as_ref().map(|r| r.0.clone()),
+                sovereign,
+                if breach.is_budget() {
+                    "budget_exceeded".to_string()
+                } else {
+                    "rate_limit_exceeded".to_string()
+                },
+            ),
+        );
         return crate::embeddings::limit_rejection_response(&breach);
     }
 
@@ -432,16 +438,20 @@ async fn run_audio_text(
                     )
                 });
 
-                state.observability_engine.record_usage(UsageEvent::success(
-                    virtual_key.name.clone(),
-                    provider_name.clone(),
-                    model_label.clone(),
-                    0,
-                    0,
-                    0,
-                    required_region.as_ref().map(|r| r.0.clone()),
-                    sovereign,
-                ));
+                state.observability_engine.record_usage(
+                    tenant_ctx.resource_tenant_id.as_ref(),
+                    UsageEvent::success(
+                        tenant_ctx.tenant_id.clone(),
+                        virtual_key.name.clone(),
+                        provider_name.clone(),
+                        model_label.clone(),
+                        0,
+                        0,
+                        0,
+                        required_region.as_ref().map(|r| r.0.clone()),
+                        sovereign,
+                    ),
+                );
 
                 let settle_now = now_unix_ms();
                 // Audio has no token-based cost; settle 0 cost gracefully so
@@ -488,14 +498,18 @@ async fn run_audio_text(
                 }
                 last_not_supported = this_not_supported;
                 last_error = e.to_string();
-                state.observability_engine.record_usage(UsageEvent::failure(
-                    virtual_key.name.clone(),
-                    provider_name.clone(),
-                    model_label.clone(),
-                    required_region.as_ref().map(|r| r.0.clone()),
-                    sovereign,
-                    last_error.clone(),
-                ));
+                state.observability_engine.record_usage(
+                    tenant_ctx.resource_tenant_id.as_ref(),
+                    UsageEvent::failure(
+                        tenant_ctx.tenant_id.clone(),
+                        virtual_key.name.clone(),
+                        provider_name.clone(),
+                        model_label.clone(),
+                        required_region.as_ref().map(|r| r.0.clone()),
+                        sovereign,
+                        last_error.clone(),
+                    ),
+                );
                 tracing::warn!(
                     "{} via {} failed: {}. Trying fallback...",
                     op.label(),
@@ -651,13 +665,15 @@ pub async fn speech(
                 region.as_str(),
                 classification.entities
             );
-            state
-                .observability_engine
-                .record_usage(UsageEvent::sovereign_block(
+            state.observability_engine.record_usage(
+                tenant_ctx.resource_tenant_id.as_ref(),
+                UsageEvent::sovereign_block(
+                    tenant_ctx.tenant_id.clone(),
                     virtual_key.name.clone(),
                     model_label.clone(),
                     Some(region.0.clone()),
-                ));
+                ),
+            );
             ledger_sink::record_decision(&state.ledger, &tenant_ctx.capabilities, || {
                 ledger_sink::decision_draft(
                     &tenant_ctx.tenant_id,
@@ -745,18 +761,22 @@ pub async fn speech(
             breach.scope_header(),
             breach.policy_id()
         );
-        state.observability_engine.record_usage(UsageEvent::failure(
-            virtual_key.name.clone(),
-            format!("({})", breach.kind_header()),
-            model_label.clone(),
-            required_region.as_ref().map(|r| r.0.clone()),
-            sovereign,
-            if breach.is_budget() {
-                "budget_exceeded".to_string()
-            } else {
-                "rate_limit_exceeded".to_string()
-            },
-        ));
+        state.observability_engine.record_usage(
+            tenant_ctx.resource_tenant_id.as_ref(),
+            UsageEvent::failure(
+                tenant_ctx.tenant_id.clone(),
+                virtual_key.name.clone(),
+                format!("({})", breach.kind_header()),
+                model_label.clone(),
+                required_region.as_ref().map(|r| r.0.clone()),
+                sovereign,
+                if breach.is_budget() {
+                    "budget_exceeded".to_string()
+                } else {
+                    "rate_limit_exceeded".to_string()
+                },
+            ),
+        );
         return crate::embeddings::limit_rejection_response(&breach);
     }
 
@@ -855,16 +875,20 @@ pub async fn speech(
                     )
                 });
 
-                state.observability_engine.record_usage(UsageEvent::success(
-                    virtual_key.name.clone(),
-                    provider_name.clone(),
-                    model_label.clone(),
-                    0,
-                    0,
-                    0,
-                    required_region.as_ref().map(|r| r.0.clone()),
-                    sovereign,
-                ));
+                state.observability_engine.record_usage(
+                    tenant_ctx.resource_tenant_id.as_ref(),
+                    UsageEvent::success(
+                        tenant_ctx.tenant_id.clone(),
+                        virtual_key.name.clone(),
+                        provider_name.clone(),
+                        model_label.clone(),
+                        0,
+                        0,
+                        0,
+                        required_region.as_ref().map(|r| r.0.clone()),
+                        sovereign,
+                    ),
+                );
 
                 let settle_now = now_unix_ms();
                 // Audio has no token-based cost; settle 0 cost gracefully so
@@ -916,14 +940,18 @@ pub async fn speech(
                 }
                 last_not_supported = this_not_supported;
                 last_error = e.to_string();
-                state.observability_engine.record_usage(UsageEvent::failure(
-                    virtual_key.name.clone(),
-                    provider_name.clone(),
-                    model_label.clone(),
-                    required_region.as_ref().map(|r| r.0.clone()),
-                    sovereign,
-                    last_error.clone(),
-                ));
+                state.observability_engine.record_usage(
+                    tenant_ctx.resource_tenant_id.as_ref(),
+                    UsageEvent::failure(
+                        tenant_ctx.tenant_id.clone(),
+                        virtual_key.name.clone(),
+                        provider_name.clone(),
+                        model_label.clone(),
+                        required_region.as_ref().map(|r| r.0.clone()),
+                        sovereign,
+                        last_error.clone(),
+                    ),
+                );
                 tracing::warn!(
                     "Speech synthesis via {} failed: {}. Trying fallback...",
                     provider_name,

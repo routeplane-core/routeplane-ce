@@ -16,3 +16,15 @@
 [cache.admission]
 ceiling_us = 50
 note = "immutable tenant lookup + entry build + tenant-local lane/wake try_send; admitted and saturated-drop paths"
+
+# --- in-process observability admission -------------------------------------
+# The synchronous producer seam only: complete UsageEvent construction, typed
+# immutable tenant lookup, tenant-owned slot reservation, bounded lane send,
+# and coalesced ready-tenant wake. Retention and reads stay on the fair writer.
+# Both admitted and full-share-drop paths are measured at 1/8/64 tenants.
+# Measurement: `cargo bench -p routeplane --features bench-internals
+# --bench observability_admission`.
+
+[observability.admission]
+ceiling_us = 50
+note = "UsageEvent build + typed lookup + tenant slot + bounded lane/wake try_send; admitted and full-share-drop paths"

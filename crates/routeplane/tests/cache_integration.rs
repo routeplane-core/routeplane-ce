@@ -92,6 +92,7 @@ fn legacy_vk_with_name(name: &str) -> VirtualKey {
 fn ctx(tenant: &str, tier: Tier) -> TenantContext {
     TenantContext {
         tenant_id: tenant.into(),
+        resource_tenant_id: routeplane_types::TenantId::new(tenant).ok(),
         tier,
         capabilities: CapabilitySet::resolve(tier, &BTreeSet::new(), &BTreeSet::new()),
         compliance_frameworks: Vec::new(),

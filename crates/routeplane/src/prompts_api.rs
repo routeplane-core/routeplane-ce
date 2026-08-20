@@ -127,7 +127,9 @@ pub async fn render_prompt(
     // FR-17: a render-only call emits a lightweight prompt.render event (no
     // tokens, no cost, no upstream). A/B testing: annotate the served variant.
     state.observability_engine.record_usage(
+        tenant_ctx.resource_tenant_id.as_ref(),
         UsageEvent::prompt_render(
+            tenant_ctx.tenant_id.clone(),
             virtual_key.name.clone(),
             rendered.model.clone().unwrap_or_default(),
             rendered.prompt_id.clone(),
@@ -235,7 +237,9 @@ pub async fn prompt_completions(
     // prompt_id + integer version + label. Region/sovereign are recorded by the
     // chat pipeline's own event; this is purely the prompt-attribution join row.
     state.observability_engine.record_usage(
+        tenant_ctx.resource_tenant_id.as_ref(),
         UsageEvent::prompt_render(
+            tenant_ctx.tenant_id.clone(),
             virtual_key.name.clone(),
             chat_request.model.clone(),
             rendered.prompt_id.clone(),

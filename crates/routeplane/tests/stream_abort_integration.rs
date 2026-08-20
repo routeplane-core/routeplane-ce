@@ -125,7 +125,8 @@ fn vk() -> VirtualKey {
     serde_json::from_value(json!({
         "name": "test-key",
         "routeplane_key": RP_KEY,
-        "provider_keys": { "openai": "test-api-key" }
+        "provider_keys": { "openai": "test-api-key" },
+        "tenant_id": TENANT
     }))
     .expect("virtual key deserializes")
 }
@@ -133,6 +134,9 @@ fn vk() -> VirtualKey {
 fn ctx() -> TenantContext {
     TenantContext {
         tenant_id: TENANT.into(),
+        resource_tenant_id: Some(
+            routeplane_types::TenantId::new(TENANT).expect("canonical test tenant"),
+        ),
         tier: Tier::Free,
         capabilities: CapabilitySet::resolve(Tier::Free, &BTreeSet::new(), &BTreeSet::new()),
         compliance_frameworks: Vec::new(),

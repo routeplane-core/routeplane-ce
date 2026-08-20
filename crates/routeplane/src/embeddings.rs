@@ -140,13 +140,15 @@ pub async fn embeddings(
                 region.as_str(),
                 classification.entities
             );
-            state
-                .observability_engine
-                .record_usage(UsageEvent::sovereign_block(
+            state.observability_engine.record_usage(
+                tenant_ctx.resource_tenant_id.as_ref(),
+                UsageEvent::sovereign_block(
+                    tenant_ctx.tenant_id.clone(),
                     virtual_key.name.clone(),
                     payload.model.clone(),
                     Some(region.0.clone()),
-                ));
+                ),
+            );
             // F5: mirror chat's sovereign-block ledger record (Outcome::ResidencyBlocked).
             ledger_sink::record_decision(&state.ledger, &tenant_ctx.capabilities, || {
                 ledger_sink::decision_draft(
@@ -228,18 +230,22 @@ pub async fn embeddings(
             breach.scope_header(),
             breach.policy_id()
         );
-        state.observability_engine.record_usage(UsageEvent::failure(
-            virtual_key.name.clone(),
-            format!("({})", breach.kind_header()),
-            payload.model.clone(),
-            required_region.as_ref().map(|r| r.0.clone()),
-            sovereign,
-            if breach.is_budget() {
-                "budget_exceeded".to_string()
-            } else {
-                "rate_limit_exceeded".to_string()
-            },
-        ));
+        state.observability_engine.record_usage(
+            tenant_ctx.resource_tenant_id.as_ref(),
+            UsageEvent::failure(
+                tenant_ctx.tenant_id.clone(),
+                virtual_key.name.clone(),
+                format!("({})", breach.kind_header()),
+                payload.model.clone(),
+                required_region.as_ref().map(|r| r.0.clone()),
+                sovereign,
+                if breach.is_budget() {
+                    "budget_exceeded".to_string()
+                } else {
+                    "rate_limit_exceeded".to_string()
+                },
+            ),
+        );
         return limit_rejection_response(&breach);
     }
 
@@ -343,16 +349,20 @@ pub async fn embeddings(
                 });
 
                 // FR-7 observability: completion_tokens = 0 for embeddings.
-                state.observability_engine.record_usage(UsageEvent::success(
-                    virtual_key.name.clone(),
-                    provider_name.clone(),
-                    response.model.clone(),
-                    response.usage.prompt_tokens,
-                    0,
-                    response.usage.total_tokens,
-                    required_region.as_ref().map(|r| r.0.clone()),
-                    sovereign,
-                ));
+                state.observability_engine.record_usage(
+                    tenant_ctx.resource_tenant_id.as_ref(),
+                    UsageEvent::success(
+                        tenant_ctx.tenant_id.clone(),
+                        virtual_key.name.clone(),
+                        provider_name.clone(),
+                        response.model.clone(),
+                        response.usage.prompt_tokens,
+                        0,
+                        response.usage.total_tokens,
+                        required_region.as_ref().map(|r| r.0.clone()),
+                        sovereign,
+                    ),
+                );
 
                 let settle_now = now_unix_ms();
                 let cost =
@@ -403,14 +413,18 @@ pub async fn embeddings(
                 }
                 last_not_supported = this_not_supported;
                 last_error = e.to_string();
-                state.observability_engine.record_usage(UsageEvent::failure(
-                    virtual_key.name.clone(),
-                    provider_name.clone(),
-                    payload.model.clone(),
-                    required_region.as_ref().map(|r| r.0.clone()),
-                    sovereign,
-                    last_error.clone(),
-                ));
+                state.observability_engine.record_usage(
+                    tenant_ctx.resource_tenant_id.as_ref(),
+                    UsageEvent::failure(
+                        tenant_ctx.tenant_id.clone(),
+                        virtual_key.name.clone(),
+                        provider_name.clone(),
+                        payload.model.clone(),
+                        required_region.as_ref().map(|r| r.0.clone()),
+                        sovereign,
+                        last_error.clone(),
+                    ),
+                );
                 tracing::warn!(
                     "Embeddings via {} failed: {}. Trying fallback...",
                     provider_name,

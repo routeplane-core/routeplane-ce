@@ -77,7 +77,8 @@ fn vk() -> VirtualKey {
     serde_json::from_value(json!({
         "name": "test-key",
         "routeplane_key": "rp_test",
-        "provider_keys": { "openai": "test-api-key" }
+        "provider_keys": { "openai": "test-api-key" },
+        "tenant_id": "t_test"
     }))
     .expect("virtual key deserializes")
 }
@@ -85,6 +86,9 @@ fn vk() -> VirtualKey {
 fn ctx(tier: Tier, tenant: &str) -> TenantContext {
     TenantContext {
         tenant_id: tenant.into(),
+        resource_tenant_id: Some(
+            routeplane_types::TenantId::new(tenant).expect("canonical test tenant"),
+        ),
         tier,
         capabilities: CapabilitySet::resolve(tier, &BTreeSet::new(), &BTreeSet::new()),
         compliance_frameworks: Vec::new(),
@@ -96,6 +100,9 @@ fn ctx_held(tier: Tier, tenant: &str) -> TenantContext {
     let holdbacks = BTreeSet::from([Feature::PromptRegistry]);
     TenantContext {
         tenant_id: tenant.into(),
+        resource_tenant_id: Some(
+            routeplane_types::TenantId::new(tenant).expect("canonical test tenant"),
+        ),
         tier,
         capabilities: CapabilitySet::resolve(tier, &BTreeSet::new(), &holdbacks),
         compliance_frameworks: Vec::new(),

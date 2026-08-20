@@ -3,10 +3,9 @@
 //! One route that returns the authenticated tenant's most-recent request events
 //! from the in-memory observability ring (the last ~1000 `UsageEvent`s). It is the
 //! read-only twin of `finops_api` and follows the SAME tenant-isolation model
-//! exactly: the scope is the set of virtual-key NAMES the requesting tenant owns,
-//! resolved SERVER-SIDE from the `SharedAuthState` snapshot (key ownership). No
-//! client-supplied identifier ever selects the scope (the ADR-023 bypass rule), so
-//! a tenant can only ever see logs for its own keys.
+//! exactly: the scope is the typed tenant authority resolved at authentication.
+//! No client-supplied identifier or collidable display-key name selects the scope
+//! (the ADR-023 bypass rule), so a tenant can only ever see its own records.
 //!
 //! Entitlement choice (documented deliberately): UNLIKE `finops_api` (gated on
 //! `Feature::FinOpsExport`, Business+), `/v1/logs` is gated on **auth + key
@@ -28,7 +27,6 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde_json::json;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// Max rows returned in one `GET /v1/logs` read. Bounded so the response (and the
@@ -38,27 +36,16 @@ const LOGS_LIMIT: usize = 200;
 
 /// `GET /v1/logs` — the tenant's recent request-log rows (newest-first).
 ///
-/// Read-only, tenant-isolated by key ownership, no entitlement gate beyond auth.
+/// Read-only, tenant-isolated by typed auth authority, no extra entitlement gate.
 /// Returns `{ "events": [ LogRow, ... ] }` over the existing observability ring.
 pub async fn list_logs(
     State(state): State<Arc<AppState>>,
-    Extension(auth_state): Extension<SharedAuthState>,
+    Extension(_auth_state): Extension<SharedAuthState>,
     Extension(tenant_ctx): Extension<TenantContext>,
 ) -> Response {
-    // Resolve the virtual-key NAMES this tenant owns from the current registry
-    // snapshot — identical to finops_api. Tenant isolation is structural (by key
-    // ownership), never by a client-supplied id.
-    let snapshot = auth_state.load();
-    let key_names: BTreeSet<String> = snapshot
-        .keys
-        .values()
-        .filter(|vk| vk.resolved_tenant_id() == tenant_ctx.tenant_id)
-        .map(|vk| vk.name.clone())
-        .collect();
-
     let events = state
         .observability_engine
-        .recent_events(&key_names, LOGS_LIMIT);
+        .recent_events(tenant_ctx.resource_tenant_id.as_ref(), LOGS_LIMIT);
 
     (StatusCode::OK, Json(json!({ "events": events }))).into_response()
 }
