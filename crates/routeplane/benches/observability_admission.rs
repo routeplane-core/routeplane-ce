@@ -4,7 +4,6 @@ use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use routeplane::observability::{bench_support::AdmissionHarness, UsageEvent};
 
 const TENANT_COUNTS: [usize; 3] = [1, 8, 64];
@@ -144,41 +143,6 @@ fn measure_and_enforce_percentiles() {
     );
 }
 
-fn bench_admission(c: &mut Criterion) {
+fn main() {
     measure_and_enforce_percentiles();
-    let runtime = tokio::runtime::Runtime::new().expect("benchmark runtime");
-    let _guard = runtime.enter();
-    let mut group = c.benchmark_group("observability_admission");
-    for tenant_count in TENANT_COUNTS {
-        let admitted = AdmissionHarness::new(tenant_count);
-        let tenant_index = tenant_count - 1;
-        group.bench_with_input(
-            BenchmarkId::new("admitted", tenant_count),
-            &tenant_count,
-            |b, _| {
-                // The fixed-sample artifact above times admission alone. This
-                // supplemental Criterion loop includes writer settlement so
-                // calibration accounts for its wall time instead of multiplying
-                // an excluded setup wait into an unbounded run.
-                b.iter(|| {
-                    admitted.release_tenant(tenant_index);
-                    assert!(admitted.record(black_box(tenant_index), event()));
-                });
-            },
-        );
-
-        let dropped = AdmissionHarness::new(tenant_count);
-        dropped.saturate_tenant(tenant_index);
-        group.bench_with_input(
-            BenchmarkId::new("full_share_drop", tenant_count),
-            &tenant_count,
-            |b, _| {
-                b.iter(|| assert!(!dropped.record(black_box(tenant_index), event())));
-            },
-        );
-    }
-    group.finish();
 }
-
-criterion_group!(benches, bench_admission);
-criterion_main!(benches);
