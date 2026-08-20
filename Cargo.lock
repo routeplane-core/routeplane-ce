@@ -1855,7 +1855,7 @@ dependencies = [
 
 [[package]]
 name = "routeplane"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "argon2",
@@ -1902,7 +1902,7 @@ dependencies = [
 
 [[package]]
 name = "routeplane-adapters"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1919,7 +1919,7 @@ dependencies = [
 
 [[package]]
 name = "routeplane-cache"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -1932,7 +1932,7 @@ dependencies = [
 
 [[package]]
 name = "routeplane-entitlements"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1940,7 +1940,7 @@ dependencies = [
 
 [[package]]
 name = "routeplane-flags"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "enum-map",
@@ -1955,7 +1955,7 @@ dependencies = [
 
 [[package]]
 name = "routeplane-guardrails"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "regex",
  "routeplane-unicode",
@@ -1965,7 +1965,7 @@ dependencies = [
 
 [[package]]
 name = "routeplane-ledger-vocab"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "proptest",
  "serde",
@@ -1974,7 +1974,7 @@ dependencies = [
 
 [[package]]
 name = "routeplane-limits"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "routeplane-policy"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "routeplane-types",
@@ -1997,7 +1997,7 @@ dependencies = [
 
 [[package]]
 name = "routeplane-prompts"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "serde",
@@ -2006,7 +2006,7 @@ dependencies = [
 
 [[package]]
 name = "routeplane-residency"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "lazy_static",
  "regex",
@@ -2016,14 +2016,14 @@ dependencies = [
 
 [[package]]
 name = "routeplane-router"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
 ]
 
 [[package]]
 name = "routeplane-rtk"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "criterion",
  "serde_json",
@@ -2031,7 +2031,7 @@ dependencies = [
 
 [[package]]
 name = "routeplane-types"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "proptest",
  "serde",
@@ -2040,7 +2040,7 @@ dependencies = [
 
 [[package]]
 name = "routeplane-unicode"
-version = "0.3.5"
+version = "0.4.0"
 
 [[package]]
 name = "rustc-hash"
