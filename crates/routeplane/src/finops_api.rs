@@ -16,13 +16,11 @@
 //!     durable history — the response `note` says both.
 //!
 //! This is a NEW module (the chat orchestrator in `proxy.rs` is UNTOUCHED), wired
-//! exactly like `prompts_api`: it extracts the resolved `TenantContext` and the
-//! `SharedAuthState` registry as Axum `Extension`s. Tenant isolation is by KEY
-//! OWNERSHIP — the report only aggregates events whose `virtual_key_name` belongs
-//! to a key the requesting tenant owns in the current registry snapshot, resolved
-//! server-side. No client-supplied identifier selects the scope (the ADR-023
-//! bypass rule: scope is keyed off the authenticated context only). The endpoint
-//! is read-only and emits no usage event of its own.
+//! exactly like `prompts_api`: it extracts the resolved `TenantContext` as an
+//! Axum `Extension`. Tenant isolation is structural: reports read only the fixed
+//! ring owned by the typed authority resolved at auth. Neither client input nor a
+//! collidable display-key name selects the scope (ADR-023). The endpoint is
+//! read-only and emits no usage event of its own.
 
 use crate::auth::{SharedAuthState, TenantContext};
 use crate::proxy::AppState;
@@ -33,7 +31,6 @@ use axum::{Extension, Json};
 use routeplane_entitlements::{tier_baseline, Feature};
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// Default recent window for `GET /v1/finops/timeseries` (minutes) when the caller
@@ -60,26 +57,18 @@ pub struct TimeseriesQuery {
 /// `GET /v1/finops/usage` — the tenant's chargeback/showback rollup (FR-24).
 pub async fn usage_export(
     State(state): State<Arc<AppState>>,
-    Extension(auth_state): Extension<SharedAuthState>,
+    Extension(_auth_state): Extension<SharedAuthState>,
     Extension(tenant_ctx): Extension<TenantContext>,
 ) -> Response {
     if let Some(resp) = entitlement_gate(&tenant_ctx, "/v1/finops/usage") {
         return resp;
     }
 
-    // Resolve the virtual-key NAMES this tenant owns from the current registry
-    // snapshot. Tenant isolation is structural (by key ownership), never by a
-    // client-supplied id — a tenant can only ever see spend attributed to its own
-    // keys' names in the recent-event window.
-    let snapshot = auth_state.load();
-    let key_names: BTreeSet<String> = snapshot
-        .keys
-        .values()
-        .filter(|vk| vk.resolved_tenant_id() == tenant_ctx.tenant_id)
-        .map(|vk| vk.name.clone())
-        .collect();
-
-    let report = state.observability_engine.chargeback(&key_names);
+    // Tenant isolation is structural: the typed auth authority selects exactly
+    // one tenant-owned recent-event ring.
+    let report = state
+        .observability_engine
+        .chargeback(tenant_ctx.resource_tenant_id.as_ref());
 
     // Attach the tenant id to the report envelope so an exported artifact is
     // self-describing. `to_value` on a plain Serialize report cannot fail.
@@ -95,7 +84,7 @@ pub async fn usage_export(
 ///
 /// Identical scoping + gating to `usage_export`: gated on `Feature::FinOpsExport`
 /// (held-back → 403 `feature_not_released`, not-entitled → 403 `feature_not_entitled`),
-/// tenant-isolated by KEY OWNERSHIP resolved server-side (never a client-supplied id).
+/// tenant-isolated by typed auth authority (never a client-supplied id).
 /// Read-only over the existing ring; emits no usage event.
 ///
 /// HONESTY: the ring holds only the last ~1000 events, so the series is the recent
@@ -103,7 +92,7 @@ pub async fn usage_export(
 /// An empty ring yields all-zero buckets (200), never fabricated traffic.
 pub async fn usage_timeseries(
     State(state): State<Arc<AppState>>,
-    Extension(auth_state): Extension<SharedAuthState>,
+    Extension(_auth_state): Extension<SharedAuthState>,
     Extension(tenant_ctx): Extension<TenantContext>,
     Query(params): Query<TimeseriesQuery>,
 ) -> Response {
@@ -122,17 +111,9 @@ pub async fn usage_timeseries(
         .clamp(1, MAX_BUCKETS);
 
     // Same key-ownership scoping as `usage_export`: tenant isolation is structural
-    // (by key ownership), never a client-supplied id.
-    let snapshot = auth_state.load();
-    let key_names: BTreeSet<String> = snapshot
-        .keys
-        .values()
-        .filter(|vk| vk.resolved_tenant_id() == tenant_ctx.tenant_id)
-        .map(|vk| vk.name.clone())
-        .collect();
-
+    // by typed auth authority, never a client-supplied id.
     let series = state.observability_engine.usage_timeseries(
-        &key_names,
+        tenant_ctx.resource_tenant_id.as_ref(),
         chrono::Duration::minutes(window_mins),
         bucket_count,
     );
@@ -170,7 +151,7 @@ pub struct CacheSavingsQuery {
 ///
 /// Identical scoping + gating to `usage_timeseries`: gated on `Feature::FinOpsExport`
 /// (held-back → 403 `feature_not_released`, not-entitled → 403 `feature_not_entitled`),
-/// tenant-isolated by KEY OWNERSHIP resolved server-side (never a client-supplied id).
+/// tenant-isolated by typed auth authority (never a client-supplied id).
 /// Read-only over the existing ring; emits no usage event.
 ///
 /// HONESTY: `saved_cost_micro_usd` sums the ring's per-hit
@@ -180,7 +161,7 @@ pub struct CacheSavingsQuery {
 /// says so. No cache hits in the window → honest zeroes (200), never fabricated.
 pub async fn cache_savings(
     State(state): State<Arc<AppState>>,
-    Extension(auth_state): Extension<SharedAuthState>,
+    Extension(_auth_state): Extension<SharedAuthState>,
     Extension(tenant_ctx): Extension<TenantContext>,
     Query(params): Query<CacheSavingsQuery>,
 ) -> Response {
@@ -195,18 +176,11 @@ pub async fn cache_savings(
         .clamp(1, MAX_WINDOW_MINS);
 
     // Same key-ownership scoping as `usage_timeseries`: tenant isolation is
-    // structural (by key ownership), never a client-supplied id.
-    let snapshot = auth_state.load();
-    let key_names: BTreeSet<String> = snapshot
-        .keys
-        .values()
-        .filter(|vk| vk.resolved_tenant_id() == tenant_ctx.tenant_id)
-        .map(|vk| vk.name.clone())
-        .collect();
-
-    let report = state
-        .observability_engine
-        .cache_savings(&key_names, chrono::Duration::minutes(window_mins));
+    // structural (typed auth authority), never a client-supplied id.
+    let report = state.observability_engine.cache_savings(
+        tenant_ctx.resource_tenant_id.as_ref(),
+        chrono::Duration::minutes(window_mins),
+    );
 
     // Shape the response with the Console's expected field names. The honest `note`
     // states this is the recent in-memory window AND that the cost is an estimate.
@@ -285,10 +259,12 @@ fn openai_error(status: StatusCode, code: &str, message: &str) -> Response {
 mod tests {
     use super::*;
     use routeplane_entitlements::{CapabilitySet, Tier};
+    use std::collections::BTreeSet;
 
     fn ctx(tier: Tier) -> TenantContext {
         TenantContext {
             tenant_id: "t_test".into(),
+            resource_tenant_id: None,
             tier,
             capabilities: CapabilitySet::resolve(tier, &BTreeSet::new(), &BTreeSet::new()),
             compliance_frameworks: Vec::new(),

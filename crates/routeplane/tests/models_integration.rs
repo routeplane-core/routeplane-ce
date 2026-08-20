@@ -64,6 +64,7 @@ fn auth() -> SharedAuthState {
 fn ctx() -> axum::Extension<routeplane::auth::TenantContext> {
     axum::Extension(routeplane::auth::TenantContext {
         tenant_id: "t_acme".into(),
+        resource_tenant_id: None,
         tier: routeplane_entitlements::Tier::Free,
         capabilities: routeplane_entitlements::CapabilitySet::resolve(
             routeplane_entitlements::Tier::Free,

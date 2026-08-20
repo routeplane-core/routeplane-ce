@@ -51,6 +51,7 @@ fn vk(tenant: &str) -> VirtualKey {
 fn ctx(tenant: &str) -> TenantContext {
     TenantContext {
         tenant_id: tenant.into(),
+        resource_tenant_id: None,
         tier: Tier::Standard,
         capabilities: CapabilitySet::resolve(Tier::Standard, &BTreeSet::new(), &BTreeSet::new()),
         compliance_frameworks: Vec::new(),

@@ -116,7 +116,8 @@ fn vk() -> VirtualKey {
     serde_json::from_value(json!({
         "name": "test-key",
         "routeplane_key": RP_KEY,
-        "provider_keys": { "openai": "test-api-key" }
+        "provider_keys": { "openai": "test-api-key" },
+        "tenant_id": TENANT
     }))
     .expect("virtual key deserializes")
 }
@@ -124,6 +125,9 @@ fn vk() -> VirtualKey {
 fn ctx() -> TenantContext {
     TenantContext {
         tenant_id: TENANT.into(),
+        resource_tenant_id: Some(
+            routeplane_types::TenantId::new(TENANT).expect("canonical test tenant"),
+        ),
         tier: Tier::Free,
         capabilities: CapabilitySet::resolve(Tier::Free, &BTreeSet::new(), &BTreeSet::new()),
         compliance_frameworks: Vec::new(),
@@ -216,14 +220,7 @@ async fn midstream_error_yields_error_frame_not_done() {
 
     let e = wait_for_event(&state, |e| !e.success).await;
     assert_eq!(e.total_tokens, 12, "observed spend is kept, not zeroed");
-    assert!(
-        e.error
-            .as_deref()
-            .unwrap_or("")
-            .contains("stream truncated"),
-        "event error names the truncation: {:?}",
-        e.error
-    );
+    assert_eq!(e.error.as_deref(), Some("stream_error"));
 }
 
 /// Hung upstream → the ROUTEPLANE_STREAM_IDLE_TIMEOUT_MS bound fires (200ms
@@ -242,11 +239,7 @@ async fn idle_upstream_is_bounded_and_truncates() {
     );
     assert!(body.contains("routeplane_stream_truncated"));
     let e = wait_for_event(&state, |e| !e.success).await;
-    assert!(e
-        .error
-        .as_deref()
-        .unwrap_or("")
-        .contains("stream truncated"));
+    assert_eq!(e.error.as_deref(), Some("stream_error"));
 }
 
 /// Happy path unchanged: clean provider end → [DONE], no error frame, success

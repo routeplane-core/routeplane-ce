@@ -67,7 +67,7 @@ pub async fn feedback(
     Extension(virtual_key): Extension<VirtualKey>,
     // Tenant context is injected by `auth_middleware`; its presence is the
     // auth gate (a missing key never reaches here — middleware returns 401).
-    Extension(_tenant_ctx): Extension<TenantContext>,
+    Extension(tenant_ctx): Extension<TenantContext>,
     crate::api_error::OpenAiJson(payload): crate::api_error::OpenAiJson<FeedbackRequest>,
 ) -> Response {
     // 1. Validate `trace_id`: non-empty + length-bounded.
@@ -110,17 +110,19 @@ pub async fn feedback(
     // 5. Record OFF the hot path: a single lock-free `try_send` into the
     //    in-memory observability ring as a synthetic `(feedback)` event. This is
     //    NOT a provider call and touches no ledger / no-raw-PII surface. The
-    //    tenant is identified by key ownership (virtual_key.name), the same
-    //    tenant-isolation basis the analytics/chargeback surfaces already use.
-    state
-        .observability_engine
-        .record_usage(UsageEvent::feedback(
+    //    tenant is identified only by the typed authority resolved at auth;
+    //    the display key name is attribution data, never an isolation key.
+    state.observability_engine.record_usage(
+        tenant_ctx.resource_tenant_id.as_ref(),
+        UsageEvent::feedback(
+            tenant_ctx.tenant_id.clone(),
             virtual_key.name.clone(),
             trace_id.to_string(),
             payload.value,
             weight,
             metadata_keys,
-        ));
+        ),
+    );
 
     (
         StatusCode::OK,

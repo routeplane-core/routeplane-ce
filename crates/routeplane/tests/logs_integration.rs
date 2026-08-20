@@ -43,6 +43,7 @@ fn auth() -> SharedAuthState {
 fn ctx(tier: Tier, tenant: &str) -> TenantContext {
     TenantContext {
         tenant_id: tenant.into(),
+        resource_tenant_id: routeplane_types::TenantId::new(tenant).ok(),
         tier,
         capabilities: CapabilitySet::resolve(tier, &BTreeSet::new(), &BTreeSet::new()),
         compliance_frameworks: Vec::new(),
@@ -62,7 +63,10 @@ async fn body_json(resp: Response) -> serde_json::Value {
 /// use, so the assertion never races the background writer.
 async fn record_and_settle(state: &AppState, event: UsageEvent) {
     let before = state.observability_engine.get_recent_events().len();
-    state.observability_engine.record_usage(event);
+    let resource_tenant_id = routeplane_types::TenantId::new(&event.tenant_id).ok();
+    state
+        .observability_engine
+        .record_usage(resource_tenant_id.as_ref(), event);
     let deadline = Instant::now() + Duration::from_secs(2);
     while state.observability_engine.get_recent_events().len() <= before {
         if Instant::now() > deadline {
@@ -95,6 +99,7 @@ async fn logs_are_tenant_isolated_and_exclude_other_tenants() {
     record_and_settle(
         &state,
         UsageEvent::success(
+            "t_acme".into(),
             "k_acme_a".into(),
             "openai".into(),
             "gpt-4o".into(),
@@ -111,6 +116,7 @@ async fn logs_are_tenant_isolated_and_exclude_other_tenants() {
     record_and_settle(
         &state,
         UsageEvent::success(
+            "t_other".into(),
             "k_other".into(),
             "openai".into(),
             "gpt-4o".into(),

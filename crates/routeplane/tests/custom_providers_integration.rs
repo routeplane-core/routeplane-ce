@@ -32,11 +32,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const CUSTOM_KEY: &str = "sk-custom-test-9999";
 
-fn vk() -> VirtualKey {
+fn vk(tenant: &str) -> VirtualKey {
     serde_json::from_value(json!({
         "name": "test-key",
         "routeplane_key": "rp_test",
-        "provider_keys": { "openai": "test-api-key" }
+        "provider_keys": { "openai": "test-api-key" },
+        "tenant_id": tenant
     }))
     .expect("virtual key deserializes")
 }
@@ -49,6 +50,9 @@ fn ctx() -> TenantContext {
 fn ctx_for(tenant: &str) -> TenantContext {
     TenantContext {
         tenant_id: tenant.into(),
+        resource_tenant_id: Some(
+            routeplane_types::TenantId::new(tenant).expect("canonical test tenant"),
+        ),
         tier: Tier::Standard,
         capabilities: CapabilitySet::resolve(
             Tier::Standard,
@@ -106,7 +110,7 @@ async fn drive_chat_as(
 ) -> Response {
     chat_completions(
         State(state.clone()),
-        axum::Extension(vk()),
+        axum::Extension(vk(tenant)),
         axum::Extension(ctx_for(tenant)),
         axum::Extension(TenantGuardrails(None)),
         headers,

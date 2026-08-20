@@ -63,6 +63,7 @@ fn ctx(token_compression: bool) -> TenantContext {
     };
     TenantContext {
         tenant_id: "t_test".into(),
+        resource_tenant_id: None,
         tier: Tier::Standard,
         capabilities: CapabilitySet::resolve(Tier::Standard, &overrides, &BTreeSet::new()),
         compliance_frameworks: Vec::new(),
@@ -83,6 +84,7 @@ fn free_ctx(held_back: bool) -> TenantContext {
     };
     TenantContext {
         tenant_id: "t_free".into(),
+        resource_tenant_id: None,
         tier: Tier::Free,
         capabilities: CapabilitySet::resolve(Tier::Free, &BTreeSet::new(), &holdbacks),
         compliance_frameworks: Vec::new(),

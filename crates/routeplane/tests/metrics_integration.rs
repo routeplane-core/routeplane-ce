@@ -30,7 +30,7 @@ fn app() -> Router {
                 )],
                 // Real handler threads in the binary-level SHED_TOTAL; the lib
                 // test passes 0 (the render logic is the same either way).
-                routeplane::metrics::metrics().render(0),
+                routeplane::metrics::metrics().render(0, None),
             )
         }),
     )

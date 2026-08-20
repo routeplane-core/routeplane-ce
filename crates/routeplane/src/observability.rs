@@ -1,9 +1,13 @@
 use chrono::{DateTime, Utc};
 use routeplane_guardrails::CheckOutcome;
+use routeplane_types::TenantId;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
-use std::sync::Mutex;
-use tokio::sync::mpsc;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
+use tokio::time::Duration;
 
 /// A single recorded request outcome. Now records FAILURES and sovereign-blocks
 /// in addition to successes (Task #5), so `/analytics` reflects real traffic
@@ -19,6 +23,11 @@ use tokio::sync::mpsc;
 pub struct UsageEvent {
     pub timestamp: DateTime<Utc>,
     pub virtual_key_name: String,
+    /// Internal resource authority stamped by [`ObservabilityEngine::record_usage`]
+    /// from the validated tenant identity resolved at authentication. This is
+    /// never accepted from the request and never serialized on the analytics wire.
+    #[serde(skip)]
+    pub tenant_id: String,
     pub provider: String,
     pub model: String,
     pub prompt_tokens: u32,
@@ -163,6 +172,20 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// Closed vocabulary for request-event errors. Provider-controlled bodies and
+/// parser fragments are discarded before an event reaches any retained or
+/// durable observability sink.
+fn safe_usage_error(raw: &str) -> &'static str {
+    match raw {
+        "rate_limit_exceeded" => "rate_limit_exceeded",
+        "budget_exceeded" => "budget_exceeded",
+        "sovereign_block" => "sovereign_block",
+        "guardrails_denied" => "guardrails_denied",
+        "stream_error" => "stream_error",
+        _ => "upstream_error",
+    }
+}
+
 impl UsageEvent {
     /// Mark this event as a hedged win (ADR-057). No-op-by-default builder so the
     /// non-hedged path stays byte-identical.
@@ -188,9 +211,9 @@ impl UsageEvent {
     /// path) is a no-op — byte-identical event.
     #[must_use]
     pub fn with_stream_error(mut self, error: Option<String>) -> Self {
-        if let Some(e) = error {
+        if error.is_some() {
             self.success = false;
-            self.error = Some(format!("stream truncated: {e}"));
+            self.error = Some("stream_error".to_string());
         }
         self
     }
@@ -198,6 +221,7 @@ impl UsageEvent {
     /// A successful provider call.
     #[allow(clippy::too_many_arguments)]
     pub fn success(
+        tenant_id: String,
         virtual_key_name: String,
         provider: String,
         model: String,
@@ -210,6 +234,7 @@ impl UsageEvent {
         Self {
             timestamp: Utc::now(),
             virtual_key_name,
+            tenant_id,
             provider,
             model,
             prompt_tokens,
@@ -245,6 +270,7 @@ impl UsageEvent {
 
     /// A failed provider attempt (error or timeout). Token counts unknown → 0.
     pub fn failure(
+        tenant_id: String,
         virtual_key_name: String,
         provider: String,
         model: String,
@@ -255,6 +281,7 @@ impl UsageEvent {
         Self {
             timestamp: Utc::now(),
             virtual_key_name,
+            tenant_id,
             provider,
             model,
             prompt_tokens: 0,
@@ -265,7 +292,7 @@ impl UsageEvent {
             region,
             sovereign_routed,
             success: false,
-            error: Some(error),
+            error: Some(safe_usage_error(&error).to_string()),
             guardrails: None,
             cache_hit: None,
             cache_status: None,
@@ -291,6 +318,7 @@ impl UsageEvent {
     /// A request refused for data-residency reasons (HTTP 422). No provider was
     /// called; `provider` is the sentinel "(sovereign_block)".
     pub fn sovereign_block(
+        tenant_id: String,
         virtual_key_name: String,
         model: String,
         region: Option<String>,
@@ -298,6 +326,7 @@ impl UsageEvent {
         Self {
             timestamp: Utc::now(),
             virtual_key_name,
+            tenant_id,
             provider: "(sovereign_block)".to_string(),
             model,
             prompt_tokens: 0,
@@ -338,6 +367,7 @@ impl UsageEvent {
     /// this — enterprise-only.
     #[cfg(feature = "enterprise")]
     pub fn guardrails_block(
+        tenant_id: String,
         virtual_key_name: String,
         model: String,
         region: Option<String>,
@@ -347,6 +377,7 @@ impl UsageEvent {
         Self {
             timestamp: Utc::now(),
             virtual_key_name,
+            tenant_id,
             provider: "(guardrails_denied)".to_string(),
             model,
             prompt_tokens: 0,
@@ -387,6 +418,7 @@ impl UsageEvent {
     #[cfg(feature = "enterprise")]
     #[allow(clippy::too_many_arguments)]
     pub fn guardrails_output_denied(
+        tenant_id: String,
         virtual_key_name: String,
         provider: String,
         model: String,
@@ -400,6 +432,7 @@ impl UsageEvent {
         Self {
             timestamp: Utc::now(),
             virtual_key_name,
+            tenant_id,
             provider,
             model,
             prompt_tokens,
@@ -439,7 +472,9 @@ impl UsageEvent {
     /// so a downstream analytics consumer can attribute traffic to a prompt
     /// version even though the chat pipeline's own usage/cost event (recorded
     /// separately by `proxy.rs`, unchanged) carries no prompt fields.
+    #[allow(clippy::too_many_arguments)]
     pub fn prompt_render(
+        tenant_id: String,
         virtual_key_name: String,
         model: String,
         prompt_id: String,
@@ -451,6 +486,7 @@ impl UsageEvent {
         Self {
             timestamp: Utc::now(),
             virtual_key_name,
+            tenant_id,
             provider: "(prompt_render)".to_string(),
             model,
             prompt_tokens: 0,
@@ -495,6 +531,7 @@ impl UsageEvent {
     /// inputs are validated + bounded at the route edge; raw caller metadata is
     /// never persisted here.
     pub fn feedback(
+        tenant_id: String,
         virtual_key_name: String,
         trace_id: String,
         value: i8,
@@ -504,6 +541,7 @@ impl UsageEvent {
         Self {
             timestamp: Utc::now(),
             virtual_key_name,
+            tenant_id,
             provider: "(feedback)".to_string(),
             model: String::new(),
             prompt_tokens: 0,
@@ -648,29 +686,15 @@ const INGEST_CHANNEL_CAPACITY: usize = 4096;
 /// DB during Alpha; a DB migration is ADR-gated).
 const MAX_RETAINED_EVENTS: usize = 1000;
 
-/// Max retained MCP enforcement events in the in-memory ring (last 200). Same
-/// frugal, in-memory, free-tier observability posture as the usage ring — NOT the
-/// durable telemetry store (ADR-024), which remains gated.
-const MAX_MCP_SECURITY_EVENTS: usize = 200;
-
-/// One MCP-leg enforcement event (a tool-call authorization / egress / quota /
-/// result-size / anomaly denial), retained in a bounded in-memory ring so the
-/// Console can show a LIVE feed of the agentic-security moat's denials. Label-only
-/// and secret-free by construction: `category`/`outcome` are closed-vocab and
-/// `detail` is a closed-vocab code (never matched content). `tenant_id` scopes the
-/// read so a tenant only ever sees its own events.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct McpSecurityEvent {
-    /// RFC3339 timestamp.
-    pub ts: String,
-    /// Closed-vocab category label (e.g. `mcp_authorize_deny`, `mcp_egress_deny`).
-    pub category: String,
-    /// Closed-vocab outcome code (e.g. `deny`).
-    pub outcome: String,
-    /// Closed-vocab detail code (e.g. `authorize`, `anomaly_quarantine`) — never content.
-    pub detail: Option<String>,
-    /// The tenant the event belongs to (used to scope the read).
-    pub tenant_id: String,
+fn partition(total: usize, tenants: usize) -> Vec<usize> {
+    if tenants == 0 {
+        return Vec::new();
+    }
+    let quotient = total / tenants;
+    let remainder = total % tenants;
+    (0..tenants)
+        .map(|index| quotient + usize::from(index < remainder))
+        .collect()
 }
 
 /// In-memory observability sink.
@@ -682,107 +706,644 @@ pub struct McpSecurityEvent {
 /// drains the channel, emits the `tracing::info!` USAGE line, and pushes into
 /// the ring. The mutex is therefore only ever contended between that single
 /// writer task and the (rare) `/analytics` reader — never on the request path.
-pub struct ObservabilityEngine {
-    tx: mpsc::Sender<UsageEvent>,
-    // The retained ring, owned by the background drain task and read by
-    // `/analytics`. The Mutex critical section is a single push/pop or a clone
-    // for the reader — it is never held across an `.await`.
-    recent_events: std::sync::Arc<Mutex<VecDeque<UsageEvent>>>,
-    // Bounded ring of MCP enforcement denials (off the chat hot path; the MCP leg
-    // is low-volume). A short push/clone critical section, never held across await.
-    // CE (PRD-047): the only writers/readers live behind the `enterprise` gate
-    // (record_mcp_security_outcome / mcp_api), so the ring sits idle there.
-    #[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
-    mcp_security: std::sync::Arc<Mutex<VecDeque<McpSecurityEvent>>>,
+#[derive(Debug)]
+struct QueuedUsage {
+    event: UsageEvent,
+    /// Holds the tenant-owned slot until the event has actually entered the
+    /// retained ring. Dropping an abandoned receiver releases it automatically.
+    _reservation: OwnedSemaphorePermit,
+    settlement: UsageSettlement,
 }
 
-impl Default for ObservabilityEngine {
-    fn default() -> Self {
-        Self::new()
+#[derive(Debug)]
+struct UsageSettlement {
+    counters: Arc<ObservabilityCounters>,
+    retained: bool,
+}
+
+impl UsageSettlement {
+    fn retained(&mut self) {
+        self.retained = true;
     }
+}
+
+impl Drop for UsageSettlement {
+    fn drop(&mut self) {
+        if !self.retained {
+            self.counters.record_drop(
+                ObservabilityAdmissionResource::UsageIngest,
+                ObservabilityAdmissionDropReason::Closed,
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+struct UsageLane {
+    tx: mpsc::Sender<QueuedUsage>,
+    slots: Arc<Semaphore>,
+    scheduled: Arc<AtomicBool>,
+    ready_tx: mpsc::Sender<usize>,
+    index: usize,
+}
+
+#[derive(Debug)]
+struct UsageState {
+    lane: UsageLane,
+    recent_events: Arc<Mutex<VecDeque<StoredUsage>>>,
+}
+
+#[derive(Debug)]
+struct UsageWriterLane {
+    rx: mpsc::Receiver<QueuedUsage>,
+    scheduled: Arc<AtomicBool>,
+    recent_events: Arc<Mutex<VecDeque<StoredUsage>>>,
+    retained_share: usize,
+}
+
+#[derive(Debug)]
+struct StoredUsage {
+    sequence: u64,
+    event: UsageEvent,
+}
+
+#[derive(Debug)]
+struct TenantObservability {
+    /// Mutable usage state exists only when this tenant has positive ingest and
+    /// retention shares. Zero-share tenants allocate no usage lane or ring.
+    usage: Option<UsageState>,
+    #[cfg(any(test, feature = "bench-internals"))]
+    // `cargo bench` also compiles the gateway binary, where the Criterion-only
+    // harness is absent. The separate benchmark target reads this field.
+    #[cfg_attr(all(feature = "bench-internals", not(test)), allow(dead_code))]
+    ingest_share: usize,
+    #[cfg(test)]
+    usage_share: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(usize)]
+pub enum ObservabilityAdmissionResource {
+    UsageIngest = 0,
+}
+
+impl ObservabilityAdmissionResource {
+    pub const ALL: [Self; 1] = [Self::UsageIngest];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::UsageIngest => "usage_ingest",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(usize)]
+pub enum ObservabilityAdmissionDropReason {
+    UnregisteredTenant = 0,
+    ZeroShare = 1,
+    Full = 2,
+    Closed = 3,
+}
+
+impl ObservabilityAdmissionDropReason {
+    pub const ALL: [Self; 4] = [
+        Self::UnregisteredTenant,
+        Self::ZeroShare,
+        Self::Full,
+        Self::Closed,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::UnregisteredTenant => "unregistered_tenant",
+            Self::ZeroShare => "zero_share",
+            Self::Full => "full",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+const OBSERVABILITY_ADMISSION_RESOURCE_COUNT: usize = 1;
+const OBSERVABILITY_ADMISSION_DROP_REASON_COUNT: usize = 4;
+
+#[derive(Debug, Default)]
+struct ObservabilityCounters {
+    drop_unregistered: AtomicU64,
+    drop_capacity: AtomicU64,
+    drop_closed: AtomicU64,
+    admission_drops: [[AtomicU64; OBSERVABILITY_ADMISSION_DROP_REASON_COUNT];
+        OBSERVABILITY_ADMISSION_RESOURCE_COUNT],
+    usage_evictions: AtomicU64,
+    #[cfg(test)]
+    usage_dispatches: AtomicU64,
+}
+
+impl ObservabilityCounters {
+    fn record_drop(
+        &self,
+        resource: ObservabilityAdmissionResource,
+        reason: ObservabilityAdmissionDropReason,
+    ) {
+        self.admission_drops[resource as usize][reason as usize].fetch_add(1, Ordering::Relaxed);
+        match reason {
+            ObservabilityAdmissionDropReason::UnregisteredTenant => {
+                self.drop_unregistered.fetch_add(1, Ordering::Relaxed);
+            }
+            ObservabilityAdmissionDropReason::ZeroShare
+            | ObservabilityAdmissionDropReason::Full => {
+                self.drop_capacity.fetch_add(1, Ordering::Relaxed);
+            }
+            ObservabilityAdmissionDropReason::Closed => {
+                self.drop_closed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn admission_drop_snapshot(
+        &self,
+    ) -> [[u64; OBSERVABILITY_ADMISSION_DROP_REASON_COUNT]; OBSERVABILITY_ADMISSION_RESOURCE_COUNT]
+    {
+        std::array::from_fn(|resource| {
+            std::array::from_fn(|reason| {
+                self.admission_drops[resource][reason].load(Ordering::Relaxed)
+            })
+        })
+    }
+}
+
+fn admit_usage(
+    tenants: &HashMap<TenantId, Arc<TenantObservability>>,
+    counters: &Arc<ObservabilityCounters>,
+    accepting: &AtomicBool,
+    tenant_id: Option<&TenantId>,
+    mut event: UsageEvent,
+) -> bool {
+    if !accepting.load(Ordering::Acquire) {
+        counters.record_drop(
+            ObservabilityAdmissionResource::UsageIngest,
+            ObservabilityAdmissionDropReason::Closed,
+        );
+        return false;
+    }
+    let Some(tenant_id) = tenant_id else {
+        counters.record_drop(
+            ObservabilityAdmissionResource::UsageIngest,
+            ObservabilityAdmissionDropReason::UnregisteredTenant,
+        );
+        return false;
+    };
+    let Some(tenant) = tenants.get(tenant_id) else {
+        counters.record_drop(
+            ObservabilityAdmissionResource::UsageIngest,
+            ObservabilityAdmissionDropReason::UnregisteredTenant,
+        );
+        return false;
+    };
+    event.tenant_id = tenant_id.as_str().to_string();
+    let Some(usage) = tenant.usage.as_ref() else {
+        counters.record_drop(
+            ObservabilityAdmissionResource::UsageIngest,
+            ObservabilityAdmissionDropReason::ZeroShare,
+        );
+        return false;
+    };
+    let Ok(reservation) = usage.lane.slots.clone().try_acquire_owned() else {
+        counters.record_drop(
+            ObservabilityAdmissionResource::UsageIngest,
+            ObservabilityAdmissionDropReason::Full,
+        );
+        return false;
+    };
+    if usage
+        .lane
+        .tx
+        .try_send(QueuedUsage {
+            event,
+            _reservation: reservation,
+            settlement: UsageSettlement {
+                counters: Arc::clone(counters),
+                retained: false,
+            },
+        })
+        .is_err()
+    {
+        return false;
+    }
+    if usage
+        .lane
+        .scheduled
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+        && usage.lane.ready_tx.try_send(usage.lane.index).is_err()
+    {
+        usage.lane.scheduled.store(false, Ordering::Release);
+    }
+    true
+}
+
+/// Fixed-cardinality operational snapshot. Tenant-count and share posture stay
+/// internal and are deliberately not projected into CE's unauthenticated
+/// `/metrics` surface.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct ObservabilityCapacitySnapshot {
+    pub tenant_count: usize,
+    pub positive_usage_ingest_share_tenants: usize,
+    pub zero_usage_ingest_share_tenants: usize,
+    pub positive_usage_retained_share_tenants: usize,
+    pub zero_usage_retained_share_tenants: usize,
+    pub usage_ingest_capacity: usize,
+    pub usage_retained_capacity: usize,
+    pub min_usage_ingest_share: usize,
+    pub min_usage_retained_share: usize,
+    pub drops_unregistered: u64,
+    pub drops_capacity: u64,
+    pub drops_closed: u64,
+    /// Fixed-cardinality `resource × reason` admission-drop matrix. Kept out of
+    /// the serialized snapshot because it exists solely to render Prometheus
+    /// series with a closed label vocabulary.
+    #[serde(skip)]
+    admission_drops:
+        [[u64; OBSERVABILITY_ADMISSION_DROP_REASON_COUNT]; OBSERVABILITY_ADMISSION_RESOURCE_COUNT],
+    pub usage_evictions: u64,
+}
+
+#[cfg(test)]
+impl ObservabilityCapacitySnapshot {
+    /// Read one fixed-cardinality admission-drop counter without adding the
+    /// backing matrix to the serialized snapshot schema.
+    pub fn admission_drop(
+        &self,
+        resource: ObservabilityAdmissionResource,
+        reason: ObservabilityAdmissionDropReason,
+    ) -> u64 {
+        self.admission_drops[resource as usize][reason as usize]
+    }
+}
+
+/// O(1) counters-only snapshot for the unauthenticated Prometheus surface.
+///
+/// Keeping this distinct from the test-only capacity/posture snapshot prevents a
+/// scrape from performing tenant-registry scans for posture that CE does not
+/// expose. Every field is a fixed-cardinality atomic counter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ObservabilityMetricsSnapshot {
+    pub drops_unregistered: u64,
+    pub drops_capacity: u64,
+    pub drops_closed: u64,
+    admission_drops:
+        [[u64; OBSERVABILITY_ADMISSION_DROP_REASON_COUNT]; OBSERVABILITY_ADMISSION_RESOURCE_COUNT],
+    pub usage_evictions: u64,
+}
+
+impl ObservabilityMetricsSnapshot {
+    pub fn admission_drop(
+        &self,
+        resource: ObservabilityAdmissionResource,
+        reason: ObservabilityAdmissionDropReason,
+    ) -> u64 {
+        self.admission_drops[resource as usize][reason as usize]
+    }
+}
+
+/// In-memory observability with one immutable, canonical tenant registry.
+///
+/// Usage producers perform only immutable-map lookup, semaphore reservation,
+/// `try_send`, and an atomic readiness transition. They never await or take a
+/// mutex. The single writer services one event per ready tenant per turn; tenant
+/// usage rings have deterministic non-borrowable shares inside one fixed replica
+/// envelope.
+pub struct ObservabilityEngine {
+    tenants: HashMap<TenantId, Arc<TenantObservability>>,
+    tenant_order: Vec<TenantId>,
+    counters: Arc<ObservabilityCounters>,
+    accepting: AtomicBool,
+    shutdown_tx: watch::Sender<bool>,
+    writer_task: Mutex<Option<JoinHandle<()>>>,
+}
+
+async fn dispatch_queued_usage(
+    lane: &mut UsageWriterLane,
+    mut queued: QueuedUsage,
+    counters: &ObservabilityCounters,
+    sequence: &AtomicU64,
+) {
+    // The OTLP exporter may spawn off-path work, so it runs only after
+    // tenant-owned admission and fair dequeue. Full/unknown drops never reach
+    // it. Shutdown draining calls this same routine, preserving the delivery
+    // path for every accepted event that completes before the deadline.
+    crate::otel::export_event(&queued.event);
+    #[cfg(test)]
+    counters.usage_dispatches.fetch_add(1, Ordering::Relaxed);
+
+    // Formatting/log dispatch stays outside every tenant-ring lock.
+    if queued.event.success {
+        tracing::info!(
+            "USAGE: Key='{}' Provider='{}' Model='{}' Tokens={}",
+            queued.event.virtual_key_name,
+            queued.event.provider,
+            queued.event.model,
+            queued.event.total_tokens
+        );
+    } else {
+        tracing::warn!(
+            "USAGE(failed): Key='{}' Provider='{}' Model='{}' Error='{}'",
+            queued.event.virtual_key_name,
+            queued.event.provider,
+            queued.event.model,
+            queued.event.error.as_deref().unwrap_or("unknown"),
+        );
+    }
+    let event_sequence = sequence.fetch_add(1, Ordering::Relaxed);
+
+    // The writer is the ring's only producer. `try_lock` + yield preserves the
+    // prior wait-for-reader behavior while keeping this task cancellation-safe:
+    // a bounded shutdown can abort it even if an analytics reader is stalled.
+    loop {
+        match try_retain_queued_usage(lane, queued, counters, event_sequence) {
+            None => return,
+            Some(returned) => queued = returned,
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+fn try_retain_queued_usage(
+    lane: &UsageWriterLane,
+    queued: QueuedUsage,
+    counters: &ObservabilityCounters,
+    sequence: u64,
+) -> Option<QueuedUsage> {
+    let mut ring = match lane.recent_events.try_lock() {
+        Ok(ring) => ring,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return Some(queued),
+    };
+    let QueuedUsage {
+        event,
+        _reservation,
+        mut settlement,
+    } = queued;
+    if ring.len() >= lane.retained_share {
+        ring.pop_front();
+        counters.usage_evictions.fetch_add(1, Ordering::Relaxed);
+    }
+    ring.push_back(StoredUsage { sequence, event });
+    settlement.retained();
+    // The reservation is released after the event moves into retained history.
+    drop(_reservation);
+    None
 }
 
 impl ObservabilityEngine {
-    pub fn new() -> Self {
-        let (tx, mut rx) = mpsc::channel::<UsageEvent>(INGEST_CHANNEL_CAPACITY);
-        let recent_events =
-            std::sync::Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RETAINED_EVENTS)));
+    /// Build from explicit validated authority. Sorting and deduplication make
+    /// quotient/remainder ownership deterministic across replicas.
+    pub fn new(mut tenant_ids: Vec<TenantId>) -> Self {
+        tenant_ids.sort();
+        tenant_ids.dedup();
+        let tenant_count = tenant_ids.len();
+        let ingest_shares = partition(INGEST_CHANNEL_CAPACITY, tenant_count);
+        let usage_shares = partition(MAX_RETAINED_EVENTS, tenant_count);
+        let active_usage_lanes = ingest_shares
+            .iter()
+            .zip(&usage_shares)
+            .filter(|(ingest, retained)| **ingest > 0 && **retained > 0)
+            .count();
+        let (ready_tx, ready_rx) = if active_usage_lanes == 0 {
+            (None, None)
+        } else {
+            let (tx, rx) = mpsc::channel::<usize>(active_usage_lanes);
+            (Some(tx), Some(rx))
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let counters = Arc::new(ObservabilityCounters::default());
+        let sequence = Arc::new(AtomicU64::new(0));
 
-        // Background drain task: the SINGLE writer to the ring. Owns logging so
-        // the hot path never logs under the lock. Ends when all senders drop.
-        let ring = recent_events.clone();
-        tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                // Log OUTSIDE the lock (Task #5): formatting + the tracing
-                // subscriber's own work must not extend the mutex hold.
-                if event.success {
-                    tracing::info!(
-                        "USAGE: Key='{}' Provider='{}' Model='{}' Tokens={}",
-                        event.virtual_key_name,
-                        event.provider,
-                        event.model,
-                        event.total_tokens
-                    );
-                } else {
-                    tracing::warn!(
-                        "USAGE(failed): Key='{}' Provider='{}' Model='{}' Error='{}'",
-                        event.virtual_key_name,
-                        event.provider,
-                        event.model,
-                        event.error.as_deref().unwrap_or("unknown"),
-                    );
-                }
+        let mut tenants = HashMap::with_capacity(tenant_count);
+        let mut writer_lanes = Vec::with_capacity(active_usage_lanes);
+        for (index, tenant_id) in tenant_ids.iter().cloned().enumerate() {
+            let ingest_share = ingest_shares[index];
+            let usage_share = usage_shares[index];
+            let usage = if ingest_share > 0 && usage_share > 0 {
+                let ready_tx = ready_tx
+                    .as_ref()
+                    .expect("positive usage lanes have a ready queue");
+                let lane_index = writer_lanes.len();
+                let (tx, rx) = mpsc::channel::<QueuedUsage>(ingest_share);
+                let slots = Arc::new(Semaphore::new(ingest_share));
+                let scheduled = Arc::new(AtomicBool::new(false));
+                let recent_events = Arc::new(Mutex::new(VecDeque::with_capacity(usage_share)));
+                writer_lanes.push(UsageWriterLane {
+                    rx,
+                    scheduled: scheduled.clone(),
+                    recent_events: recent_events.clone(),
+                    retained_share: usage_share,
+                });
+                Some(UsageState {
+                    lane: UsageLane {
+                        tx,
+                        slots,
+                        scheduled,
+                        ready_tx: ready_tx.clone(),
+                        index: lane_index,
+                    },
+                    recent_events,
+                })
+            } else {
+                None
+            };
+            tenants.insert(
+                tenant_id,
+                Arc::new(TenantObservability {
+                    usage,
+                    #[cfg(any(test, feature = "bench-internals"))]
+                    ingest_share,
+                    #[cfg(test)]
+                    usage_share,
+                }),
+            );
+        }
+        let writer_counters = counters.clone();
+        let writer_sequence = sequence.clone();
+        let writer_task = ready_tx.zip(ready_rx).map(|(ready_tx, mut ready_rx)| {
+            let mut shutdown_rx = shutdown_rx;
+            tokio::spawn(async move {
+                loop {
+                    let lane_index = tokio::select! {
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() {
+                                break;
+                            }
+                            continue;
+                        }
+                        ready = ready_rx.recv() => match ready {
+                            Some(index) => index,
+                            None => break,
+                        },
+                    };
+                    let Some(lane) = writer_lanes.get_mut(lane_index) else {
+                        continue;
+                    };
+                    let Ok(queued) = lane.rx.try_recv() else {
+                        // Defensive stale-token recovery. Producers can schedule a
+                        // fresh token after this release transition.
+                        lane.scheduled.store(false, Ordering::Release);
+                        continue;
+                    };
+                    dispatch_queued_usage(lane, queued, &writer_counters, &writer_sequence).await;
 
-                // Minimal critical section: push (and bound) only.
-                if let Ok(mut events) = ring.lock() {
-                    if events.len() >= MAX_RETAINED_EVENTS {
-                        events.pop_front();
+                    // Clear then double-check closes the producer/writer race:
+                    // enqueue-before-clear is observed by `is_empty`; enqueue-after-
+                    // clear schedules its own token. The CAS coalesces the overlap.
+                    lane.scheduled.store(false, Ordering::Release);
+                    if !lane.rx.is_empty()
+                        && lane
+                            .scheduled
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                        && ready_tx.try_send(lane_index).is_err()
+                    {
+                        lane.scheduled.store(false, Ordering::Release);
                     }
-                    events.push_back(event);
                 }
-            }
+                // Close first: every producer racing shutdown now receives Closed.
+                // Then drain one event per tenant per round through the same
+                // export/log/retention/settlement path as normal operation.
+                for lane in &mut writer_lanes {
+                    lane.rx.close();
+                }
+                loop {
+                    let mut progressed = false;
+                    for lane in &mut writer_lanes {
+                        if let Ok(queued) = lane.rx.try_recv() {
+                            progressed = true;
+                            dispatch_queued_usage(lane, queued, &writer_counters, &writer_sequence)
+                                .await;
+                            // Bound cancellation latency to one event rather than
+                            // one full tenant round during a large-registry drain.
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    if !progressed {
+                        break;
+                    }
+                }
+            })
         });
 
         Self {
-            tx,
-            recent_events,
-            mcp_security: std::sync::Arc::new(Mutex::new(VecDeque::with_capacity(
-                MAX_MCP_SECURITY_EVENTS,
-            ))),
+            tenants,
+            tenant_order: tenant_ids,
+            counters,
+            accepting: AtomicBool::new(true),
+            shutdown_tx,
+            writer_task: Mutex::new(writer_task),
         }
     }
 
-    /// Record an MCP enforcement event into the bounded ring. Off the chat hot
-    /// path (the MCP leg is low-volume); a single bounded push under a short-lived
-    /// lock, never held across an `.await`. Best-effort: a poisoned lock is ignored
-    /// rather than propagated to the caller (observability must never fail a deny).
-    /// CE (PRD-047): callers live behind the `enterprise` gate.
-    #[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
-    pub fn record_mcp_security_event(&self, event: McpSecurityEvent) {
-        if let Ok(mut ring) = self.mcp_security.lock() {
-            if ring.len() >= MAX_MCP_SECURITY_EVENTS {
-                ring.pop_front();
-            }
-            ring.push_back(event);
+    /// Fixed-cost operational counters for `/metrics`. This intentionally does
+    /// not inspect the tenant registry.
+    pub fn metrics_snapshot(&self) -> ObservabilityMetricsSnapshot {
+        ObservabilityMetricsSnapshot {
+            drops_unregistered: self.counters.drop_unregistered.load(Ordering::Relaxed),
+            drops_capacity: self.counters.drop_capacity.load(Ordering::Relaxed),
+            drops_closed: self.counters.drop_closed.load(Ordering::Relaxed),
+            admission_drops: self.counters.admission_drop_snapshot(),
+            usage_evictions: self.counters.usage_evictions.load(Ordering::Relaxed),
         }
     }
 
-    /// Recent MCP enforcement events for ONE tenant, newest-first, capped at
-    /// `limit`. Tenant-scoped so a caller only ever sees its own events.
-    /// CE (PRD-047): the only caller is the gated `mcp_api::security_events`.
-    #[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
-    pub fn recent_mcp_security(&self, tenant_id: &str, limit: usize) -> Vec<McpSecurityEvent> {
-        self.mcp_security
-            .lock()
-            .map(|ring| {
-                ring.iter()
-                    .rev()
-                    .filter(|e| e.tenant_id == tenant_id)
-                    .take(limit)
-                    .cloned()
-                    .collect()
+    #[cfg(test)]
+    pub fn shutdown_is_settled_for_test(&self) -> bool {
+        !self.accepting.load(Ordering::Acquire)
+            && self
+                .writer_task
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none()
+            && self.tenants.values().all(|tenant| {
+                tenant
+                    .usage
+                    .as_ref()
+                    .is_none_or(|usage| usage.lane.slots.available_permits() == tenant.ingest_share)
             })
-            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub fn capacity_snapshot(&self) -> ObservabilityCapacitySnapshot {
+        let min_positive = |f: fn(&TenantObservability) -> usize| {
+            self.tenant_order
+                .iter()
+                .filter_map(|tenant| self.tenants.get(tenant))
+                .map(|tenant| f(tenant))
+                .filter(|share| *share > 0)
+                .min()
+                .unwrap_or(0)
+        };
+        ObservabilityCapacitySnapshot {
+            tenant_count: self.tenant_order.len(),
+            positive_usage_ingest_share_tenants: self
+                .tenants
+                .values()
+                .filter(|tenant| tenant.ingest_share > 0)
+                .count(),
+            zero_usage_ingest_share_tenants: self
+                .tenants
+                .values()
+                .filter(|tenant| tenant.ingest_share == 0)
+                .count(),
+            positive_usage_retained_share_tenants: self
+                .tenants
+                .values()
+                .filter(|tenant| tenant.usage_share > 0)
+                .count(),
+            zero_usage_retained_share_tenants: self
+                .tenants
+                .values()
+                .filter(|tenant| tenant.usage_share == 0)
+                .count(),
+            usage_ingest_capacity: INGEST_CHANNEL_CAPACITY,
+            usage_retained_capacity: MAX_RETAINED_EVENTS,
+            min_usage_ingest_share: min_positive(|t| t.ingest_share),
+            min_usage_retained_share: min_positive(|t| t.usage_share),
+            drops_unregistered: self.counters.drop_unregistered.load(Ordering::Relaxed),
+            drops_capacity: self.counters.drop_capacity.load(Ordering::Relaxed),
+            drops_closed: self.counters.drop_closed.load(Ordering::Relaxed),
+            admission_drops: self.counters.admission_drop_snapshot(),
+            usage_evictions: self.counters.usage_evictions.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Stop new admission, drain accepted events through their normal delivery
+    /// path, and join the writer within `bound`. On deadline, aborting the task
+    /// drops the in-flight event and receivers; settlement and semaphore permits
+    /// are released by RAII and the aborted task is reaped before return.
+    pub async fn shutdown(&self, bound: Duration) {
+        self.accepting.store(false, Ordering::Release);
+        let _ = self.shutdown_tx.send(true);
+        let Some(mut task) = self
+            .writer_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        else {
+            return;
+        };
+        match tokio::time::timeout(bound, &mut task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!("observability writer terminated unexpectedly: {error}");
+            }
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                tracing::warn!(
+                    shutdown_bound = ?bound,
+                    "observability shutdown exceeded its bound; abandoned events were settled closed"
+                );
+            }
+        }
     }
 
     /// Record a usage event. NON-BLOCKING and lock-free on the hot path: a
@@ -790,17 +1351,17 @@ impl ObservabilityEngine {
     /// burst beyond capacity) the event is dropped with a rate-limited warning
     /// rather than blocking the request — observability must never add latency to
     /// or stall a caller's request.
-    pub fn record_usage(&self, event: UsageEvent) {
-        // OTLP export skeleton (PRD-009): best-effort, fire-and-forget. The
-        // exporter is gated on OTEL_EXPORT_ENABLED; when disabled the function
-        // returns immediately. Failure in the exporter must never affect the
-        // primary observability path.
-        crate::otel::export_event(&event);
-        if let Err(e) = self.tx.try_send(event) {
-            // `tracing` itself is non-blocking; this is the only work on the hot
-            // path when the buffer is saturated.
-            tracing::warn!("observability ingest channel full, dropping usage event: {e}");
-        }
+    pub fn record_usage<'a>(&self, tenant_id: impl Into<Option<&'a TenantId>>, event: UsageEvent) {
+        // OTLP export skeleton (PRD-009) is inside the shared admission seam so
+        // the benchmark exercises the same producer path. It remains a no-op
+        // unless OTEL_EXPORT_ENABLED is armed.
+        let _ = admit_usage(
+            &self.tenants,
+            &self.counters,
+            &self.accepting,
+            tenant_id.into(),
+            event,
+        );
     }
 
     /// Returns the ENTIRE ring, unscoped — every tenant's events. This is an
@@ -812,30 +1373,56 @@ impl ObservabilityEngine {
     /// the library's test consumers do.
     #[allow(dead_code)]
     pub fn get_recent_events(&self) -> Vec<UsageEvent> {
-        self.recent_events
-            .lock()
-            .map(|events| events.iter().cloned().collect())
-            .unwrap_or_default()
+        let mut events: Vec<(u64, UsageEvent)> = self
+            .tenant_order
+            .iter()
+            .filter_map(|tenant_id| self.tenants.get(tenant_id))
+            .filter_map(|tenant| tenant.usage.as_ref())
+            .flat_map(|usage| {
+                usage
+                    .recent_events
+                    .lock()
+                    .map(|ring| {
+                        ring.iter()
+                            .map(|stored| (stored.sequence, stored.event.clone()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        events.sort_by_key(|(sequence, _)| *sequence);
+        events.into_iter().map(|(_, event)| event).collect()
     }
 
     /// Tenant-scoped variant of `get_recent_events`: returns only the events whose
-    /// `virtual_key_name` is one of `key_names` — the virtual-key names the caller's
-    /// tenant owns. Isolation is structural, by key ownership (ADR-023), exactly like
-    /// `recent_events`/`chargeback`; the scope is NEVER a client-supplied id. Insertion
-    /// order is preserved (unlike the newest-first `recent_events` log projection), so
-    /// the `/analytics` response keeps its prior ordering — only cross-tenant rows are
-    /// removed. Same short mutex, never held across an `.await`.
-    pub fn recent_events_owned(
+    /// `tenant_id` equals the authenticated caller's `tenant_id`. Isolation is by the
+    /// stamped tenant id (ADR-023 — from the authenticated context, NEVER a
+    /// client-supplied value), exactly like `recent_events`/`chargeback`. This is the
+    /// isolation boundary that the removed `virtual_key_name`-set filter could not be:
+    /// two tenants can each own a key named e.g. "prod", and a name match would have
+    /// leaked one tenant's events to the other. Insertion order is preserved (unlike
+    /// the newest-first `recent_events` log projection), so the `/analytics` response
+    /// keeps its prior ordering — only cross-tenant rows are removed. Same short mutex,
+    /// never held across an `.await`.
+    pub fn recent_events_owned<'a>(
         &self,
-        key_names: &std::collections::BTreeSet<String>,
+        tenant_id: impl Into<Option<&'a TenantId>>,
     ) -> Vec<UsageEvent> {
-        self.recent_events
-            .lock()
+        let Some(tenant_id) = tenant_id.into() else {
+            return Vec::new();
+        };
+        let Some(tenant) = self.tenants.get(tenant_id) else {
+            return Vec::new();
+        };
+        tenant
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.recent_events.lock().ok())
             .map(|events| {
                 events
                     .iter()
-                    .filter(|ev| key_names.contains(&ev.virtual_key_name))
-                    .cloned()
+                    .filter(|stored| stored.event.tenant_id == tenant_id.as_str())
+                    .map(|stored| stored.event.clone())
                     .collect()
             })
             .unwrap_or_default()
@@ -848,9 +1435,7 @@ impl ObservabilityEngine {
     /// bodies, or PII — only counts. `window` is the sample size (≤1000), so the
     /// rates are read as "over the recent window", not all-time.
     pub fn usage_summary(&self) -> UsageSummary {
-        let Ok(events) = self.recent_events.lock() else {
-            return UsageSummary::default();
-        };
+        let events = self.get_recent_events();
         let mut s = UsageSummary {
             window: events.len(),
             ..Default::default()
@@ -897,21 +1482,25 @@ impl ObservabilityEngine {
         s
     }
 
-    /// Latency percentiles (p50/p95/p99) over the retained ring — overall and
-    /// per provider. Computed by exact nearest-rank over the latencies recorded
-    /// on real provider attempts (synthetic sentinel events like
-    /// "(sovereign_block)" / "(prompt_render)" carry no latency and are skipped).
-    /// Folds the ring ONCE under the same short mutex `get_recent_events` takes;
-    /// never held across an `.await`, never on the request hot path. The ring is
-    /// ≤1000 events, so the per-provider sort is trivially cheap.
-    pub fn latency_stats(&self) -> LatencyReport {
-        let Ok(events) = self.recent_events.lock() else {
-            return LatencyReport::default();
-        };
+    /// Latency percentiles (p50/p95/p99) over the retained ring, scoped to ONE
+    /// tenant by the authenticated `tenant_id` — overall and per provider. Isolation
+    /// is by the stamped `tenant_id` (mirroring the ring-read isolation:
+    /// from the authenticated `TenantContext`, NEVER a client-supplied value and
+    /// never the non-unique `virtual_key_name`), so a tenant sees latency for its
+    /// OWN traffic only — the `/analytics/latency` route was previously the last
+    /// unscoped ring read. Computed by exact nearest-rank over the latencies recorded
+    /// on real provider attempts (synthetic sentinel events like "(sovereign_block)"
+    /// / "(prompt_render)" carry no latency and are skipped). Folds the ring ONCE
+    /// under the same short mutex `get_recent_events` takes; never held across an
+    /// `.await`, never on the request hot path. The ring is ≤1000 events, so the
+    /// per-provider sort is trivially cheap.
+    pub fn latency_stats<'a>(&self, tenant_id: impl Into<Option<&'a TenantId>>) -> LatencyReport {
+        let events = self.recent_events_owned(tenant_id);
         let mut overall: Vec<u64> = Vec::new();
         let mut per_provider: BTreeMap<String, Vec<u64>> = BTreeMap::new();
         for ev in events.iter() {
-            // Only real provider attempts that were timed contribute.
+            // Tenant isolation + only real, timed provider attempts contribute (the
+            // same `'('` synthetic-sentinel skip the sibling ring readers use).
             if ev.provider.starts_with('(') {
                 continue;
             }
@@ -933,22 +1522,22 @@ impl ObservabilityEngine {
     }
 
     /// FinOps chargeback/showback (PRD-008 FR-24, `Feature::FinOpsExport`) over the
-    /// retained ring, scoped to ONE tenant. The caller passes the set of virtual-key
-    /// NAMES it owns (resolved from the auth registry — tenant isolation is by key
-    /// ownership, never a client-supplied id); only events whose `virtual_key_name`
-    /// is in that set contribute, so a tenant can never see another tenant's spend.
+    /// retained ring, scoped to ONE tenant by the authenticated `tenant_id` (ADR-023 —
+    /// from the authenticated context, never a client-supplied id); only events whose
+    /// stamped `tenant_id` matches contribute, so a tenant can never see another
+    /// tenant's spend — even one that owns a same-named virtual key. The `by_key`
+    /// breakdown still groups on `virtual_key_name`, which is now inherently
+    /// within-tenant (every matched event belongs to this tenant).
     ///
     /// Synthetic sentinel events (providers like "(sovereign_block)" /
     /// "(prompt_render)") carry no real spend and are skipped — `window` still
-    /// reports the full ring size so the caller knows the sample horizon. Folds the
-    /// ring ONCE under the same short mutex `get_recent_events` takes; never held
+    /// reports the tenant-local ring size so the caller knows the sample horizon.
+    /// Folds the ring ONCE under the same short mutex `get_recent_events` takes; never held
     /// across an `.await`, never on the request hot path. Costs sum the canonical
     /// integer micro-USD (`cost_micro_usd`) plus per-currency minor-unit totals
     /// (`cost_by_currency`) — money stays integer end to end (never a float).
-    pub fn chargeback(&self, key_names: &std::collections::BTreeSet<String>) -> ChargebackReport {
-        let Ok(events) = self.recent_events.lock() else {
-            return ChargebackReport::default();
-        };
+    pub fn chargeback<'a>(&self, tenant_id: impl Into<Option<&'a TenantId>>) -> ChargebackReport {
+        let events = self.recent_events_owned(tenant_id);
         let mut report = ChargebackReport {
             window: events.len(),
             ..Default::default()
@@ -957,9 +1546,9 @@ impl ObservabilityEngine {
         // report's real p50/p95/p99 — collected during the same single fold.
         let mut latencies: Vec<u64> = Vec::new();
         for ev in events.iter() {
-            // Tenant isolation: only this tenant's keys, and only real provider
+            // Tenant isolation: only this tenant's events, and only real provider
             // attempts (synthetic sentinels carry no chargeable spend).
-            if ev.provider.starts_with('(') || !key_names.contains(&ev.virtual_key_name) {
+            if ev.provider.starts_with('(') {
                 continue;
             }
             report.events_matched += 1;
@@ -992,10 +1581,10 @@ impl ObservabilityEngine {
 
     /// Recent-window usage TIME-SERIES for the read-only `GET /v1/finops/timeseries`
     /// surface, scoped to ONE tenant. Mirrors `chargeback`'s isolation model EXACTLY:
-    /// the caller passes the set of virtual-key NAMES it owns (resolved server-side
-    /// from the auth registry — tenant isolation is by key ownership, never a
-    /// client-supplied id), and only events whose `virtual_key_name` is in that set
-    /// contribute.
+    /// the caller passes the authenticated `tenant_id` (from the authenticated context
+    /// — tenant isolation is by the stamped tenant id, never a client-supplied id, and
+    /// never the non-unique `virtual_key_name`), and only events whose stamped
+    /// `tenant_id` matches contribute.
     ///
     /// Buckets the tenant's real provider attempts by `timestamp` into `bucket_count`
     /// fixed-width buckets spanning `[now - window, now)`. Bucket width is
@@ -1014,9 +1603,9 @@ impl ObservabilityEngine {
     /// Read-only and lock-short: folds the ring ONCE under the same brief mutex
     /// `get_recent_events` takes (never held across an `.await`, never on the request
     /// hot path). No `unwrap`/panic — a poisoned lock yields all-zero buckets.
-    pub fn usage_timeseries(
+    pub fn usage_timeseries<'a>(
         &self,
-        key_names: &std::collections::BTreeSet<String>,
+        tenant_id: impl Into<Option<&'a TenantId>>,
         window: chrono::Duration,
         bucket_count: usize,
     ) -> UsageTimeseries {
@@ -1047,11 +1636,12 @@ impl ObservabilityEngine {
 
         let mut total_events_in_window: u64 = 0;
 
-        if let Ok(events) = self.recent_events.lock() {
-            for ev in events.iter() {
+        {
+            let events = self.recent_events_owned(tenant_id);
+            for ev in &events {
                 // Tenant isolation + only real provider attempts (skip the synthetic
                 // sentinels — the same `'('` rule chargeback uses).
-                if ev.provider.starts_with('(') || !key_names.contains(&ev.virtual_key_name) {
+                if ev.provider.starts_with('(') {
                     continue;
                 }
                 // Exclude events outside the recent window — honest: the ring may not
@@ -1095,11 +1685,11 @@ impl ObservabilityEngine {
 
     /// Guardrail detection outcomes for the read-only `GET /v1/guardrails/outcomes`
     /// surface, scoped to ONE tenant. Mirrors `usage_timeseries`'s isolation +
-    /// windowing model EXACTLY: the caller passes the set of virtual-key NAMES it
-    /// owns (resolved server-side from the auth registry — tenant isolation is by key
-    /// ownership, never a client-supplied id), and only events whose
-    /// `virtual_key_name` is in that set, with a `timestamp` inside `[now-window, now)`,
-    /// contribute.
+    /// windowing model EXACTLY: the caller passes the authenticated `tenant_id` (from
+    /// the authenticated context — tenant isolation is by the stamped tenant id, never
+    /// a client-supplied id, and never the non-unique `virtual_key_name`), and only
+    /// events whose stamped `tenant_id` matches, with a `timestamp` inside
+    /// `[now-window, now)`, contribute.
     ///
     /// The ring's `UsageEvent.guardrails` carries COARSE detector labels only —
     /// `CheckOutcome.check_type` is a string like `detect_pii` / `detect_secrets` /
@@ -1129,9 +1719,9 @@ impl ObservabilityEngine {
     /// MOAT (ADR-088): the sole caller is the enterprise-only /v1/guardrails/outcomes
     /// report handler, so this rides `enterprise`.
     #[cfg(feature = "enterprise")]
-    pub fn guardrail_outcomes(
+    pub fn guardrail_outcomes<'a>(
         &self,
-        key_names: &std::collections::BTreeSet<String>,
+        tenant_id: impl Into<Option<&'a TenantId>>,
         window: chrono::Duration,
         bucket_count: usize,
     ) -> GuardrailOutcomesReport {
@@ -1158,15 +1748,13 @@ impl ObservabilityEngine {
             series: Vec::new(),
         };
 
-        if let Ok(events) = self.recent_events.lock() {
-            for ev in events.iter() {
+        {
+            let events = self.recent_events_owned(tenant_id);
+            for ev in &events {
                 // Tenant isolation + recent-window bound. We do NOT apply the `'('`
                 // synthetic-provider skip here: a `(guardrails_denied)` block IS a
                 // real detection a tenant should see, and the other sentinels carry
                 // no guardrail outcomes anyway.
-                if !key_names.contains(&ev.virtual_key_name) {
-                    continue;
-                }
                 if ev.timestamp < start || ev.timestamp >= now {
                     continue;
                 }
@@ -1201,10 +1789,10 @@ impl ObservabilityEngine {
 
     /// Cache-SAVINGS rollup for the read-only `GET /v1/finops/cache-savings`
     /// surface, scoped to ONE tenant. Mirrors `usage_timeseries`'s isolation +
-    /// windowing model EXACTLY: the caller passes the set of virtual-key NAMES it
-    /// owns (resolved server-side from the auth registry — tenant isolation is by
-    /// key ownership, never a client-supplied id), and only events whose
-    /// `virtual_key_name` is in that set, with a `timestamp` inside
+    /// windowing model EXACTLY: the caller passes the authenticated `tenant_id` (from
+    /// the authenticated context — tenant isolation is by the stamped tenant id, never
+    /// a client-supplied id, and never the non-unique `virtual_key_name`), and only
+    /// events whose stamped `tenant_id` matches, with a `timestamp` inside
     /// `[now-window, now)`, contribute.
     ///
     /// A served cache hit IS the event that carries the savings: the proxy records
@@ -1232,9 +1820,9 @@ impl ObservabilityEngine {
     /// Read-only and lock-short: folds the ring ONCE under the same brief mutex
     /// `get_recent_events` takes (never held across an `.await`, never on the request
     /// hot path). No `unwrap`/panic — a poisoned lock yields an all-zero report.
-    pub fn cache_savings(
+    pub fn cache_savings<'a>(
         &self,
-        key_names: &std::collections::BTreeSet<String>,
+        tenant_id: impl Into<Option<&'a TenantId>>,
         window: chrono::Duration,
     ) -> CacheSavingsReport {
         let now = Utc::now();
@@ -1249,15 +1837,13 @@ impl ObservabilityEngine {
             saved_tokens: 0,
         };
 
-        if let Ok(events) = self.recent_events.lock() {
-            for ev in events.iter() {
+        {
+            let events = self.recent_events_owned(tenant_id);
+            for ev in &events {
                 // Tenant isolation + recent-window bound. We do NOT apply the `'('`
                 // synthetic-provider skip here: a served cache hit is recorded on the
                 // `(cache)` / `(semantic-cache)` sentinel and IS the event that carries
                 // the savings a tenant should see.
-                if !key_names.contains(&ev.virtual_key_name) {
-                    continue;
-                }
                 if ev.timestamp < start || ev.timestamp >= now {
                     continue;
                 }
@@ -1295,10 +1881,10 @@ impl ObservabilityEngine {
 
     /// Recent request-log rows for the read-only `GET /v1/logs` surface, scoped to
     /// ONE tenant. Mirrors `chargeback`'s isolation model exactly: the caller passes
-    /// the set of virtual-key NAMES it owns (resolved server-side from the auth
-    /// registry — tenant isolation is by key ownership, never a client-supplied id),
-    /// and only events whose `virtual_key_name` is in that set are returned. Rows are
-    /// newest-first and capped at `limit`.
+    /// the authenticated `tenant_id` (from the authenticated context — tenant isolation
+    /// is by the stamped tenant id, never a client-supplied id, and never the
+    /// non-unique `virtual_key_name`), and only events whose stamped `tenant_id`
+    /// matches are returned. Rows are newest-first and capped at `limit`.
     ///
     /// Synthetic sentinel events (providers like "(sovereign_block)" /
     /// "(prompt_render)" / "(feedback)", all of which start with `'('`) are EXCLUDED
@@ -1314,20 +1900,18 @@ impl ObservabilityEngine {
     /// Read-only and lock-short: folds the ring ONCE under the same brief mutex
     /// `get_recent_events` takes (never held across an `.await`, never on the request
     /// hot path). No `unwrap`/panic — a poisoned lock yields an empty list.
-    pub fn recent_events(
+    pub fn recent_events<'a>(
         &self,
-        key_names: &std::collections::BTreeSet<String>,
+        tenant_id: impl Into<Option<&'a TenantId>>,
         limit: usize,
     ) -> Vec<LogRow> {
-        let Ok(events) = self.recent_events.lock() else {
-            return Vec::new();
-        };
+        let events = self.recent_events_owned(tenant_id);
         // Iterate newest-first (the ring pushes to the back), filtering to the
-        // tenant's own keys and to real request attempts, capped at `limit`.
+        // tenant's own events and to real request attempts, capped at `limit`.
         events
             .iter()
             .rev()
-            .filter(|ev| key_names.contains(&ev.virtual_key_name) && is_logged_attempt(ev))
+            .filter(|ev| is_logged_attempt(ev))
             .take(limit)
             .map(LogRow::from_event)
             .collect()
@@ -1335,11 +1919,11 @@ impl ObservabilityEngine {
 
     /// Residency observability for the read-only `GET /v1/residency/summary` +
     /// `GET /v1/residency/ledger` surfaces, scoped to ONE tenant. Mirrors
-    /// `recent_events`'s isolation model EXACTLY: the caller passes the set of
-    /// virtual-key NAMES it owns (resolved server-side from the auth registry —
-    /// tenant isolation is by key ownership, never a client-supplied id), and only
-    /// events whose `virtual_key_name` is in that set contribute. The ledger rows
-    /// are newest-first and capped at `limit`.
+    /// `recent_events`'s isolation model EXACTLY: the caller passes the authenticated
+    /// `tenant_id` (from the authenticated context — tenant isolation is by the
+    /// stamped tenant id, never a client-supplied id, and never the non-unique
+    /// `virtual_key_name`), and only events whose stamped `tenant_id` matches
+    /// contribute. The ledger rows are newest-first and capped at `limit`.
     ///
     /// Folds the ring ONCE (a single short mutex hold, the same brief lock
     /// `recent_events`/`chargeback` take — never across an `.await`, never on the
@@ -1356,14 +1940,12 @@ impl ObservabilityEngine {
     /// `(prompt_render)` / `(feedback)` are excluded via `is_logged_attempt`, the
     /// same rule as `/v1/logs`); the block sentinel `(sovereign_block)` IS counted
     /// (a residency refusal is a real residency decision a tenant should see).
-    pub fn residency_report(
+    pub fn residency_report<'a>(
         &self,
-        key_names: &std::collections::BTreeSet<String>,
+        tenant_id: impl Into<Option<&'a TenantId>>,
         limit: usize,
     ) -> (ResidencySummaryView, Vec<ResidencyLedgerRow>) {
-        let Ok(events) = self.recent_events.lock() else {
-            return (ResidencySummaryView::default(), Vec::new());
-        };
+        let events = self.recent_events_owned(tenant_id);
 
         let mut summary = ResidencySummaryView {
             window: events.len(),
@@ -1374,7 +1956,7 @@ impl ObservabilityEngine {
         // Iterate newest-first (the ring pushes to the back) so the ledger is
         // newest-first and the `limit` cap keeps the most-recent decisions.
         for ev in events.iter().rev() {
-            if !key_names.contains(&ev.virtual_key_name) || !is_logged_attempt(ev) {
+            if !is_logged_attempt(ev) {
                 continue;
             }
 
@@ -1425,6 +2007,15 @@ impl ObservabilityEngine {
         }
 
         (summary.finalize(), rows)
+    }
+}
+
+impl Drop for ObservabilityEngine {
+    fn drop(&mut self) {
+        // Best effort for owners that do not run the explicit bounded join
+        // (principally short-lived tests). Production calls `shutdown` after
+        // Axum has drained requests.
+        let _ = self.shutdown_tx.send(true);
     }
 }
 
@@ -1916,11 +2507,755 @@ pub struct ResidencyLedgerRow {
     pub virtual_key_name: String,
 }
 
+/// Criterion-only access to the production admission seam.
+#[cfg(feature = "bench-internals")]
+// Cargo also compiles the gateway binary for integration benchmarks. That
+// duplicate module does not consume this harness; the benchmark target does.
+#[allow(dead_code)]
+pub mod bench_support {
+    use super::*;
+
+    pub struct AdmissionHarness {
+        engine: ObservabilityEngine,
+        tenant_ids: Vec<TenantId>,
+        held_capacity: Mutex<Option<OwnedSemaphorePermit>>,
+    }
+
+    impl AdmissionHarness {
+        const RELEASE_BOUND: Duration = Duration::from_secs(1);
+
+        pub fn new(tenant_count: usize) -> Self {
+            assert!(tenant_count > 0, "benchmark requires at least one tenant");
+            let tenant_ids: Vec<_> = (0..tenant_count)
+                .map(|index| {
+                    TenantId::new(format!("tenant_{index:05}"))
+                        .expect("benchmark tenant id is canonical")
+                })
+                .collect();
+            let engine = ObservabilityEngine::new(tenant_ids.clone());
+            Self {
+                engine,
+                tenant_ids,
+                held_capacity: Mutex::new(None),
+            }
+        }
+
+        pub fn record(&self, index: usize, event: UsageEvent) -> bool {
+            admit_usage(
+                &self.engine.tenants,
+                &self.engine.counters,
+                &self.engine.accepting,
+                self.tenant_ids.get(index),
+                event,
+            )
+        }
+
+        pub fn release_tenant(&self, index: usize) {
+            let tenant = &self.engine.tenants[&self.tenant_ids[index]];
+            let usage = tenant
+                .usage
+                .as_ref()
+                .expect("benchmarks use positive-share tenants");
+            let deadline = std::time::Instant::now() + Self::RELEASE_BOUND;
+            while usage.lane.slots.available_permits() < tenant.ingest_share {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "observability benchmark writer did not release tenant capacity within {:?}",
+                    Self::RELEASE_BOUND
+                );
+                std::thread::yield_now();
+            }
+        }
+
+        pub fn saturate_tenant(&self, index: usize) {
+            let tenant = &self.engine.tenants[&self.tenant_ids[index]];
+            let share = u32::try_from(tenant.ingest_share).expect("ingest share fits u32");
+            let permit = tenant
+                .usage
+                .as_ref()
+                .expect("benchmarks use positive-share tenants")
+                .lane
+                .slots
+                .clone()
+                .try_acquire_many_owned(share)
+                .expect("real writer drained the tenant lane before saturation");
+            *self.held_capacity.lock().expect("benchmark capacity lock") = Some(permit);
+        }
+
+        pub fn dropped_capacity(&self) -> u64 {
+            self.engine.counters.drop_capacity.load(Ordering::Relaxed)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn usage_events<'a>(
+        engine: &'a ObservabilityEngine,
+        tenant: &TenantId,
+    ) -> &'a Arc<Mutex<VecDeque<StoredUsage>>> {
+        &engine.tenants[tenant]
+            .usage
+            .as_ref()
+            .expect("test tenant has a positive usage share")
+            .recent_events
+    }
     use routeplane_guardrails::{CheckAction, Hook, Verdict};
     use routeplane_limits::pricing::CostBreakdown;
+
+    fn tid(raw: &str) -> TenantId {
+        TenantId::new(raw).expect("canonical test tenant")
+    }
+
+    fn test_engine() -> ObservabilityEngine {
+        ObservabilityEngine::new(
+            ["t", "t_a", "t_b", "t_own", "t_other"]
+                .into_iter()
+                .map(tid)
+                .collect(),
+        )
+    }
+
+    fn registry(count: usize) -> Vec<TenantId> {
+        (0..count)
+            .map(|index| tid(&format!("tenant_{index:05}")))
+            .collect()
+    }
+
+    fn admission_drop(
+        snapshot: &ObservabilityCapacitySnapshot,
+        resource: ObservabilityAdmissionResource,
+        reason: ObservabilityAdmissionDropReason,
+    ) -> u64 {
+        snapshot.admission_drop(resource, reason)
+    }
+
+    async fn wait_for_owned(engine: &ObservabilityEngine, tenant: &TenantId, count: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if engine
+                .tenants
+                .get(tenant)
+                .and_then(|state| state.usage.as_ref())
+                .and_then(|usage| usage.recent_events.lock().ok().map(|ring| ring.len()))
+                .unwrap_or(0)
+                >= count
+            {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("tenant-owned observability writer did not reach expected count");
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_drop_matrix_attributes_unregistered_full_and_zero_share() {
+        let unknown = tid("unknown");
+        let empty = ObservabilityEngine::new(Vec::new());
+        empty.record_usage(&unknown, tagged_event("spoofed", &[]));
+        let snapshot = empty.capacity_snapshot();
+        assert_eq!(
+            admission_drop(
+                &snapshot,
+                ObservabilityAdmissionResource::UsageIngest,
+                ObservabilityAdmissionDropReason::UnregisteredTenant,
+            ),
+            1
+        );
+        assert_eq!(snapshot.drops_unregistered, 1);
+        empty.shutdown(Duration::from_secs(1)).await;
+
+        let tenant = tid("tenant");
+        let full = ObservabilityEngine::new(vec![tenant.clone()]);
+        let share = full.tenants[&tenant].ingest_share;
+        let reservation = full.tenants[&tenant]
+            .usage
+            .as_ref()
+            .expect("positive-share tenant has usage state")
+            .lane
+            .slots
+            .clone()
+            .acquire_many_owned(u32::try_from(share).expect("share fits u32"))
+            .await
+            .expect("usage lane remains open");
+        full.record_usage(&tenant, tagged_event("spoofed", &[]));
+        let snapshot = full.capacity_snapshot();
+        assert_eq!(
+            admission_drop(
+                &snapshot,
+                ObservabilityAdmissionResource::UsageIngest,
+                ObservabilityAdmissionDropReason::Full,
+            ),
+            1
+        );
+        assert_eq!(snapshot.drops_capacity, 1);
+        drop(reservation);
+        full.shutdown(Duration::from_secs(1)).await;
+
+        let zero_share = ObservabilityEngine::new(registry(MAX_RETAINED_EVENTS + 1));
+        let zero = zero_share
+            .tenant_order
+            .iter()
+            .find(|tenant| zero_share.tenants[*tenant].usage_share == 0)
+            .expect("registry contains a zero-share tenant");
+        zero_share.record_usage(zero, tagged_event("spoofed", &[]));
+        assert_eq!(
+            admission_drop(
+                &zero_share.capacity_snapshot(),
+                ObservabilityAdmissionResource::UsageIngest,
+                ObservabilityAdmissionDropReason::ZeroShare,
+            ),
+            1
+        );
+        zero_share.shutdown(Duration::from_secs(1)).await;
+
+        let closed_tenant = tid("closed");
+        let closed = ObservabilityEngine::new(vec![closed_tenant.clone()]);
+        closed.shutdown(Duration::from_secs(1)).await;
+        closed.record_usage(&closed_tenant, tagged_event("spoofed", &[]));
+        let snapshot = closed.capacity_snapshot();
+        assert_eq!(
+            admission_drop(
+                &snapshot,
+                ObservabilityAdmissionResource::UsageIngest,
+                ObservabilityAdmissionDropReason::Closed,
+            ),
+            1
+        );
+        assert_eq!(snapshot.drops_closed, 1);
+    }
+
+    #[tokio::test]
+    async fn capacity_partition_is_exact_for_zero_one_eight_sixty_four_and_large_registries() {
+        for count in [0, 1, 8, 64, 4_097] {
+            let engine = ObservabilityEngine::new(registry(count));
+            let snapshot = engine.capacity_snapshot();
+            assert_eq!(snapshot.tenant_count, count);
+            assert_eq!(snapshot.usage_ingest_capacity, INGEST_CHANNEL_CAPACITY);
+            assert_eq!(snapshot.usage_retained_capacity, MAX_RETAINED_EVENTS);
+            assert_eq!(
+                snapshot.positive_usage_ingest_share_tenants
+                    + snapshot.zero_usage_ingest_share_tenants,
+                count
+            );
+            assert_eq!(
+                snapshot.positive_usage_retained_share_tenants
+                    + snapshot.zero_usage_retained_share_tenants,
+                count
+            );
+            assert_eq!(
+                snapshot.min_usage_ingest_share,
+                if count == 0 {
+                    0
+                } else {
+                    (INGEST_CHANNEL_CAPACITY / count).max(1)
+                }
+            );
+            assert_eq!(
+                snapshot.min_usage_retained_share,
+                if count == 0 {
+                    0
+                } else {
+                    (MAX_RETAINED_EVENTS / count).max(1)
+                }
+            );
+            for (sum, capacity) in [
+                (
+                    engine
+                        .tenants
+                        .values()
+                        .map(|tenant| tenant.ingest_share)
+                        .sum::<usize>(),
+                    INGEST_CHANNEL_CAPACITY,
+                ),
+                (
+                    engine
+                        .tenants
+                        .values()
+                        .map(|tenant| tenant.usage_share)
+                        .sum::<usize>(),
+                    MAX_RETAINED_EVENTS,
+                ),
+            ] {
+                assert_eq!(sum, if count == 0 { 0 } else { capacity });
+            }
+            assert_eq!(
+                engine
+                    .tenants
+                    .values()
+                    .filter(|tenant| tenant.usage.is_some())
+                    .count(),
+                engine
+                    .tenants
+                    .values()
+                    .filter(|tenant| tenant.ingest_share > 0 && tenant.usage_share > 0)
+                    .count()
+            );
+            for tenant in engine.tenants.values() {
+                assert_eq!(
+                    tenant.usage.is_some(),
+                    tenant.ingest_share > 0 && tenant.usage_share > 0
+                );
+            }
+            if count == 0 {
+                assert!(engine.writer_task.lock().unwrap().is_none());
+            }
+            engine.shutdown(Duration::from_secs(1)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_share_tenants_reject_without_mutable_surface_state() {
+        for count in [1_001, 4_097] {
+            let ids = registry(count);
+            let engine = ObservabilityEngine::new(ids);
+            let zero = engine
+                .tenant_order
+                .iter()
+                .find(|tenant| engine.tenants[*tenant].usage_share == 0)
+                .cloned()
+                .expect("boundary registry contains a zero-retention tenant");
+            let before = engine.capacity_snapshot();
+            engine.record_usage(&zero, tagged_event("spoofed", &[]));
+            let after = engine.capacity_snapshot();
+            assert_eq!(after.drops_capacity - before.drops_capacity, 1);
+            assert_eq!(after.drops_closed, before.drops_closed);
+            assert!(engine.recent_events_owned(&zero).is_empty());
+            assert!(engine.tenants[&zero].usage.is_none());
+            engine.shutdown(Duration::from_secs(1)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_surfaces_are_bounded_at_zero_one_eight_and_sixty_four_tenants() {
+        for count in [0, 1, 8, 64] {
+            let ids = registry(count);
+            let engine = ObservabilityEngine::new(ids.clone());
+            for (actual, capacity, resource) in [
+                (
+                    engine
+                        .tenants
+                        .values()
+                        .map(|tenant| tenant.ingest_share)
+                        .sum::<usize>(),
+                    INGEST_CHANNEL_CAPACITY,
+                    "usage_ingest",
+                ),
+                (
+                    engine
+                        .tenants
+                        .values()
+                        .map(|tenant| tenant.usage_share)
+                        .sum::<usize>(),
+                    MAX_RETAINED_EVENTS,
+                    "usage_retained",
+                ),
+            ] {
+                assert_eq!(
+                    actual,
+                    if count == 0 { 0 } else { capacity },
+                    "{resource} shares must exactly partition the fixed envelope at N={count}"
+                );
+            }
+            if count == 0 {
+                assert!(engine.get_recent_events().is_empty());
+                engine.shutdown(Duration::from_secs(1)).await;
+                continue;
+            }
+
+            let noisy = &ids[0];
+            let quiet = &ids[count - 1];
+
+            let usage_share = engine.tenants[noisy].usage_share;
+            for index in 0..(usage_share + 8) {
+                engine.record_usage(
+                    noisy,
+                    tagged_event("spoofed", &[("usage", &index.to_string())]),
+                );
+            }
+            wait_for_owned(&engine, noisy, usage_share).await;
+            assert_eq!(engine.recent_events_owned(noisy).len(), usage_share);
+            if count > 1 {
+                engine.record_usage(quiet, tagged_event("spoofed", &[("usage", "quiet")]));
+                wait_for_owned(&engine, quiet, 1).await;
+                assert_eq!(engine.recent_events_owned(quiet).len(), 1);
+            }
+
+            engine.shutdown(Duration::from_secs(1)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quiet_usage_tenant_is_served_within_one_active_tenant_round() {
+        for count in [8, 64] {
+            let ids = registry(count);
+            let noisy = ids[0].clone();
+            let quiet = ids[count - 1].clone();
+            let engine = ObservabilityEngine::new(ids);
+            let noisy_ring = Arc::clone(usage_events(&engine, &noisy));
+            let noisy_guard = noisy_ring.lock().unwrap();
+
+            for index in 0..16 {
+                engine.record_usage(
+                    &noisy,
+                    tagged_event("spoofed", &[("usage", &index.to_string())]),
+                );
+            }
+            engine.record_usage(&quiet, tagged_event("spoofed", &[("usage", "quiet")]));
+            drop(noisy_guard);
+
+            wait_for_owned(&engine, &quiet, 1).await;
+            let quiet_sequence = usage_events(&engine, &quiet)
+                .lock()
+                .unwrap()
+                .front()
+                .expect("quiet event retained")
+                .sequence;
+            assert_eq!(
+                quiet_sequence, 1,
+                "quiet tenant must run after at most one event from the already-active noisy lane"
+            );
+            engine.shutdown(Duration::from_secs(1)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_saturation_is_non_borrowable_and_quiet_tenant_is_served() {
+        let a = tid("t_a");
+        let b = tid("t_b");
+        let engine = ObservabilityEngine::new(vec![b.clone(), a.clone(), a.clone()]);
+        let a_share = engine.tenants[&a].usage_share;
+        for index in 0..(a_share + 32) {
+            engine.record_usage(
+                &a,
+                UsageEvent::success(
+                    "spoofed".into(),
+                    format!("a_{index}"),
+                    "openai".into(),
+                    "m".into(),
+                    1,
+                    1,
+                    2,
+                    None,
+                    false,
+                ),
+            );
+        }
+        engine.record_usage(
+            &b,
+            UsageEvent::success(
+                "spoofed".into(),
+                "quiet_b".into(),
+                "openai".into(),
+                "m".into(),
+                1,
+                1,
+                2,
+                None,
+                false,
+            ),
+        );
+        wait_for_owned(&engine, &b, 1).await;
+        let b_events: Vec<_> = engine.tenants[&b]
+            .usage
+            .as_ref()
+            .unwrap()
+            .recent_events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|stored| stored.event.clone())
+            .collect();
+        assert_eq!(b_events.len(), 1);
+        assert_eq!(b_events[0].virtual_key_name, "quiet_b");
+        assert_eq!(b_events[0].tenant_id, "t_b", "typed authority stamps owner");
+        wait_for_owned(&engine, &a, a_share).await;
+        assert_eq!(
+            engine.tenants[&a]
+                .usage
+                .as_ref()
+                .unwrap()
+                .recent_events
+                .lock()
+                .unwrap()
+                .len(),
+            a_share
+        );
+        assert_eq!(
+            engine.tenants[&b]
+                .usage
+                .as_ref()
+                .unwrap()
+                .recent_events
+                .lock()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn full_share_drop_accounting_is_exact() {
+        let tenant = tid("t_a");
+        let engine = ObservabilityEngine::new(vec![tenant.clone()]);
+        let share = engine.tenants[&tenant].ingest_share;
+        let reservation = engine.tenants[&tenant]
+            .usage
+            .as_ref()
+            .unwrap()
+            .lane
+            .slots
+            .clone()
+            .acquire_many_owned(u32::try_from(share).expect("share fits u32"))
+            .await
+            .expect("tenant lane remains open");
+        let before = engine.capacity_snapshot().drops_capacity;
+        for index in 0..257 {
+            engine.record_usage(
+                &tenant,
+                tagged_event("spoofed", &[("i", &index.to_string())]),
+            );
+        }
+        assert_eq!(engine.capacity_snapshot().drops_capacity - before, 257);
+        assert!(engine.recent_events_owned(&tenant).is_empty());
+        drop(reservation);
+        engine.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_drain_to_empty_and_reenqueue_never_loses_a_wakeup() {
+        let tenant = tid("t_a");
+        let engine = ObservabilityEngine::new(vec![tenant.clone()]);
+        for round in 0..128 {
+            engine.record_usage(
+                &tenant,
+                UsageEvent::success(
+                    "wrong".into(),
+                    format!("round_{round}"),
+                    "openai".into(),
+                    "m".into(),
+                    1,
+                    1,
+                    2,
+                    None,
+                    false,
+                ),
+            );
+            wait_for_owned(&engine, &tenant, round + 1).await;
+        }
+        let events = engine.tenants[&tenant]
+            .usage
+            .as_ref()
+            .unwrap()
+            .recent_events
+            .lock()
+            .unwrap();
+        assert_eq!(events.len(), 128);
+        assert_eq!(events.back().unwrap().event.virtual_key_name, "round_127");
+    }
+
+    #[tokio::test]
+    async fn legacy_display_name_collision_and_unknown_authority_are_inert() {
+        let owner = tid("t_a");
+        let engine = ObservabilityEngine::new(vec![owner.clone()]);
+        let legacy_display = tid("legacy_display");
+        engine.record_usage(
+            &legacy_display,
+            tagged_event(owner.as_str(), &[("attempt", "collision")]),
+        );
+        tokio::task::yield_now().await;
+        assert!(engine.tenants[&owner]
+            .usage
+            .as_ref()
+            .unwrap()
+            .recent_events
+            .lock()
+            .unwrap()
+            .is_empty());
+        let snapshot = engine.capacity_snapshot();
+        assert_eq!(snapshot.drops_unregistered, 1);
+        assert_eq!(snapshot.drops_capacity, 0);
+        assert_eq!(snapshot.drops_closed, 0);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_dispatches_retains_and_settles_accepted_queue() {
+        let a = tid("t_a");
+        let engine = Arc::new(ObservabilityEngine::new(vec![a.clone()]));
+        let ring = Arc::clone(&engine.tenants[&a].usage.as_ref().unwrap().recent_events);
+        // Hold the reader lock so the writer cannot retain early: every accepted
+        // record below is queued or in-flight when shutdown begins.
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let reader = std::thread::spawn(move || {
+            let _guard = ring.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.recv().unwrap();
+        for index in 0..32 {
+            engine.record_usage(&a, tagged_event("wrong", &[("i", &index.to_string())]));
+        }
+        let shutdown_engine = Arc::clone(&engine);
+        let shutdown = tokio::spawn(async move {
+            shutdown_engine.shutdown(Duration::from_secs(1)).await;
+        });
+        loop {
+            if !engine.accepting.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        release_tx.send(()).unwrap();
+        reader.join().unwrap();
+        shutdown.await.unwrap();
+
+        assert_eq!(engine.recent_events_owned(&a).len(), 32);
+        assert_eq!(engine.counters.usage_dispatches.load(Ordering::Relaxed), 32);
+        assert_eq!(engine.capacity_snapshot().drops_closed, 0);
+        assert_eq!(
+            engine.tenants[&a]
+                .usage
+                .as_ref()
+                .unwrap()
+                .lane
+                .slots
+                .available_permits(),
+            engine.tenants[&a].ingest_share
+        );
+        assert!(engine.writer_task.lock().unwrap().is_none());
+
+        // The producer is closed after Axum's request drain. Any later attempt
+        // is explicitly settled as Closed and can never reach OTLP or retention.
+        engine.record_usage(&a, tagged_event("wrong", &[]));
+        assert_eq!(engine.capacity_snapshot().drops_closed, 1);
+        assert_eq!(engine.recent_events_owned(&a).len(), 32);
+        assert_eq!(engine.counters.usage_dispatches.load(Ordering::Relaxed), 32);
+
+        let value = serde_json::to_value(engine.capacity_snapshot()).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 13);
+        assert!(!value.to_string().contains("t_a"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_producers_and_shutdown_settle_every_event_once() {
+        let tenant = tid("t_a");
+        let engine = Arc::new(ObservabilityEngine::new(vec![tenant.clone()]));
+        let attempts = 4 * 400;
+        let mut producers = Vec::new();
+        for producer in 0..4 {
+            let engine = Arc::clone(&engine);
+            let tenant = tenant.clone();
+            producers.push(tokio::spawn(async move {
+                for index in 0..400 {
+                    engine.record_usage(
+                        &tenant,
+                        tagged_event("spoofed", &[("p", &format!("{producer}-{index}"))]),
+                    );
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        tokio::task::yield_now().await;
+        engine.shutdown(Duration::from_secs(1)).await;
+        for producer in producers {
+            producer.await.unwrap();
+        }
+        let snapshot = engine.capacity_snapshot();
+        let retained = engine.recent_events_owned(&tenant).len() as u64;
+        assert_eq!(
+            retained + snapshot.usage_evictions + snapshot.drops_capacity + snapshot.drops_closed,
+            attempts
+        );
+        assert_eq!(
+            engine.tenants[&tenant]
+                .usage
+                .as_ref()
+                .unwrap()
+                .lane
+                .slots
+                .available_permits(),
+            engine.tenants[&tenant].ingest_share
+        );
+        assert!(engine.writer_task.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn deadline_aborts_writer_and_settles_queue_without_leaking_permits() {
+        let tenant = tid("t_a");
+        let engine = ObservabilityEngine::new(vec![tenant.clone()]);
+        let ring = Arc::clone(
+            &engine.tenants[&tenant]
+                .usage
+                .as_ref()
+                .unwrap()
+                .recent_events,
+        );
+        // Force the writer to yield in the cancellation-safe retention loop.
+        // A zero deadline must abort it, drop the receivers, and settle both the
+        // in-flight item and the rest of the accepted queue as Closed.
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let reader = std::thread::spawn(move || {
+            let _guard = ring.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.recv().unwrap();
+        for index in 0..128 {
+            engine.record_usage(
+                &tenant,
+                tagged_event("spoofed", &[("i", &index.to_string())]),
+            );
+        }
+        let started = std::time::Instant::now();
+        engine.shutdown(Duration::ZERO).await;
+        assert!(started.elapsed() < Duration::from_millis(100));
+        release_tx.send(()).unwrap();
+        reader.join().unwrap();
+
+        let snapshot = engine.capacity_snapshot();
+        assert_eq!(engine.recent_events_owned(&tenant).len(), 0);
+        assert_eq!(snapshot.usage_evictions, 0);
+        assert_eq!(snapshot.drops_closed, 128);
+        assert_eq!(
+            engine.tenants[&tenant]
+                .usage
+                .as_ref()
+                .unwrap()
+                .lane
+                .slots
+                .available_permits(),
+            engine.tenants[&tenant].ingest_share
+        );
+        assert!(engine.writer_task.lock().unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reader_contention_waits_then_retains_without_closed_drop() {
+        let tenant = tid("t_a");
+        let engine = ObservabilityEngine::new(vec![tenant.clone()]);
+        let ring = Arc::clone(
+            &engine.tenants[&tenant]
+                .usage
+                .as_ref()
+                .unwrap()
+                .recent_events,
+        );
+        let guard = ring.lock().unwrap();
+        engine.record_usage(&tenant, tagged_event("spoofed", &[]));
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(engine.capacity_snapshot().drops_closed, 0);
+        drop(guard);
+        wait_for_owned(&engine, &tenant, 1).await;
+        assert_eq!(engine.recent_events_owned(&tenant).len(), 1);
+        assert_eq!(engine.capacity_snapshot().drops_closed, 0);
+        engine.shutdown(Duration::from_secs(1)).await;
+    }
 
     fn outcome() -> CheckOutcome {
         CheckOutcome {
@@ -1933,12 +3268,74 @@ mod tests {
         }
     }
 
+    fn tagged_event(tenant: &str, _pairs: &[(&str, &str)]) -> UsageEvent {
+        UsageEvent::success(
+            tenant.into(),
+            "k".into(),
+            "openai".into(),
+            "gpt-4o".into(),
+            1,
+            1,
+            2,
+            None,
+            false,
+        )
+    }
+
+    fn push_stored(ring: &mut VecDeque<StoredUsage>, event: UsageEvent) {
+        let sequence = ring.back().map_or(0, |stored| stored.sequence + 1);
+        ring.push_back(StoredUsage { sequence, event });
+    }
+
+    #[test]
+    fn usage_errors_are_closed_vocabulary_before_they_reach_any_sink() {
+        let secret = "synthetic-provider-secret";
+        let failure = UsageEvent::failure(
+            "t".into(),
+            "k".into(),
+            "provider".into(),
+            "model".into(),
+            None,
+            false,
+            format!("upstream echoed Authorization: Bearer {secret}"),
+        );
+        assert_eq!(failure.error.as_deref(), Some("upstream_error"));
+        assert!(!serde_json::to_string(&failure).unwrap().contains(secret));
+
+        let stream = UsageEvent::success(
+            "t".into(),
+            "k".into(),
+            "provider".into(),
+            "model".into(),
+            1,
+            1,
+            2,
+            None,
+            false,
+        )
+        .with_stream_error(Some(format!("malformed chunk {secret}")));
+        assert_eq!(stream.error.as_deref(), Some("stream_error"));
+        assert!(!serde_json::to_string(&stream).unwrap().contains(secret));
+
+        let sovereign = UsageEvent::failure(
+            "t".into(),
+            "k".into(),
+            "(sovereign_block)".into(),
+            "model".into(),
+            Some("IN".into()),
+            true,
+            "sovereign_block".into(),
+        );
+        assert_eq!(sovereign.error.as_deref(), Some("sovereign_block"));
+    }
+
     #[test]
     fn guardrails_field_is_omitted_when_absent_byte_identical() {
         // Ship-dark guarantee at the event layer: an event with no guardrail
         // outcomes serializes WITHOUT the `guardrails` key — byte-identical to
         // the pre-G2.6 wire shape.
         let e = UsageEvent::success(
+            "t".into(),
             "k".into(),
             "openai".into(),
             "gpt-4o".into(),
@@ -1953,6 +3350,7 @@ mod tests {
 
         // with_guardrails(empty) must also attach nothing.
         let e2 = UsageEvent::success(
+            "t".into(),
             "k".into(),
             "openai".into(),
             "gpt-4o".into(),
@@ -1972,6 +3370,7 @@ mod tests {
     #[test]
     fn with_guardrails_attaches_outcomes() {
         let e = UsageEvent::success(
+            "t".into(),
             "k".into(),
             "openai".into(),
             "gpt-4o".into(),
@@ -1991,8 +3390,14 @@ mod tests {
     #[cfg(feature = "enterprise")]
     #[test]
     fn guardrails_block_event_shape() {
-        let e =
-            UsageEvent::guardrails_block("k".into(), "gpt-4o".into(), None, false, vec![outcome()]);
+        let e = UsageEvent::guardrails_block(
+            "t".into(),
+            "k".into(),
+            "gpt-4o".into(),
+            None,
+            false,
+            vec![outcome()],
+        );
         assert_eq!(e.provider, "(guardrails_denied)");
         assert!(!e.success);
         assert_eq!(e.error.as_deref(), Some("guardrails_denied"));
@@ -2005,20 +3410,25 @@ mod tests {
     async fn usage_summary_aggregates_recent_ring() {
         // Push directly into the ring (the test is the writer) so the aggregation
         // is exercised deterministically, without racing the async drain task.
-        let engine = ObservabilityEngine::new();
+        let engine = test_engine();
         {
-            let mut ring = engine.recent_events.lock().unwrap();
-            ring.push_back(UsageEvent::success(
-                "k".into(),
-                "openai".into(),
-                "gpt-4o".into(),
-                1,
-                2,
-                3,
-                None,
-                false,
-            ));
+            let mut ring = usage_events(&engine, &tid("t")).lock().unwrap();
+            push_stored(
+                &mut ring,
+                UsageEvent::success(
+                    "t".into(),
+                    "k".into(),
+                    "openai".into(),
+                    "gpt-4o".into(),
+                    1,
+                    2,
+                    3,
+                    None,
+                    false,
+                ),
+            );
             let mut cache_hit = UsageEvent::success(
+                "t".into(),
                 "k".into(),
                 "openai".into(),
                 "gpt-4o".into(),
@@ -2029,27 +3439,34 @@ mod tests {
                 false,
             );
             cache_hit.cache_hit = Some(true);
-            ring.push_back(cache_hit);
-            ring.push_back(UsageEvent::failure(
-                "k".into(),
-                "anthropic".into(),
-                "claude".into(),
-                None,
-                false,
-                "boom".into(),
-            ));
-            ring.push_back(UsageEvent::sovereign_block(
-                "k".into(),
-                "m".into(),
-                Some("IN".into()),
-            ));
-            ring.push_back(UsageEvent::guardrails_block(
-                "k".into(),
-                "m".into(),
-                None,
-                false,
-                vec![outcome()],
-            ));
+            push_stored(&mut ring, cache_hit);
+            push_stored(
+                &mut ring,
+                UsageEvent::failure(
+                    "t".into(),
+                    "k".into(),
+                    "anthropic".into(),
+                    "claude".into(),
+                    None,
+                    false,
+                    "boom".into(),
+                ),
+            );
+            push_stored(
+                &mut ring,
+                UsageEvent::sovereign_block("t".into(), "k".into(), "m".into(), Some("IN".into())),
+            );
+            push_stored(
+                &mut ring,
+                UsageEvent::guardrails_block(
+                    "t".into(),
+                    "k".into(),
+                    "m".into(),
+                    None,
+                    false,
+                    vec![outcome()],
+                ),
+            );
         }
 
         let s = engine.usage_summary();
@@ -2072,12 +3489,14 @@ mod tests {
 
     #[tokio::test]
     async fn cache_savings_sums_estimate_and_tokens_over_owned_hits() {
-        let engine = ObservabilityEngine::new();
+        let engine = test_engine();
         {
-            let mut ring = engine.recent_events.lock().unwrap();
+            let mut ring = usage_events(&engine, &tid("t")).lock().unwrap();
             // Two served cache hits on the tenant's key.
-            ring.push_back(
+            push_stored(
+                &mut ring,
                 UsageEvent::success(
+                    "t".into(),
                     "k".into(),
                     "(cache)".into(),
                     "gpt-4o".into(),
@@ -2089,8 +3508,10 @@ mod tests {
                 )
                 .with_cache_hit(Some("default".into()), 4_321),
             );
-            ring.push_back(
+            push_stored(
+                &mut ring,
                 UsageEvent::success(
+                    "t".into(),
                     "k".into(),
                     "(semantic-cache)".into(),
                     "gpt-4o".into(),
@@ -2103,8 +3524,10 @@ mod tests {
                 .with_cache_hit(Some("default".into()), 6_000),
             );
             // A cache miss (participating, not a hit).
-            ring.push_back(
+            push_stored(
+                &mut ring,
                 UsageEvent::success(
+                    "t".into(),
                     "k".into(),
                     "openai".into(),
                     "gpt-4o".into(),
@@ -2116,10 +3539,14 @@ mod tests {
                 )
                 .with_cache_status(Some("miss"), Some("default".into())),
             );
-            // Another tenant's hit — excluded by key ownership.
-            ring.push_back(
+            // Another tenant's hit — SAME key name "k" but a DIFFERENT tenant_id,
+            // so it must be excluded (this is the cross-tenant leak the fix closes:
+            // a name match would have leaked it into this tenant's savings).
+            push_stored(
+                &mut ring,
                 UsageEvent::success(
-                    "k_other".into(),
+                    "t_other".into(),
+                    "k".into(),
                     "(cache)".into(),
                     "gpt-4o".into(),
                     5,
@@ -2132,8 +3559,7 @@ mod tests {
             );
         }
 
-        let keys = std::collections::BTreeSet::from(["k".to_string()]);
-        let report = engine.cache_savings(&keys, chrono::Duration::minutes(60));
+        let report = engine.cache_savings(&tid("t"), chrono::Duration::minutes(60));
         assert_eq!(report.cache_hits, 2);
         assert_eq!(report.cacheable_lookups, 3); // two hits + one miss
         assert_eq!(report.saved_cost_micro_usd, 4_321 + 6_000);
@@ -2142,9 +3568,8 @@ mod tests {
 
     #[tokio::test]
     async fn cache_savings_empty_is_honest_zero() {
-        let engine = ObservabilityEngine::new();
-        let keys = std::collections::BTreeSet::from(["k".to_string()]);
-        let report = engine.cache_savings(&keys, chrono::Duration::minutes(60));
+        let engine = test_engine();
+        let report = engine.cache_savings(&tid("t"), chrono::Duration::minutes(60));
         // The window is reported honestly; the savings are all zero (no hits).
         assert_eq!(report.window_secs, 3600);
         assert_eq!(report.cache_hits, 0);
@@ -2158,6 +3583,7 @@ mod tests {
     fn guardrails_output_denied_keeps_real_token_counts() {
         // FinOps accuracy: an output denial still consumed upstream tokens.
         let e = UsageEvent::guardrails_output_denied(
+            "t".into(),
             "k".into(),
             "openai".into(),
             "gpt-4o".into(),
@@ -2180,6 +3606,7 @@ mod tests {
         // AC-7 at the event layer: a request with no cache config serializes
         // WITHOUT any cache key — byte-identical to the pre-G2.5 wire shape.
         let e = UsageEvent::success(
+            "t".into(),
             "k".into(),
             "openai".into(),
             "gpt-4o".into(),
@@ -2204,6 +3631,7 @@ mod tests {
     #[test]
     fn cache_hit_event_records_stored_usage_and_saved_cost() {
         let e = UsageEvent::success(
+            "t".into(),
             "k".into(),
             "(cache)".into(),
             "gpt-4o".into(),
@@ -2227,6 +3655,7 @@ mod tests {
     #[test]
     fn cache_miss_and_bypass_annotations() {
         let miss = UsageEvent::success(
+            "t".into(),
             "k".into(),
             "openai".into(),
             "gpt-4o".into(),
@@ -2243,6 +3672,7 @@ mod tests {
         assert!(v.get("estimated_saved_cost_micro_usd").is_none());
 
         let bypass = UsageEvent::success(
+            "t".into(),
             "k".into(),
             "openai".into(),
             "gpt-4o".into(),
@@ -2263,6 +3693,7 @@ mod tests {
     fn prompt_fields_omitted_on_non_prompt_events_byte_identical() {
         // A chat/embeddings success event must NOT carry any prompt_* key.
         let e = UsageEvent::success(
+            "t".into(),
             "k".into(),
             "openai".into(),
             "gpt-4o".into(),
@@ -2283,6 +3714,7 @@ mod tests {
         // AC-10: the concrete integer version is recorded even when referenced by
         // label, and the label is carried alongside.
         let e = UsageEvent::prompt_render(
+            "t".into(),
             "k".into(),
             "gpt-4o".into(),
             "prompt_greeting".into(),
@@ -2308,6 +3740,7 @@ mod tests {
         // None) must carry no prompt_variant — and never a prompt_experiment,
         // which the ADR-152 cutover retired from the wire entirely.
         let e = UsageEvent::prompt_render(
+            "t".into(),
             "k".into(),
             "gpt-4o".into(),
             "prompt_x".into(),
@@ -2328,6 +3761,7 @@ mod tests {
     #[test]
     fn with_variant_attaches_the_served_label() {
         let e = UsageEvent::prompt_render(
+            "t".into(),
             "k".into(),
             "gpt-4o".into(),
             "prompt_x".into(),
@@ -2338,9 +3772,9 @@ mod tests {
         )
         .with_variant(Some("casual".into()));
         let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["prompt_variant"], "casual");
         // The retired experiment field never reappears on the wire.
         assert!(v.get("prompt_experiment").is_none());
-        assert_eq!(v["prompt_variant"], "casual");
         // The served concrete version is still the base field.
         assert_eq!(v["prompt_version"], 3);
         // A split-resolved render carries no static label.
@@ -2351,6 +3785,7 @@ mod tests {
     fn variant_field_absent_on_non_prompt_events() {
         // A regular chat success event never gains the split fields.
         let e = UsageEvent::success(
+            "t".into(),
             "k".into(),
             "openai".into(),
             "gpt-4o".into(),
@@ -2372,6 +3807,7 @@ mod tests {
         // A success event with no latency attached must NOT carry `latency_ms` —
         // byte-identical to the pre-latency wire shape (A/B parity guard).
         let e = UsageEvent::success(
+            "t".into(),
             "k".into(),
             "openai".into(),
             "gpt-4o".into(),
@@ -2390,6 +3826,7 @@ mod tests {
     #[test]
     fn with_latency_attaches_value() {
         let e = UsageEvent::success(
+            "t".into(),
             "k".into(),
             "openai".into(),
             "gpt-4o".into(),
@@ -2439,12 +3876,14 @@ mod tests {
 
     #[tokio::test]
     async fn latency_stats_aggregates_overall_and_per_provider() {
-        let engine = ObservabilityEngine::new();
+        let engine = test_engine();
         {
-            let mut ring = engine.recent_events.lock().unwrap();
+            let mut ring = usage_events(&engine, &tid("t")).lock().unwrap();
             for ms in [10u64, 20, 30] {
-                ring.push_back(
+                push_stored(
+                    &mut ring,
                     UsageEvent::success(
+                        "t".into(),
                         "k".into(),
                         "openai".into(),
                         "gpt-4o".into(),
@@ -2457,8 +3896,10 @@ mod tests {
                     .with_latency(ms),
                 );
             }
-            ring.push_back(
+            push_stored(
+                &mut ring,
                 UsageEvent::success(
+                    "t".into(),
                     "k".into(),
                     "anthropic".into(),
                     "claude".into(),
@@ -2471,29 +3912,121 @@ mod tests {
                 .with_latency(100),
             );
             // Synthetic sentinel + a timed-less event must be excluded.
-            ring.push_back(UsageEvent::sovereign_block(
-                "k".into(),
-                "m".into(),
-                Some("IN".into()),
-            ));
-            ring.push_back(UsageEvent::failure(
-                "k".into(),
-                "openai".into(),
-                "gpt-4o".into(),
-                None,
-                false,
-                "boom".into(),
-            ));
+            push_stored(
+                &mut ring,
+                UsageEvent::sovereign_block("t".into(), "k".into(), "m".into(), Some("IN".into())),
+            );
+            push_stored(
+                &mut ring,
+                UsageEvent::failure(
+                    "t".into(),
+                    "k".into(),
+                    "openai".into(),
+                    "gpt-4o".into(),
+                    None,
+                    false,
+                    "boom".into(),
+                ),
+            );
+            // Another tenant's timed attempt that SHARES the caller's key name "k"
+            // but has a DIFFERENT tenant_id — the exact cross-tenant leak this closes.
+            // A distinctive provider lets us assert it never surfaces; under the old
+            // unscoped `latency_stats` it WOULD have inflated `overall` and added a
+            // `leaked_provider` bucket.
+            push_stored(
+                &mut ring,
+                UsageEvent::success(
+                    "t_other".into(),
+                    "k".into(),
+                    "leaked_provider".into(),
+                    "gpt-4o".into(),
+                    1,
+                    2,
+                    3,
+                    None,
+                    false,
+                )
+                .with_latency(999),
+            );
         }
 
-        let report = engine.latency_stats();
-        // Overall: 4 timed samples (10,20,30,100).
+        let report = engine.latency_stats(&tid("t"));
+        // Overall: 4 timed samples (10,20,30,100) — the foreign same-named 999 excluded.
         assert_eq!(report.overall.count, 4);
         assert_eq!(report.overall.max_ms, Some(100));
         // Per-provider split; sentinel/untimed excluded.
         assert_eq!(report.by_provider.get("openai").unwrap().count, 3);
         assert_eq!(report.by_provider.get("anthropic").unwrap().count, 1);
         assert!(!report.by_provider.contains_key("(sovereign_block)"));
+        // The same-named foreign tenant's attempt never surfaces (tenant isolation).
+        assert!(!report.by_provider.contains_key("leaked_provider"));
+    }
+
+    #[tokio::test]
+    async fn latency_stats_isolates_two_tenants_that_share_a_key_name() {
+        // Two tenants each own a key named "prod" (names are caller-chosen with no
+        // uniqueness guard). `/analytics/latency` must fold each tenant's latency over
+        // its OWN events only, scoped by the stamped `tenant_id` — never the collidable
+        // key name. Mirrors the bidirectional same-key-name isolation idiom.
+        let engine = test_engine();
+        {
+            let mut ring = usage_events(&engine, &tid("t_a")).lock().unwrap();
+            push_stored(
+                &mut ring,
+                UsageEvent::success(
+                    "t_a".into(),
+                    "prod".into(),
+                    "openai".into(),
+                    "gpt-4o".into(),
+                    1,
+                    2,
+                    3,
+                    None,
+                    false,
+                )
+                .with_latency(10),
+            );
+        }
+        {
+            let mut ring = usage_events(&engine, &tid("t_b")).lock().unwrap();
+            push_stored(
+                &mut ring,
+                UsageEvent::success(
+                    "t_b".into(),
+                    "prod".into(),
+                    "anthropic".into(),
+                    "claude".into(),
+                    1,
+                    2,
+                    3,
+                    None,
+                    false,
+                )
+                .with_latency(500),
+            );
+        }
+
+        // Tenant A sees only its own 10ms openai sample.
+        let a = engine.latency_stats(&tid("t_a"));
+        assert_eq!(a.overall.count, 1);
+        assert_eq!(a.overall.max_ms, Some(10));
+        assert!(a.by_provider.contains_key("openai"));
+        assert!(
+            !a.by_provider.contains_key("anthropic"),
+            "tenant B's provider must not leak to A through the shared key name"
+        );
+
+        // Tenant B sees only its own 500ms anthropic sample (the mirror).
+        let b = engine.latency_stats(&tid("t_b"));
+        assert_eq!(b.overall.count, 1);
+        assert_eq!(b.overall.max_ms, Some(500));
+        assert!(b.by_provider.contains_key("anthropic"));
+        assert!(!b.by_provider.contains_key("openai"));
+
+        // A tenant with no events sees an empty report (honest zero).
+        let none = engine.latency_stats(&tid("t_absent"));
+        assert_eq!(none.overall.count, 0);
+        assert!(none.by_provider.is_empty());
     }
 
     // --- FinOps chargeback (PRD-008 FR-24) -------------------------------------
@@ -2509,13 +4042,15 @@ mod tests {
 
     #[tokio::test]
     async fn chargeback_is_tenant_isolated_and_aggregates_by_model_and_key() {
-        let engine = ObservabilityEngine::new();
+        let engine = test_engine();
         {
-            let mut ring = engine.recent_events.lock().unwrap();
+            let mut ring = usage_events(&engine, &tid("t")).lock().unwrap();
             // Two events on the requesting tenant's keys (k_acme_a, k_acme_b),
             // across two models and two currencies.
-            ring.push_back(
+            push_stored(
+                &mut ring,
                 UsageEvent::success(
+                    "t".into(),
                     "k_acme_a".into(),
                     "openai".into(),
                     "gpt-4o".into(),
@@ -2527,8 +4062,10 @@ mod tests {
                 )
                 .with_cost(cost(2_000, "USD", 200)),
             );
-            ring.push_back(
+            push_stored(
+                &mut ring,
                 UsageEvent::success(
+                    "t".into(),
                     "k_acme_b".into(),
                     "gemini".into(),
                     "gemini-pro".into(),
@@ -2541,17 +4078,24 @@ mod tests {
                 .with_cost(cost(3_000, "INR", 24)),
             );
             // A failure on an owned key still counts as a request (not a success).
-            ring.push_back(UsageEvent::failure(
-                "k_acme_a".into(),
-                "openai".into(),
-                "gpt-4o".into(),
-                None,
-                false,
-                "boom".into(),
-            ));
-            // Another tenant's key — MUST be excluded (isolation).
-            ring.push_back(
+            push_stored(
+                &mut ring,
+                UsageEvent::failure(
+                    "t".into(),
+                    "k_acme_a".into(),
+                    "openai".into(),
+                    "gpt-4o".into(),
+                    None,
+                    false,
+                    "boom".into(),
+                ),
+            );
+            // Another tenant's event — a DIFFERENT tenant_id — MUST be excluded
+            // (isolation is by the stamped tenant_id, not the key name).
+            push_stored(
+                &mut ring,
                 UsageEvent::success(
+                    "t_other".into(),
                     "k_other".into(),
                     "openai".into(),
                     "gpt-4o".into(),
@@ -2563,22 +4107,45 @@ mod tests {
                 )
                 .with_cost(cost(9_999, "USD", 999)),
             );
+            // Another tenant's event that SHARES the caller's owned key name
+            // "k_acme_a" — the exact leak this fix closes. Under the removed
+            // name-based scoping "k_acme_a" was in the owned-name set, so this
+            // foreign spend/tokens would have leaked into the report (and inflated
+            // by_key["k_acme_a"] to 3 requests). Scoping on the stamped tenant_id
+            // excludes it despite the identical name.
+            push_stored(
+                &mut ring,
+                UsageEvent::success(
+                    "t_other".into(),
+                    "k_acme_a".into(),
+                    "openai".into(),
+                    "gpt-4o".into(),
+                    77,
+                    77,
+                    154,
+                    None,
+                    true,
+                )
+                .with_cost(cost(7_777, "USD", 777)),
+            );
             // Synthetic sentinel on an owned key — no chargeable spend, excluded.
-            ring.push_back(UsageEvent::sovereign_block(
-                "k_acme_a".into(),
-                "m".into(),
-                Some("IN".into()),
-            ));
+            push_stored(
+                &mut ring,
+                UsageEvent::sovereign_block(
+                    "t".into(),
+                    "k_acme_a".into(),
+                    "m".into(),
+                    Some("IN".into()),
+                ),
+            );
         }
 
-        let owned: std::collections::BTreeSet<String> =
-            ["k_acme_a".to_string(), "k_acme_b".to_string()]
-                .into_iter()
-                .collect();
-        let report = engine.chargeback(&owned);
+        let report = engine.chargeback(&tid("t"));
 
-        // Window is the full ring (5); only 3 real events belong to this tenant.
-        assert_eq!(report.window, 5);
+        // Window is this tenant's isolated ring view (4); the two deliberately
+        // misplaced foreign events — including the same-named one — are excluded
+        // before both the window and chargeback fold are computed.
+        assert_eq!(report.window, 4);
         assert_eq!(report.events_matched, 3);
 
         // Totals: 3 requests, 2 successful; tokens summed across owned events.
@@ -2608,11 +4175,13 @@ mod tests {
 
     #[tokio::test]
     async fn chargeback_empty_for_a_tenant_with_no_matching_keys() {
-        let engine = ObservabilityEngine::new();
+        let engine = test_engine();
         {
-            let mut ring = engine.recent_events.lock().unwrap();
-            ring.push_back(
+            let mut ring = usage_events(&engine, &tid("t")).lock().unwrap();
+            push_stored(
+                &mut ring,
                 UsageEvent::success(
+                    "t".into(),
                     "k_other".into(),
                     "openai".into(),
                     "gpt-4o".into(),
@@ -2625,9 +4194,8 @@ mod tests {
                 .with_cost(cost(1_000, "USD", 100)),
             );
         }
-        let none: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let report = engine.chargeback(&none);
-        assert_eq!(report.window, 1);
+        let report = engine.chargeback(&tid("t_absent"));
+        assert_eq!(report.window, 0);
         assert_eq!(report.events_matched, 0);
         assert_eq!(report.totals, ChargebackTotals::default());
         assert!(report.by_model.is_empty());
@@ -2635,44 +4203,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recent_events_owned_excludes_other_tenants_and_their_error_bodies() {
-        // Two tenants share the cell's observability ring. `/analytics` must return
-        // ONLY the caller's own events — never another tenant's key name or the raw
-        // provider `error` body (which can echo prompt text). Regression for the
-        // cross-tenant `/analytics` disclosure.
-        let engine = ObservabilityEngine::new();
+    async fn recent_events_owned_excludes_other_tenants_even_with_same_key_name() {
+        // Two tenants share the cell's observability ring AND both named their
+        // virtual key "prod" — key names are caller-chosen and carry NO uniqueness
+        // guard. `/analytics` must return ONLY the caller's own events, scoped by the
+        // stamped `tenant_id` and NEVER the collidable key name, so tenant A never
+        // sees tenant B's cost/model/latency or the raw provider `error` body (which
+        // can echo prompt text). Regression for the cross-tenant `/analytics`
+        // disclosure (a name-based filter leaked between same-named keys).
+        let engine = test_engine();
         {
-            let mut ring = engine.recent_events.lock().unwrap();
-            ring.push_back(UsageEvent::success(
-                "tenant_a_key".into(),
-                "openai".into(),
-                "gpt-4o".into(),
-                1,
-                2,
-                3,
-                None,
-                false,
-            ));
-            // Tenant B's failure carries a raw upstream body in `error`.
-            ring.push_back(UsageEvent::failure(
-                "tenant_b_key".into(),
-                "openai".into(),
-                "gpt-4o".into(),
-                None,
-                false,
-                "openai API error (400): {\"prompt\":\"tenant B secret\"}".into(),
-            ));
+            let mut ring = usage_events(&engine, &tid("t_a")).lock().unwrap();
+            push_stored(
+                &mut ring,
+                UsageEvent::success(
+                    "t_a".into(),
+                    "prod".into(),
+                    "openai".into(),
+                    "gpt-4o".into(),
+                    1,
+                    2,
+                    3,
+                    None,
+                    false,
+                ),
+            );
+        }
+        {
+            let mut ring = usage_events(&engine, &tid("t_b")).lock().unwrap();
+            // Tenant B — SAME key name "prod", DIFFERENT tenant — whose failure body
+            // echoes prompt text. A key-name filter would have leaked this to A.
+            push_stored(
+                &mut ring,
+                UsageEvent::failure(
+                    "t_b".into(),
+                    "prod".into(),
+                    "openai".into(),
+                    "gpt-4o".into(),
+                    None,
+                    false,
+                    "openai API error (400): {\"prompt\":\"tenant B secret\"}".into(),
+                ),
+            );
         }
 
-        let mut scope = std::collections::BTreeSet::new();
-        scope.insert("tenant_a_key".to_string());
-        let owned = engine.recent_events_owned(&scope);
+        let owned = engine.recent_events_owned(&tid("t_a"));
 
         assert_eq!(owned.len(), 1, "only tenant A's event is visible");
-        assert_eq!(owned[0].virtual_key_name, "tenant_a_key");
+        assert_eq!(owned[0].tenant_id, "t_a");
         assert!(
-            owned.iter().all(|e| e.virtual_key_name == "tenant_a_key"),
-            "no other tenant's key name leaks through"
+            owned.iter().all(|e| e.tenant_id == "t_a"),
+            "no other tenant's event leaks through the shared key name"
         );
         assert!(
             !owned.iter().any(|e| e
@@ -2682,9 +4263,8 @@ mod tests {
             "another tenant's raw provider error body must never appear"
         );
 
-        // An empty scope (a tenant that owns no keys) sees nothing.
-        let empty: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        assert!(engine.recent_events_owned(&empty).is_empty());
+        // A tenant with no events in the ring sees nothing.
+        assert!(engine.recent_events_owned(&tid("t_absent")).is_empty());
     }
 
     // --- F14 (G2.2 / ADR-021): config_ref / config_match -----------------------
@@ -2693,6 +4273,7 @@ mod tests {
     fn config_fields_omitted_when_absent_and_attached_when_present() {
         // Legacy (no routing config) → both keys omitted, byte-identical.
         let legacy = UsageEvent::success(
+            "t".into(),
             "k".into(),
             "openai".into(),
             "gpt-4o".into(),
@@ -2709,6 +4290,7 @@ mod tests {
 
         // With a config source → both present.
         let cfg = UsageEvent::success(
+            "t".into(),
             "k".into(),
             "openai".into(),
             "gpt-4o".into(),
@@ -2728,60 +4310,102 @@ mod tests {
 
     #[tokio::test]
     async fn recent_events_is_tenant_isolated_newest_first_and_bounded() {
-        let engine = ObservabilityEngine::new();
+        let engine = test_engine();
         {
-            let mut ring = engine.recent_events.lock().unwrap();
+            let mut ring = usage_events(&engine, &tid("t")).lock().unwrap();
             // Oldest first into the ring (push_back), so newest-first output is the
             // reverse: k_acme_b (latency+cost) is the most-recent owned attempt.
-            ring.push_back(UsageEvent::success(
-                "k_acme_a".into(),
-                "openai".into(),
-                "gpt-4o".into(),
-                10,
-                5,
-                15,
-                None,
-                false,
-            ));
-            // Another tenant's key — MUST be excluded (isolation).
-            ring.push_back(UsageEvent::success(
-                "k_other".into(),
-                "openai".into(),
-                "gpt-4o".into(),
-                99,
-                99,
-                198,
-                None,
-                true,
-            ));
-            // A failure on an owned key → outcome "error".
-            ring.push_back(UsageEvent::failure(
-                "k_acme_a".into(),
-                "anthropic".into(),
-                "claude".into(),
-                None,
-                false,
-                "boom".into(),
-            ));
-            // A synthetic JOIN sentinel on an owned key — excluded (not an attempt).
-            ring.push_back(UsageEvent::prompt_render(
-                "k_acme_a".into(),
-                "gpt-4o".into(),
-                "prompt_x".into(),
-                1,
-                None,
-                None,
-                false,
-            ));
-            // A sovereign block on an owned key — INCLUDED (a real outcome).
-            ring.push_back(UsageEvent::sovereign_block(
-                "k_acme_b".into(),
-                "gemini-pro".into(),
-                Some("IN".into()),
-            ));
-            // The most-recent owned success, priced + timed.
-            ring.push_back(
+            push_stored(
+                &mut ring,
                 UsageEvent::success(
+                    "t".into(),
+                    "k_acme_a".into(),
+                    "openai".into(),
+                    "gpt-4o".into(),
+                    10,
+                    5,
+                    15,
+                    None,
+                    false,
+                ),
+            );
+            // Another tenant's event (a DIFFERENT tenant_id) — MUST be excluded
+            // (isolation is by the stamped tenant_id, not the key name).
+            push_stored(
+                &mut ring,
+                UsageEvent::success(
+                    "t_other".into(),
+                    "k_other".into(),
+                    "openai".into(),
+                    "gpt-4o".into(),
+                    99,
+                    99,
+                    198,
+                    None,
+                    true,
+                ),
+            );
+            // Another tenant's event that SHARES the caller's owned key name
+            // "k_acme_a" — the exact leak this fix closes. It is a real attempt, so
+            // under the removed name-based scoping it WOULD have appeared in this
+            // tenant's log rows. The distinctive provider "leaked_provider" lets us
+            // assert it never surfaces.
+            push_stored(
+                &mut ring,
+                UsageEvent::success(
+                    "t_other".into(),
+                    "k_acme_a".into(),
+                    "leaked_provider".into(),
+                    "gpt-4o".into(),
+                    88,
+                    88,
+                    176,
+                    None,
+                    true,
+                ),
+            );
+            // A failure on an owned key → outcome "error".
+            push_stored(
+                &mut ring,
+                UsageEvent::failure(
+                    "t".into(),
+                    "k_acme_a".into(),
+                    "anthropic".into(),
+                    "claude".into(),
+                    None,
+                    false,
+                    "boom".into(),
+                ),
+            );
+            // A synthetic JOIN sentinel on an owned key — excluded (not an attempt).
+            push_stored(
+                &mut ring,
+                UsageEvent::prompt_render(
+                    "t".into(),
+                    "k_acme_a".into(),
+                    "gpt-4o".into(),
+                    "prompt_x".into(),
+                    1,
+                    None,
+                    None,
+                    false,
+                ),
+            );
+            // A sovereign block on an owned key — INCLUDED (a real outcome).
+            push_stored(
+                &mut ring,
+                UsageEvent::sovereign_block(
+                    "t".into(),
+                    "k_acme_b".into(),
+                    "gemini-pro".into(),
+                    Some("IN".into()),
+                ),
+            );
+            // The most-recent owned success, priced + timed.
+            push_stored(
+                &mut ring,
+                UsageEvent::success(
+                    "t".into(),
                     "k_acme_b".into(),
                     "gemini".into(),
                     "gemini-pro".into(),
@@ -2796,12 +4420,7 @@ mod tests {
             );
         }
 
-        let owned: std::collections::BTreeSet<String> =
-            ["k_acme_a".to_string(), "k_acme_b".to_string()]
-                .into_iter()
-                .collect();
-
-        let rows = engine.recent_events(&owned, 200);
+        let rows = engine.recent_events(&tid("t"), 200);
         // 4 owned attempts (the prompt_render sentinel + the k_other event excluded).
         assert_eq!(rows.len(), 4);
         // Newest-first: the priced k_acme_b success is first.
@@ -2819,21 +4438,22 @@ mod tests {
         // The oldest owned event is last.
         assert_eq!(rows[3].virtual_key_name, "k_acme_a");
         assert_eq!(rows[3].provider, "openai");
-        // No other-tenant or synthetic-join row ever appears.
+        // No other-tenant or synthetic-join row ever appears — including the
+        // same-named foreign event (isolation is by tenant_id, not key name).
         assert!(rows.iter().all(|r| r.virtual_key_name != "k_other"));
+        assert!(rows.iter().all(|r| r.provider != "leaked_provider"));
         assert!(rows.iter().all(|r| r.provider != "(prompt_render)"));
         // Every row carries a synthesized, stable id.
         assert!(rows.iter().all(|r| r.id.starts_with("log_")));
 
         // The limit is respected (cap at 2 → the 2 newest owned rows).
-        let capped = engine.recent_events(&owned, 2);
+        let capped = engine.recent_events(&tid("t"), 2);
         assert_eq!(capped.len(), 2);
         assert_eq!(capped[0].virtual_key_name, "k_acme_b");
         assert_eq!(capped[1].provider, "(sovereign_block)");
 
-        // A tenant owning no matching keys sees nothing.
-        let none: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        assert!(engine.recent_events(&none, 200).is_empty());
+        // A tenant with no matching events sees nothing.
+        assert!(engine.recent_events(&tid("t_absent"), 200).is_empty());
     }
 
     #[cfg(feature = "enterprise")]
@@ -2842,6 +4462,7 @@ mod tests {
         // A guardrails-denied block carries outcomes — the row must expose ONLY the
         // id + verdict label, never the detail string (no-reflection posture).
         let ev = UsageEvent::guardrails_block(
+            "t".into(),
             "k".into(),
             "gpt-4o".into(),
             None,
@@ -2863,13 +4484,14 @@ mod tests {
 
     #[tokio::test]
     async fn timeseries_buckets_recent_events_and_is_tenant_isolated() {
-        let engine = ObservabilityEngine::new();
+        let engine = test_engine();
         let now = Utc::now();
         {
-            let mut ring = engine.recent_events.lock().unwrap();
+            let mut ring = usage_events(&engine, &tid("t")).lock().unwrap();
             // Helper: an owned priced+timed success at a given age (mins ago).
             let mut at = |key: &str, mins_ago: i64, ms: u64, micro: u64, tokens: u32| {
                 let mut ev = UsageEvent::success(
+                    "t".into(),
                     key.into(),
                     "openai".into(),
                     "gpt-4o".into(),
@@ -2882,7 +4504,7 @@ mod tests {
                 .with_latency(ms)
                 .with_cost(cost(micro, "USD", micro / 10));
                 ev.timestamp = now - chrono::Duration::minutes(mins_ago);
-                ring.push_back(ev);
+                push_stored(&mut ring, ev);
             };
             // Two owned events, ~5 min apart, well inside a 60-min window.
             at("k_acme_a", 50, 100, 2_000, 10);
@@ -2890,8 +4512,10 @@ mod tests {
             // An owned event WAY outside the window (excluded — honest, the ring may
             // not span the window).
             at("k_acme_b", 600, 999, 9_999, 99);
-            // Another tenant's in-window event (excluded — isolation).
+            // Another tenant's in-window event (a DIFFERENT tenant_id) — excluded
+            // (isolation is by the stamped tenant_id, not the key name).
             let mut other = UsageEvent::success(
+                "t_other".into(),
                 "k_other".into(),
                 "openai".into(),
                 "gpt-4o".into(),
@@ -2903,19 +4527,38 @@ mod tests {
             )
             .with_cost(cost(7_777, "USD", 777));
             other.timestamp = now - chrono::Duration::minutes(40);
-            ring.push_back(other);
+            push_stored(&mut ring, other);
+            // Another tenant's in-window event that SHARES the caller's owned key
+            // name "k_acme_a" — the exact leak this fix closes. Under the removed
+            // name-based scoping it WOULD have contributed to the buckets; scoping
+            // on the stamped tenant_id excludes it despite the identical name.
+            let mut same_name = UsageEvent::success(
+                "t_other".into(),
+                "k_acme_a".into(),
+                "openai".into(),
+                "gpt-4o".into(),
+                55,
+                0,
+                55,
+                None,
+                false,
+            )
+            .with_latency(500)
+            .with_cost(cost(5_555, "USD", 555));
+            same_name.timestamp = now - chrono::Duration::minutes(35);
+            push_stored(&mut ring, same_name);
             // A synthetic sentinel inside the window on an owned key (excluded).
-            let mut sentinel =
-                UsageEvent::sovereign_block("k_acme_a".into(), "m".into(), Some("IN".into()));
+            let mut sentinel = UsageEvent::sovereign_block(
+                "t".into(),
+                "k_acme_a".into(),
+                "m".into(),
+                Some("IN".into()),
+            );
             sentinel.timestamp = now - chrono::Duration::minutes(30);
-            ring.push_back(sentinel);
+            push_stored(&mut ring, sentinel);
         }
 
-        let owned: std::collections::BTreeSet<String> =
-            ["k_acme_a".to_string(), "k_acme_b".to_string()]
-                .into_iter()
-                .collect();
-        let ts = engine.usage_timeseries(&owned, chrono::Duration::minutes(60), 60);
+        let ts = engine.usage_timeseries(&tid("t"), chrono::Duration::minutes(60), 60);
 
         // 60 one-minute buckets; only the two in-window owned attempts contribute.
         assert_eq!(ts.buckets.len(), 60);
@@ -2940,9 +4583,8 @@ mod tests {
             }
         }
 
-        // A tenant owning no matching keys sees all-zero buckets (honest empty).
-        let none: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let empty = engine.usage_timeseries(&none, chrono::Duration::minutes(60), 12);
+        // A tenant with no matching events sees all-zero buckets (honest empty).
+        let empty = engine.usage_timeseries(&tid("t_absent"), chrono::Duration::minutes(60), 12);
         assert_eq!(empty.buckets.len(), 12);
         assert_eq!(empty.total_events_in_window, 0);
         assert!(empty.buckets.iter().all(|b| b.requests == 0));
@@ -2952,90 +4594,136 @@ mod tests {
 
     #[tokio::test]
     async fn residency_report_is_tenant_isolated_and_classifies_outcomes() {
-        let engine = ObservabilityEngine::new();
+        let engine = test_engine();
         {
-            let mut ring = engine.recent_events.lock().unwrap();
+            let mut ring = usage_events(&engine, &tid("t")).lock().unwrap();
             // Oldest first into the ring (push_back); newest-first output reverses.
 
             // 1) A passthrough success on an owned key: no region, not routed.
-            ring.push_back(UsageEvent::success(
-                "k_acme_a".into(),
-                "self_hosted".into(),
-                "llama".into(),
-                10,
-                5,
-                15,
-                None,
-                false,
-            ));
-            // 2) ANOTHER tenant's sovereign-routed success — MUST be excluded.
-            ring.push_back(UsageEvent::success(
-                "k_other".into(),
-                "gemini".into(),
-                "gemini-pro".into(),
-                1,
-                1,
-                2,
-                Some("IN".into()),
-                true,
-            ));
+            push_stored(
+                &mut ring,
+                UsageEvent::success(
+                    "t".into(),
+                    "k_acme_a".into(),
+                    "self_hosted".into(),
+                    "llama".into(),
+                    10,
+                    5,
+                    15,
+                    None,
+                    false,
+                ),
+            );
+            // 2) ANOTHER tenant's sovereign-routed success (a DIFFERENT tenant_id) —
+            //    MUST be excluded (isolation is by tenant_id, not the key name).
+            push_stored(
+                &mut ring,
+                UsageEvent::success(
+                    "t_other".into(),
+                    "k_other".into(),
+                    "gemini".into(),
+                    "gemini-pro".into(),
+                    1,
+                    1,
+                    2,
+                    Some("IN".into()),
+                    true,
+                ),
+            );
             // 3) A failure on an owned key with NO residency constraint → not a
             //    residency outcome (not_regulated, not all_failed).
-            ring.push_back(UsageEvent::failure(
-                "k_acme_a".into(),
-                "openai".into(),
-                "gpt-4o".into(),
-                None,
-                false,
-                "boom".into(),
-            ));
+            push_stored(
+                &mut ring,
+                UsageEvent::failure(
+                    "t".into(),
+                    "k_acme_a".into(),
+                    "openai".into(),
+                    "gpt-4o".into(),
+                    None,
+                    false,
+                    "boom".into(),
+                ),
+            );
             // 4) A synthetic JOIN sentinel on an owned key — excluded (not an attempt).
-            ring.push_back(UsageEvent::prompt_render(
-                "k_acme_a".into(),
-                "gpt-4o".into(),
-                "prompt_x".into(),
-                1,
-                None,
-                None,
-                false,
-            ));
+            push_stored(
+                &mut ring,
+                UsageEvent::prompt_render(
+                    "t".into(),
+                    "k_acme_a".into(),
+                    "gpt-4o".into(),
+                    "prompt_x".into(),
+                    1,
+                    None,
+                    None,
+                    false,
+                ),
+            );
             // 5) A residency-constrained provider failure on an owned key → all_failed.
-            ring.push_back(UsageEvent::failure(
-                "k_acme_b".into(),
-                "gemini".into(),
-                "gemini-pro".into(),
-                Some("IN".into()),
-                true,
-                "timeout".into(),
-            ));
+            push_stored(
+                &mut ring,
+                UsageEvent::failure(
+                    "t".into(),
+                    "k_acme_b".into(),
+                    "gemini".into(),
+                    "gemini-pro".into(),
+                    Some("IN".into()),
+                    true,
+                    "timeout".into(),
+                ),
+            );
             // 6) A sovereign BLOCK on an owned key → residency_blocked (422).
-            ring.push_back(UsageEvent::sovereign_block(
-                "k_acme_b".into(),
-                "gpt-4o".into(),
-                Some("IN".into()),
-            ));
+            push_stored(
+                &mut ring,
+                UsageEvent::sovereign_block(
+                    "t".into(),
+                    "k_acme_b".into(),
+                    "gpt-4o".into(),
+                    Some("IN".into()),
+                ),
+            );
             // 7) The most-recent owned attempt: a sovereign-ROUTED success to IN.
-            ring.push_back(UsageEvent::success(
-                "k_acme_b".into(),
-                "gemini".into(),
-                "gemini-pro".into(),
-                20,
-                10,
-                30,
-                Some("IN".into()),
-                true,
-            ));
+            push_stored(
+                &mut ring,
+                UsageEvent::success(
+                    "t".into(),
+                    "k_acme_b".into(),
+                    "gemini".into(),
+                    "gemini-pro".into(),
+                    20,
+                    10,
+                    30,
+                    Some("IN".into()),
+                    true,
+                ),
+            );
+            // 8) Another tenant's sovereign-routed success that SHARES the caller's
+            //    owned key name "k_acme_a" — the exact leak this fix closes. Under
+            //    the removed name-based scoping it WOULD have inflated total,
+            //    regulated_count, sovereign_routed_count, and by_region["IN"];
+            //    scoping on the stamped tenant_id excludes it despite the shared name.
+            push_stored(
+                &mut ring,
+                UsageEvent::success(
+                    "t_other".into(),
+                    "k_acme_a".into(),
+                    "gemini".into(),
+                    "gemini-pro".into(),
+                    7,
+                    7,
+                    14,
+                    Some("IN".into()),
+                    true,
+                ),
+            );
         }
 
-        let owned: std::collections::BTreeSet<String> =
-            ["k_acme_a".to_string(), "k_acme_b".to_string()]
-                .into_iter()
-                .collect();
-        let (summary, rows) = engine.residency_report(&owned, 200);
+        let (summary, rows) = engine.residency_report(&tid("t"), 200);
 
-        // Window is the full ring (7); 5 owned real attempts contribute (the other
-        // tenant's event + the prompt_render sentinel are excluded).
-        assert_eq!(summary.window, 7);
+        // Window is this tenant's isolated ring view (6); both deliberately
+        // misplaced foreign events are excluded before the fold. Five real
+        // attempts contribute because the prompt_render sentinel remains in the
+        // tenant window but is not a residency attempt.
+        assert_eq!(summary.window, 6);
         assert_eq!(summary.total, 5);
 
         // Counts: regulated = events 5,6,7 (region Some OR routed) = 3.
@@ -3086,14 +4774,13 @@ mod tests {
         assert!(rows.iter().all(|r| r.id.starts_with("log_")));
 
         // The limit caps the ledger to the newest rows (summary is unaffected).
-        let (capped_summary, capped_rows) = engine.residency_report(&owned, 2);
+        let (capped_summary, capped_rows) = engine.residency_report(&tid("t"), 2);
         assert_eq!(capped_rows.len(), 2);
         assert_eq!(capped_summary.total, 5);
         assert_eq!(capped_rows[0].virtual_key_name, "k_acme_b");
 
-        // A tenant owning no matching keys sees an empty report.
-        let none: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let (empty, empty_rows) = engine.residency_report(&none, 200);
+        // A tenant with no matching events sees an empty report.
+        let (empty, empty_rows) = engine.residency_report(&tid("t_absent"), 200);
         assert_eq!(empty.total, 0);
         assert_eq!(empty.regulated_pct, 0.0);
         assert!(empty.by_region.is_empty());

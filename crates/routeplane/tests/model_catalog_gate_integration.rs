@@ -100,6 +100,7 @@ fn catalog_key() -> VirtualKey {
 fn ctx_with_catalog(frameworks: Vec<String>, mode: ComplianceMode) -> TenantContext {
     TenantContext {
         tenant_id: TENANT.to_string(),
+        resource_tenant_id: None,
         tier: Tier::Standard,
         capabilities: CapabilitySet::resolve(
             Tier::Standard,

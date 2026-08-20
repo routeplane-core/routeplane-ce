@@ -17,6 +17,7 @@ use routeplane_flags::UnleashFlags;
 use routeplane_guardrails_advanced::{CompiledGuardrails, ConfigSource};
 use routeplane_limits::auth_failures::{AuthFailureConfig, AuthFailureTracker, AuthThrottle};
 use routeplane_limits::{now_unix_ms, KeyLimits};
+use routeplane_types::TenantId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -321,6 +322,10 @@ impl VirtualKey {
 #[derive(Clone, Debug)]
 pub struct TenantContext {
     pub tenant_id: String,
+    /// Explicit validated authority for bounded shared resources. A legacy key's
+    /// display-name fallback may continue serving inference, but it cannot claim
+    /// another tenant's retained capacity.
+    pub resource_tenant_id: Option<TenantId>,
     pub tier: Tier,
     pub capabilities: CapabilitySet,
     /// Org compliance frameworks ([ADR-035] §4), cloned read-only from the
@@ -338,6 +343,9 @@ impl TenantContext {
     pub fn from_virtual_key(key: &VirtualKey, global_holdbacks: &BTreeSet<Feature>) -> Self {
         Self {
             tenant_id: key.resolved_tenant_id(),
+            resource_tenant_id: key
+                .canonical_tenant_id()
+                .and_then(|tenant_id| TenantId::new(tenant_id).ok()),
             tier: key.tier,
             capabilities: key.capability_set(global_holdbacks),
             compliance_frameworks: key.compliance_frameworks.clone(),
@@ -1542,9 +1550,10 @@ mod tests {
 
         let ctx = TenantContext::from_virtual_key(&key, &BTreeSet::new());
         assert_eq!(ctx.tenant_id, "Default Development Key"); // falls back to name
-                                                              // The Free baseline carries exactly {RoutingPolicy (F13 core surface
-                                                              // with a holdback kill switch), TokenCompression (ADR-088 Bundle B,
-                                                              // release-plane gated at rollout)} — no other features.
+        assert!(ctx.resource_tenant_id.is_none());
+        // The Free baseline carries exactly {RoutingPolicy (F13 core surface
+        // with a holdback kill switch), TokenCompression (ADR-088 Bundle B,
+        // release-plane gated at rollout)} — no other features.
         assert!(ctx.capabilities.active(Feature::RoutingPolicy));
         assert!(ctx.capabilities.active(Feature::TokenCompression));
         assert_eq!(ctx.capabilities.len(), 2);
@@ -1565,6 +1574,10 @@ mod tests {
         );
         let ctx = TenantContext::from_virtual_key(&key, &BTreeSet::new());
         assert_eq!(ctx.tenant_id, "t_paid");
+        assert_eq!(
+            ctx.resource_tenant_id.as_ref().map(TenantId::as_str),
+            Some("t_paid")
+        );
         assert_eq!(ctx.tier, Tier::Standard);
         // Standard baseline:
         assert!(ctx.capabilities.active(Feature::SemanticCache));
@@ -1574,6 +1587,20 @@ mod tests {
         assert!(ctx.capabilities.active(Feature::FinOpsExport));
         // Not granted:
         assert!(!ctx.capabilities.active(Feature::AgenticSecurity));
+    }
+
+    #[test]
+    fn canonical_looking_legacy_display_name_does_not_mint_resource_authority() {
+        let key = base_key(
+            r#"{
+                "name": "t_paid",
+                "routeplane_key": "rp_legacy_collision",
+                "provider_keys": { "openai": "env:OPENAI_API_KEY" }
+            }"#,
+        );
+        let ctx = TenantContext::from_virtual_key(&key, &BTreeSet::new());
+        assert_eq!(ctx.tenant_id, "t_paid");
+        assert!(ctx.resource_tenant_id.is_none());
     }
 
     #[test]

@@ -458,6 +458,9 @@ impl McpAgenticState {
 #[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 pub(crate) struct TelemetryCtx<'a> {
     pub tenant_id: &'a str,
+    /// Validated resource authority resolved at auth. This is deliberately
+    /// distinct from the display-compatible tenant string above.
+    pub resource_tenant_id: Option<&'a TenantId>,
     pub request_id: &'a str,
     pub capabilities: &'a CapabilitySet,
     /// True when this outcome resolved a STREAMED (SSE) request, so the durable
@@ -568,7 +571,26 @@ impl AppState {
             guardrail_engine: GuardrailEngine::new(),
             #[cfg(feature = "enterprise")]
             tokenizer_key: TokenizerKey::default(),
-            observability_engine: ObservabilityEngine::new(),
+            observability_engine: ObservabilityEngine::new(
+                [
+                    "t_test",
+                    "t_a",
+                    "t_b",
+                    "t_sem",
+                    "t_victim",
+                    "t_attacker",
+                    "t_acme",
+                    "t_other",
+                    "t_free",
+                    "t_enterprise",
+                    "t_sovereign",
+                    "t_models",
+                    "t_comp",
+                ]
+                .into_iter()
+                .map(|raw| TenantId::new(raw).expect("canonical test tenant"))
+                .collect(),
+            ),
             residency_engine: ResidencyEngine::new(),
             router: Router::with_defaults(),
             deadline_config: DeadlineConfig::default(),
@@ -634,18 +656,23 @@ impl AppState {
     /// the disabled (default) build. Every label is sanitized by the export
     /// helpers; only labels/counts/outcome leave the process (never PII or the
     /// guardrail `detail` free-text).
-    fn emit_usage(&self, event: UsageEvent) {
-        self.emit_usage_inner(event, None);
+    fn emit_usage(&self, resource_tenant_id: Option<&TenantId>, event: UsageEvent) {
+        self.emit_usage_inner(resource_tenant_id, event, None);
     }
 
     /// Like [`AppState::emit_usage`] but also records a durable telemetry event
     /// (PRD-009 / ADR-024) when the tenant holds `Feature::TelemetryDurable` and a
     /// writer is configured. Off by default ⇒ byte-identical to `emit_usage`.
     fn emit_usage_with_telemetry(&self, event: UsageEvent, tel: TelemetryCtx<'_>) {
-        self.emit_usage_inner(event, Some(tel));
+        self.emit_usage_inner(tel.resource_tenant_id, event, Some(tel));
     }
 
-    fn emit_usage_inner(&self, event: UsageEvent, tel: Option<TelemetryCtx<'_>>) {
+    fn emit_usage_inner(
+        &self,
+        resource_tenant_id: Option<&TenantId>,
+        event: UsageEvent,
+        tel: Option<TelemetryCtx<'_>>,
+    ) {
         // Prometheus `/metrics` surface (SRE parity): derive every counter from
         // the SAME UsageEvent the observability ring records, so there is one
         // choke point and zero risk of double-counting. Wait-free atomic adds
@@ -698,7 +725,8 @@ impl AppState {
         #[cfg(not(feature = "enterprise"))]
         let _ = &tel;
         // Observability ring is the canonical local record (always).
-        self.observability_engine.record_usage(event);
+        self.observability_engine
+            .record_usage(resource_tenant_id, event);
     }
 
     /// Export a security event OFF the synchronous path (ADR-054), mirroring the
@@ -785,9 +813,9 @@ impl AppState {
     }
 
     /// Shared body for the MCP governance-seam record: fans one closed-vocab,
-    /// secret-free security event to the audit ledger, the SIEM/warehouse export,
-    /// and the bounded in-memory Console ring — with the caller-supplied
-    /// `outcome` (a genuine denial is `Deny`; a non-blocking flag is `Allow`).
+    /// secret-free security event to the audit ledger and SIEM/warehouse export,
+    /// with the caller-supplied `outcome` (a genuine denial is `Deny`; a
+    /// non-blocking flag is `Allow`).
     #[cfg(feature = "enterprise")]
     fn record_mcp_security_outcome(
         &self,
@@ -815,18 +843,6 @@ impl AppState {
             outcome,
             None,
             detail_code,
-        );
-        // Also retain it in the bounded in-memory ring so the Console can show a
-        // LIVE feed of agentic-security enforcement events (free-tier observability
-        // — NOT the durable telemetry store, ADR-024). Label-only + tenant-scoped.
-        self.observability_engine.record_mcp_security_event(
-            crate::observability::McpSecurityEvent {
-                ts: chrono::Utc::now().to_rfc3339(),
-                category: category.label().to_string(),
-                outcome: outcome.code().to_string(),
-                detail: detail_code.map(|s| s.to_string()),
-                tenant_id: tenant.tenant_id.clone(),
-            },
         );
     }
 }
@@ -1725,6 +1741,7 @@ struct StreamAbortAccounting {
     guards: routeplane_limits::LimitGuards,
     capabilities: CapabilitySet,
     tenant_id: String,
+    resource_tenant_id: Option<TenantId>,
     request_id: String,
     provider: String,
     vk_name: String,
@@ -1812,6 +1829,7 @@ impl StreamAbortAccounting {
         // only adds the off-path durable record.
         self.state.emit_usage_with_telemetry(
             UsageEvent::success(
+                self.tenant_id.clone(),
                 self.vk_name.clone(),
                 self.provider.clone(),
                 self.model.clone(),
@@ -1826,6 +1844,7 @@ impl StreamAbortAccounting {
             .with_cached_tokens(usage.cached_tokens),
             TelemetryCtx {
                 tenant_id: &self.tenant_id,
+                resource_tenant_id: self.resource_tenant_id.as_ref(),
                 request_id: &self.request_id,
                 capabilities: &self.capabilities,
                 streaming: true,
@@ -2084,12 +2103,14 @@ fn sovereign_block_response(
     );
     state.emit_usage_with_telemetry(
         UsageEvent::sovereign_block(
+            tenant_ctx.tenant_id.clone(),
             virtual_key.name.clone(),
             model.to_string(),
             Some(region.0.clone()),
         ),
         TelemetryCtx {
             tenant_id: &tenant_ctx.tenant_id,
+            resource_tenant_id: tenant_ctx.resource_tenant_id.as_ref(),
             request_id,
             capabilities: &tenant_ctx.capabilities,
             streaming: false,
@@ -3248,6 +3269,7 @@ async fn chat_completions_pipeline(
                 estimate_cost_micro_usd(&entry.model, entry.prompt_tokens, entry.completion_tokens);
             state.emit_usage_with_telemetry(
                 UsageEvent::success(
+                    tenant_ctx.tenant_id.clone(),
                     virtual_key.name.clone(),
                     "(cache)".to_string(),
                     entry.model.clone(),
@@ -3260,6 +3282,7 @@ async fn chat_completions_pipeline(
                 .with_cache_hit(cache_namespace.clone(), saved),
                 TelemetryCtx {
                     tenant_id: &tenant_ctx.tenant_id,
+                    resource_tenant_id: tenant_ctx.resource_tenant_id.as_ref(),
                     request_id: &request_id,
                     capabilities: &tenant_ctx.capabilities,
                     streaming: false,
@@ -3445,6 +3468,7 @@ async fn chat_completions_pipeline(
                     );
                     state.emit_usage_with_telemetry(
                         UsageEvent::success(
+                            tenant_ctx.tenant_id.clone(),
                             virtual_key.name.clone(),
                             "(semantic-cache)".to_string(),
                             hit.entry.model.clone(),
@@ -3457,6 +3481,7 @@ async fn chat_completions_pipeline(
                         .with_cache_hit(cache_namespace.clone(), saved),
                         TelemetryCtx {
                             tenant_id: &tenant_ctx.tenant_id,
+                            resource_tenant_id: tenant_ctx.resource_tenant_id.as_ref(),
                             request_id: &request_id,
                             capabilities: &tenant_ctx.capabilities,
                             streaming: false,
@@ -3565,6 +3590,7 @@ async fn chat_completions_pipeline(
             );
             state.emit_usage_with_telemetry(
                 UsageEvent::guardrails_block(
+                    tenant_ctx.tenant_id.clone(),
                     virtual_key.name.clone(),
                     payload.model.clone(),
                     required_region.as_ref().map(|r| r.0.clone()),
@@ -3573,6 +3599,7 @@ async fn chat_completions_pipeline(
                 ),
                 TelemetryCtx {
                     tenant_id: &tenant_ctx.tenant_id,
+                    resource_tenant_id: tenant_ctx.resource_tenant_id.as_ref(),
                     request_id: &request_id,
                     capabilities: &tenant_ctx.capabilities,
                     streaming: false,
@@ -3703,6 +3730,7 @@ async fn chat_completions_pipeline(
         );
         state.emit_usage_with_telemetry(
             UsageEvent::failure(
+                tenant_ctx.tenant_id.clone(),
                 virtual_key.name.clone(),
                 format!("({})", breach.kind_header()),
                 payload.model.clone(),
@@ -3716,6 +3744,7 @@ async fn chat_completions_pipeline(
             ),
             TelemetryCtx {
                 tenant_id: &tenant_ctx.tenant_id,
+                resource_tenant_id: tenant_ctx.resource_tenant_id.as_ref(),
                 request_id: &request_id,
                 capabilities: &tenant_ctx.capabilities,
                 streaming: false,
@@ -3778,6 +3807,7 @@ async fn chat_completions_pipeline(
             outcomes.push(synthetic);
             state.emit_usage_with_telemetry(
                 UsageEvent::guardrails_block(
+                    tenant_ctx.tenant_id.clone(),
                     virtual_key.name.clone(),
                     payload.model.clone(),
                     required_region.as_ref().map(|r| r.0.clone()),
@@ -3786,6 +3816,7 @@ async fn chat_completions_pipeline(
                 ),
                 TelemetryCtx {
                     tenant_id: &tenant_ctx.tenant_id,
+                    resource_tenant_id: tenant_ctx.resource_tenant_id.as_ref(),
                     request_id: &request_id,
                     capabilities: &tenant_ctx.capabilities,
                     streaming: false,
@@ -3959,6 +3990,7 @@ async fn chat_completions_pipeline(
                 for (key_index, api_key) in &rt.keys {
                     match attempt_target(
                         &tenant_ctx.tenant_id,
+                        tenant_ctx.resource_tenant_id.as_ref(),
                         &state,
                         rt.target,
                         &rt.shaped,
@@ -4010,6 +4042,7 @@ async fn chat_completions_pipeline(
         Some(hedge) => {
             run_hedged_targets(
                 &tenant_ctx.tenant_id,
+                tenant_ctx.resource_tenant_id.as_ref(),
                 &state,
                 &ready
                     .iter()
@@ -4123,6 +4156,7 @@ async fn chat_completions_pipeline(
                         );
                         state.emit_usage_with_telemetry(
                             UsageEvent::guardrails_output_denied(
+                                tenant_ctx.tenant_id.clone(),
                                 virtual_key.name.clone(),
                                 provider_name.clone(),
                                 response.model.clone(),
@@ -4135,6 +4169,7 @@ async fn chat_completions_pipeline(
                             ),
                             TelemetryCtx {
                                 tenant_id: &tenant_ctx.tenant_id,
+                                resource_tenant_id: tenant_ctx.resource_tenant_id.as_ref(),
                                 request_id: &request_id,
                                 capabilities: &tenant_ctx.capabilities,
                                 streaming: false,
@@ -4262,6 +4297,7 @@ async fn chat_completions_pipeline(
                             if deny {
                                 state.emit_usage_with_telemetry(
                                     UsageEvent::guardrails_output_denied(
+                                        tenant_ctx.tenant_id.clone(),
                                         virtual_key.name.clone(),
                                         provider_name.clone(),
                                         response.model.clone(),
@@ -4274,6 +4310,7 @@ async fn chat_completions_pipeline(
                                     ),
                                     TelemetryCtx {
                                         tenant_id: &tenant_ctx.tenant_id,
+                                        resource_tenant_id: tenant_ctx.resource_tenant_id.as_ref(),
                                         request_id: &request_id,
                                         capabilities: &tenant_ctx.capabilities,
                                         streaming: false,
@@ -4365,6 +4402,7 @@ async fn chat_completions_pipeline(
                         if deny {
                             state.emit_usage_with_telemetry(
                                 UsageEvent::guardrails_output_denied(
+                                    tenant_ctx.tenant_id.clone(),
                                     virtual_key.name.clone(),
                                     provider_name.clone(),
                                     response.model.clone(),
@@ -4377,6 +4415,7 @@ async fn chat_completions_pipeline(
                                 ),
                                 TelemetryCtx {
                                     tenant_id: &tenant_ctx.tenant_id,
+                                    resource_tenant_id: tenant_ctx.resource_tenant_id.as_ref(),
                                     request_id: &request_id,
                                     capabilities: &tenant_ctx.capabilities,
                                     streaming: false,
@@ -4430,6 +4469,7 @@ async fn chat_completions_pipeline(
 
                 state.emit_usage_with_telemetry(
                     UsageEvent::success(
+                        tenant_ctx.tenant_id.clone(),
                         virtual_key.name.clone(),
                         provider_name.clone(),
                         response.model.clone(),
@@ -4461,6 +4501,7 @@ async fn chat_completions_pipeline(
                     .with_output_masked(output_mask_annotation),
                     TelemetryCtx {
                         tenant_id: &tenant_ctx.tenant_id,
+                        resource_tenant_id: tenant_ctx.resource_tenant_id.as_ref(),
                         request_id: &request_id,
                         capabilities: &tenant_ctx.capabilities,
                         streaming: false,
@@ -4764,6 +4805,7 @@ async fn attempt_target(
     // so adapter scope and health scope can never diverge (the breaker follows
     // the adapter).
     tenant_id: &str,
+    resource_tenant_id: Option<&TenantId>,
     state: &AppState,
     target: &TargetPlan,
     shaped: &ChatCompletionRequest,
@@ -4984,7 +5026,9 @@ async fn attempt_target(
                 }
                 let last_error = e.to_string();
                 state.emit_usage(
+                    resource_tenant_id,
                     UsageEvent::failure(
+                        tenant_id.to_string(),
                         virtual_key.name.clone(),
                         provider_name.clone(),
                         shaped.model.clone(),
@@ -5058,6 +5102,7 @@ async fn run_hedged_targets(
     // so concurrent hedges score health under the same scope as the sequential
     // path (the breaker follows the adapter).
     tenant_id: &str,
+    resource_tenant_id: Option<&TenantId>,
     state: &Arc<AppState>,
     ready: &[(usize, &TargetPlan, &ChatCompletionRequest, &str)],
     deadline: Deadline,
@@ -5103,6 +5148,7 @@ async fn run_hedged_targets(
             let (idx, target, shaped, api_key) = ready[next];
             next += 1;
             let state = state.clone();
+            let resource_tenant_id = resource_tenant_id.cloned();
             let vk = virtual_key.clone();
             let region = required_region.clone();
             let matched = config_matched_label.map(str::to_string);
@@ -5114,6 +5160,7 @@ async fn run_hedged_targets(
             in_flight.push(Box::pin(async move {
                 let outcome = attempt_target(
                     tenant_id,
+                    resource_tenant_id.as_ref(),
                     &state,
                     &target,
                     &shaped,
@@ -5387,6 +5434,7 @@ fn record_stream_attempt_failure(
 ) {
     state.emit_usage_with_telemetry(
         UsageEvent::failure(
+            tel.tenant_id.to_string(),
             virtual_key.name.clone(),
             provider_name.to_string(),
             model.to_string(),
@@ -5663,6 +5711,7 @@ async fn stream_chat_completions(
                             &last_error,
                             TelemetryCtx {
                                 tenant_id: &tenant_ctx.tenant_id,
+                                resource_tenant_id: tenant_ctx.resource_tenant_id.as_ref(),
                                 request_id: &request_id,
                                 capabilities: &tenant_ctx.capabilities,
                                 streaming: true,
@@ -5743,6 +5792,7 @@ async fn stream_chat_completions(
                             &last_error,
                             TelemetryCtx {
                                 tenant_id: &tenant_ctx.tenant_id,
+                                resource_tenant_id: tenant_ctx.resource_tenant_id.as_ref(),
                                 request_id: &request_id,
                                 capabilities: &tenant_ctx.capabilities,
                                 streaming: true,
@@ -5828,6 +5878,7 @@ async fn stream_chat_completions(
         let plan_for_stream = plan;
         let stream_outcomes = prior_outcomes;
         let tenant_id_for_stream = tenant_ctx.tenant_id.clone();
+        let resource_tenant_id_for_stream = tenant_ctx.resource_tenant_id.clone();
         let request_id_for_stream = request_id.clone();
         let classification_for_stream = classification.clone();
         let guards_for_stream = guards.clone();
@@ -5852,6 +5903,7 @@ async fn stream_chat_completions(
                 guards: guards_for_stream.clone(),
                 capabilities: capabilities_for_stream.clone(),
                 tenant_id: tenant_id_for_stream.clone(),
+                resource_tenant_id: resource_tenant_id_for_stream.clone(),
                 request_id: request_id_for_stream.clone(),
                 provider: provider_name_owned.clone(),
                 vk_name: vk_name.clone(),
@@ -6104,7 +6156,7 @@ async fn stream_chat_completions(
                 usage.completion_tokens,
             );
             let event = UsageEvent::success(
-                vk_name, provider_name_owned, model_seen.clone(),
+                tenant_id_for_stream.clone(), vk_name, provider_name_owned, model_seen.clone(),
                 usage.prompt_tokens, usage.completion_tokens, usage.total_tokens,
                 region_owned, sovereign,
             )
@@ -6147,6 +6199,7 @@ async fn stream_chat_completions(
                 let plan_for_eval = plan_for_stream;
                 let mut outcomes = stream_outcomes;
                 let tenant_id = tenant_id_for_stream;
+                let resource_tenant_id = resource_tenant_id_for_stream;
                 let request_id = request_id_for_stream;
                 let caps_for_eval = capabilities_for_stream.clone();
                 let model_for_eval = model_seen;
@@ -6315,6 +6368,7 @@ async fn stream_chat_completions(
                         event.with_guardrails(outcomes),
                         TelemetryCtx {
                             tenant_id: &tenant_id,
+                            resource_tenant_id: resource_tenant_id.as_ref(),
                             request_id: &request_id,
                             capabilities: &caps_for_eval,
                             streaming: true,
@@ -6328,6 +6382,7 @@ async fn stream_chat_completions(
                     event.with_guardrails(stream_outcomes),
                     TelemetryCtx {
                         tenant_id: &tenant_id_for_stream,
+                        resource_tenant_id: resource_tenant_id_for_stream.as_ref(),
                         request_id: &request_id_for_stream,
                         capabilities: &capabilities_for_stream,
                         streaming: true,
@@ -6344,6 +6399,7 @@ async fn stream_chat_completions(
                 event.with_guardrails(stream_outcomes),
                 TelemetryCtx {
                     tenant_id: &tenant_id_for_stream,
+                    resource_tenant_id: resource_tenant_id_for_stream.as_ref(),
                     request_id: &request_id_for_stream,
                     capabilities: &capabilities_for_stream,
                     streaming: true,
@@ -6591,6 +6647,7 @@ mod tests {
         let caps = unentitled();
         let tel = TelemetryCtx {
             tenant_id: "t_acme",
+            resource_tenant_id: None,
             request_id: "req_1",
             capabilities: &caps,
             streaming: false,
@@ -6600,6 +6657,7 @@ mod tests {
         // INR display currency → USD (from micro-usd) AND INR (from minor units
         // = paise) are both filled (#212 / FR-10).
         let ev = UsageEvent::success(
+            "t_test".into(),
             "k".into(),
             "openai".into(),
             "gpt-4o".into(),
@@ -6621,6 +6679,7 @@ mod tests {
 
         // Non-INR display currency → USD filled, INR left None (no cross-rate here).
         let ev2 = UsageEvent::success(
+            "t_test".into(),
             "k".into(),
             "openai".into(),
             "gpt-4o".into(),
@@ -6642,6 +6701,7 @@ mod tests {
 
         // No cost on the event → both stay None.
         let ev3 = UsageEvent::success(
+            "t_test".into(),
             "k".into(),
             "openai".into(),
             "gpt-4o".into(),
@@ -6663,6 +6723,7 @@ mod tests {
         // status the caller saw — never a blanket 500 (Finding 2). Only a genuine
         // upstream/provider error falls through to 500.
         let ok = UsageEvent::success(
+            "t_test".into(),
             "k".into(),
             "openai".into(),
             "m".into(),
@@ -6675,6 +6736,7 @@ mod tests {
         assert_eq!(telemetry_status_code(&ok), 200);
 
         let rate = UsageEvent::failure(
+            "t_test".into(),
             "k".into(),
             "(requests)".into(),
             "m".into(),
@@ -6685,6 +6747,7 @@ mod tests {
         assert_eq!(telemetry_status_code(&rate), 429);
 
         let budget = UsageEvent::failure(
+            "t_test".into(),
             "k".into(),
             "(cost)".into(),
             "m".into(),
@@ -6694,14 +6757,23 @@ mod tests {
         );
         assert_eq!(telemetry_status_code(&budget), 402);
 
-        let residency = UsageEvent::sovereign_block("k".into(), "m".into(), Some("IN".into()));
+        let residency =
+            UsageEvent::sovereign_block("t_test".into(), "k".into(), "m".into(), Some("IN".into()));
         assert_eq!(telemetry_status_code(&residency), 422);
 
-        let guardrail = UsageEvent::guardrails_block("k".into(), "m".into(), None, false, vec![]);
+        let guardrail = UsageEvent::guardrails_block(
+            "t_test".into(),
+            "k".into(),
+            "m".into(),
+            None,
+            false,
+            vec![],
+        );
         assert_eq!(telemetry_status_code(&guardrail), 446);
 
         // A raw provider error string is a real 5xx.
         let provider = UsageEvent::failure(
+            "t_test".into(),
             "k".into(),
             "openai".into(),
             "m".into(),
@@ -6720,6 +6792,7 @@ mod tests {
         let caps = unentitled();
         let tel = TelemetryCtx {
             tenant_id: "t",
+            resource_tenant_id: None,
             request_id: "r",
             capabilities: &caps,
             streaming: false,
@@ -6727,6 +6800,7 @@ mod tests {
             contains_regulated_data: false,
         };
         let rate = UsageEvent::failure(
+            "t_test".into(),
             "k".into(),
             "(requests)".into(),
             "m".into(),
@@ -6744,6 +6818,7 @@ mod tests {
         // streamed outcome is recorded with streaming=true (was always false).
         let caps = unentitled();
         let ev = UsageEvent::success(
+            "t_test".into(),
             "k".into(),
             "openai".into(),
             "m".into(),
@@ -6756,6 +6831,7 @@ mod tests {
 
         let streamed = TelemetryCtx {
             tenant_id: "t",
+            resource_tenant_id: None,
             request_id: "r",
             capabilities: &caps,
             streaming: true,
@@ -6766,6 +6842,7 @@ mod tests {
 
         let buffered = TelemetryCtx {
             tenant_id: "t",
+            resource_tenant_id: None,
             request_id: "r",
             capabilities: &caps,
             streaming: false,
@@ -6785,6 +6862,7 @@ mod tests {
 
         // Sovereign success: served IN to satisfy an IN residency requirement.
         let served = UsageEvent::success(
+            "t_test".into(),
             "k".into(),
             "azure_openai".into(),
             "m".into(),
@@ -6796,6 +6874,7 @@ mod tests {
         );
         let tel = TelemetryCtx {
             tenant_id: "t",
+            resource_tenant_id: None,
             request_id: "r",
             capabilities: &caps,
             streaming: false,
@@ -6808,6 +6887,7 @@ mod tests {
 
         // Non-sovereign success: a served route region, no residency requirement.
         let no_residency = UsageEvent::success(
+            "t_test".into(),
             "k".into(),
             "openai".into(),
             "m".into(),
@@ -6819,6 +6899,7 @@ mod tests {
         );
         let tel_us = TelemetryCtx {
             tenant_id: "t",
+            resource_tenant_id: None,
             request_id: "r",
             capabilities: &caps,
             streaming: false,
@@ -6830,9 +6911,11 @@ mod tests {
         assert_eq!(t2.required_region, None);
 
         // Residency block: a required region but no served route (no provider).
-        let blocked = UsageEvent::sovereign_block("k".into(), "m".into(), Some("IN".into()));
+        let blocked =
+            UsageEvent::sovereign_block("t_test".into(), "k".into(), "m".into(), Some("IN".into()));
         let tel_block = TelemetryCtx {
             tenant_id: "t",
+            resource_tenant_id: None,
             request_id: "r",
             capabilities: &caps,
             streaming: false,
@@ -6857,6 +6940,7 @@ mod tests {
         // Regulated data present, but NOT region-locked (e.g. an Aadhaar with no
         // `x-routeplane-residency`): contains_regulated_data=true, sovereign=false.
         let unlocked = UsageEvent::success(
+            "t_test".into(),
             "k".into(),
             "openai".into(),
             "m".into(),
@@ -6868,6 +6952,7 @@ mod tests {
         );
         let tel_reg = TelemetryCtx {
             tenant_id: "t",
+            resource_tenant_id: None,
             request_id: "r",
             capabilities: &caps,
             streaming: false,
@@ -6881,6 +6966,7 @@ mod tests {
         // No regulated data at all: both false.
         let tel_clean = TelemetryCtx {
             tenant_id: "t",
+            resource_tenant_id: None,
             request_id: "r",
             capabilities: &caps,
             streaming: false,
@@ -6893,6 +6979,7 @@ mod tests {
 
         // Region-locked sovereign route: both true.
         let locked = UsageEvent::success(
+            "t_test".into(),
             "k".into(),
             "azure_openai".into(),
             "m".into(),
@@ -6904,6 +6991,7 @@ mod tests {
         );
         let tel_locked = TelemetryCtx {
             tenant_id: "t",
+            resource_tenant_id: None,
             request_id: "r",
             capabilities: &caps,
             streaming: false,
@@ -7202,6 +7290,7 @@ mod tests {
         record_metrics_into(
             &m,
             &UsageEvent::success(
+                "t_test".into(),
                 "k".into(),
                 "openai".into(),
                 "gpt-4o".into(),
@@ -7223,6 +7312,7 @@ mod tests {
         record_metrics_into(
             &m,
             &UsageEvent::success(
+                "t_test".into(),
                 "k".into(),
                 "anthropic".into(),
                 "claude".into(),
@@ -7239,6 +7329,7 @@ mod tests {
         record_metrics_into(
             &m,
             &UsageEvent::failure(
+                "t_test".into(),
                 "k".into(),
                 "anthropic".into(),
                 "claude".into(),
@@ -7251,18 +7342,31 @@ mod tests {
         // 4. Residency block (sentinel provider) → residency_blocked under `other`.
         record_metrics_into(
             &m,
-            &UsageEvent::sovereign_block("k".into(), "m".into(), Some("IN".into())),
+            &UsageEvent::sovereign_block(
+                "t_test".into(),
+                "k".into(),
+                "m".into(),
+                Some("IN".into()),
+            ),
         );
         // 5. Before-request guardrail denial → guardrail_denied under `other`.
         record_metrics_into(
             &m,
-            &UsageEvent::guardrails_block("k".into(), "m".into(), None, false, vec![]),
+            &UsageEvent::guardrails_block(
+                "t_test".into(),
+                "k".into(),
+                "m".into(),
+                None,
+                false,
+                vec![],
+            ),
         );
         // 6. After-request (output) denial on a REAL provider → guardrail_denied
         //    on that provider + tokens (the upstream call really spent them).
         record_metrics_into(
             &m,
             &UsageEvent::guardrails_output_denied(
+                "t_test".into(),
                 "k".into(),
                 "openai".into(),
                 "gpt-4o".into(),
@@ -7278,6 +7382,7 @@ mod tests {
         record_metrics_into(
             &m,
             &UsageEvent::failure(
+                "t_test".into(),
                 "k".into(),
                 "(rate_limit_requests)".into(),
                 "gpt-4o".into(),
@@ -7290,6 +7395,7 @@ mod tests {
         record_metrics_into(
             &m,
             &UsageEvent::failure(
+                "t_test".into(),
                 "k".into(),
                 "(budget_cost)".into(),
                 "gpt-4o".into(),
@@ -7302,6 +7408,7 @@ mod tests {
         record_metrics_into(
             &m,
             &UsageEvent::success(
+                "t_test".into(),
                 "k".into(),
                 "(cache)".into(),
                 "gpt-4o".into(),
@@ -7317,6 +7424,7 @@ mod tests {
         record_metrics_into(
             &m,
             &UsageEvent::success(
+                "t_test".into(),
                 "k".into(),
                 "openai".into(),
                 "gpt-4o".into(),
@@ -7332,6 +7440,7 @@ mod tests {
         record_metrics_into(
             &m,
             &UsageEvent::prompt_render(
+                "t_test".into(),
                 "k".into(),
                 "gpt-4o".into(),
                 "prompt_x".into(),
@@ -7342,7 +7451,7 @@ mod tests {
             ),
         );
 
-        let body = m.render(0);
+        let body = m.render(0, None);
 
         // Request outcomes.
         // openai successes: case 1 + case 10 (cache-miss annotation rides a success).
@@ -7556,7 +7665,9 @@ mod tests {
             guardrail_engine: GuardrailEngine::new(),
             #[cfg(feature = "enterprise")]
             tokenizer_key: TokenizerKey::default(),
-            observability_engine: ObservabilityEngine::new(),
+            observability_engine: ObservabilityEngine::new(vec![
+                TenantId::new("t_test").expect("canonical test tenant")
+            ]),
             residency_engine: ResidencyEngine::new(),
             health: HealthTracker::new(["openai"]),
             router: Router::with_defaults(),
@@ -7589,7 +7700,7 @@ mod tests {
             name: "k".into(),
             routeplane_key: "rp_test".into(),
             provider_keys: HashMap::from([("openai".to_string(), "sk-test".to_string())]),
-            tenant_id: None,
+            tenant_id: Some("t_test".into()),
             lifecycle_state: routeplane_entitlements::TenantState::Active,
             tier: Tier::Free,
             capability_overrides: BTreeSet::new(),
@@ -7746,7 +7857,9 @@ mod tests {
             guardrail_engine: GuardrailEngine::new(),
             #[cfg(feature = "enterprise")]
             tokenizer_key: TokenizerKey::default(),
-            observability_engine: ObservabilityEngine::new(),
+            observability_engine: ObservabilityEngine::new(vec![
+                TenantId::new("t_test").expect("canonical test tenant")
+            ]),
             residency_engine: ResidencyEngine::new(),
             health: HealthTracker::new(["slow", "fast"]),
             router: Router::with_defaults(),
@@ -7794,7 +7907,7 @@ mod tests {
                 ("slow".to_string(), "sk-slow".to_string()),
                 ("fast".to_string(), "sk-fast".to_string()),
             ]),
-            tenant_id: None,
+            tenant_id: Some("t_test".into()),
             lifecycle_state: routeplane_entitlements::TenantState::Active,
             tier: Tier::Standard,
             capability_overrides: BTreeSet::new(),
@@ -7856,9 +7969,12 @@ mod tests {
     /// task), so poll on a real-time budget rather than reading once (matches the
     /// `ab_parity` harness note).
     async fn assert_single_success(state: &AppState, want_provider: &str, want_hedged: bool) {
+        let tenant_id = TenantId::new("t_test").expect("canonical test tenant");
         let mut successes = Vec::new();
         for _ in 0..200 {
-            let events = state.observability_engine.get_recent_events();
+            let events = state
+                .observability_engine
+                .recent_events_owned(Some(&tenant_id));
             successes = events.into_iter().filter(|e| e.success).collect();
             if !successes.is_empty() {
                 break;
@@ -8007,7 +8123,9 @@ mod tests {
             guardrail_engine: GuardrailEngine::new(),
             #[cfg(feature = "enterprise")]
             tokenizer_key: TokenizerKey::default(),
-            observability_engine: ObservabilityEngine::new(),
+            observability_engine: ObservabilityEngine::new(vec![
+                TenantId::new("t_test").expect("canonical test tenant")
+            ]),
             residency_engine: ResidencyEngine::new(),
             health: HealthTracker::new(["a", "b", "c"]),
             router: Router::with_defaults(),
@@ -8140,7 +8258,9 @@ mod tests {
             guardrail_engine: GuardrailEngine::new(),
             #[cfg(feature = "enterprise")]
             tokenizer_key: TokenizerKey::default(),
-            observability_engine: ObservabilityEngine::new(),
+            observability_engine: ObservabilityEngine::new(vec![
+                TenantId::new("t_test").expect("canonical test tenant")
+            ]),
             residency_engine: ResidencyEngine::new(),
             health: HealthTracker::new(["openai"]),
             router: Router::with_defaults(),
@@ -8434,7 +8554,9 @@ mod tests {
             guardrail_engine: GuardrailEngine::new(),
             #[cfg(feature = "enterprise")]
             tokenizer_key: TokenizerKey::default(),
-            observability_engine: ObservabilityEngine::new(),
+            observability_engine: ObservabilityEngine::new(vec![
+                TenantId::new("t_test").expect("canonical test tenant")
+            ]),
             residency_engine: ResidencyEngine::new(),
             health: HealthTracker::new(["openai"]),
             router: Router::with_defaults(),
@@ -8463,16 +8585,21 @@ mod tests {
             custom_providers: Arc::new(crate::custom_providers::CustomProviderStore::ephemeral()),
         };
         assert!(!state.export.is_enabled());
-        state.emit_usage(UsageEvent::success(
-            "k".into(),
-            "openai".into(),
-            "gpt-4o".into(),
-            1,
-            1,
-            2,
-            None,
-            false,
-        ));
+        let resource_tenant_id = TenantId::new("t_test").expect("canonical test tenant");
+        state.emit_usage(
+            Some(&resource_tenant_id),
+            UsageEvent::success(
+                "t_test".into(),
+                "k".into(),
+                "openai".into(),
+                "gpt-4o".into(),
+                1,
+                1,
+                2,
+                None,
+                false,
+            ),
+        );
         state.export_security(
             "req_x",
             Some("t_1"),
@@ -8488,7 +8615,12 @@ mod tests {
         // background task, so poll briefly for the event to land.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if state.observability_engine.get_recent_events().len() == 1 {
+            if state
+                .observability_engine
+                .recent_events_owned(Some(&resource_tenant_id))
+                .len()
+                == 1
+            {
                 break;
             }
             assert!(
@@ -8517,7 +8649,9 @@ mod tests {
             guardrail_engine: GuardrailEngine::new(),
             #[cfg(feature = "enterprise")]
             tokenizer_key: TokenizerKey::default(),
-            observability_engine: ObservabilityEngine::new(),
+            observability_engine: ObservabilityEngine::new(vec![
+                TenantId::new("t_test").expect("canonical test tenant")
+            ]),
             residency_engine: ResidencyEngine::new(),
             health: HealthTracker::new(["openai"]),
             router: Router::with_defaults(),
@@ -9167,7 +9301,9 @@ mod tests {
             guardrail_engine: GuardrailEngine::new(),
             #[cfg(feature = "enterprise")]
             tokenizer_key: TokenizerKey::default(),
-            observability_engine: ObservabilityEngine::new(),
+            observability_engine: ObservabilityEngine::new(vec![
+                TenantId::new("t_test").expect("canonical test tenant")
+            ]),
             residency_engine: ResidencyEngine::new(),
             health: HealthTracker::new([name]),
             router: Router::with_defaults(),
@@ -9248,6 +9384,7 @@ mod tests {
         assert_eq!(state.health.in_flight("t_test", "err"), 0);
         let outcome = attempt_target(
             "t_test",
+            None,
             &state,
             &target,
             &req,
@@ -9322,6 +9459,7 @@ mod tests {
 
         let outcome = attempt_target(
             "t_test",
+            None,
             &state,
             &target,
             &req,
@@ -9351,6 +9489,7 @@ mod tests {
     fn compliance_ctx(frameworks: &[&str], mode: crate::auth::ComplianceMode) -> TenantContext {
         TenantContext {
             tenant_id: "t_comp".into(),
+            resource_tenant_id: None,
             tier: Tier::Standard,
             capabilities: CapabilitySet::resolve(
                 Tier::Standard,
@@ -9435,7 +9574,9 @@ mod tests {
             guardrail_engine: GuardrailEngine::new(),
             #[cfg(feature = "enterprise")]
             tokenizer_key: TokenizerKey::default(),
-            observability_engine: ObservabilityEngine::new(),
+            observability_engine: ObservabilityEngine::new(vec![
+                TenantId::new("t_test").expect("canonical test tenant")
+            ]),
             residency_engine: ResidencyEngine::new(),
             health: HealthTracker::new([] as [&str; 0]),
             router: Router::with_defaults(),

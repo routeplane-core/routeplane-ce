@@ -45,6 +45,7 @@ fn auth() -> SharedAuthState {
 fn ctx(tier: Tier, tenant: &str) -> TenantContext {
     TenantContext {
         tenant_id: tenant.into(),
+        resource_tenant_id: routeplane_types::TenantId::new(tenant).ok(),
         tier,
         capabilities: CapabilitySet::resolve(tier, &BTreeSet::new(), &BTreeSet::new()),
         compliance_frameworks: Vec::new(),
@@ -64,7 +65,10 @@ async fn body_json(resp: Response) -> serde_json::Value {
 /// so the assertion never races the background writer.
 async fn record_and_settle(state: &AppState, event: UsageEvent) {
     let before = state.observability_engine.get_recent_events().len();
-    state.observability_engine.record_usage(event);
+    let resource_tenant_id = routeplane_types::TenantId::new(&event.tenant_id).ok();
+    state
+        .observability_engine
+        .record_usage(resource_tenant_id.as_ref(), event);
     let deadline = Instant::now() + Duration::from_secs(2);
     while state.observability_engine.get_recent_events().len() <= before {
         if Instant::now() > deadline {
@@ -110,6 +114,7 @@ async fn residency_report_is_tenant_isolated_and_classifies() {
     record_and_settle(
         &state,
         UsageEvent::success(
+            "t_acme".into(),
             "k_acme_a".into(),
             "gemini".into(),
             "gemini-pro".into(),
@@ -124,13 +129,19 @@ async fn residency_report_is_tenant_isolated_and_classifies() {
     // A sovereign BLOCK on the tenant's OWN key (residency_blocked, 422).
     record_and_settle(
         &state,
-        UsageEvent::sovereign_block("k_acme_b".into(), "gpt-4o".into(), Some("IN".into())),
+        UsageEvent::sovereign_block(
+            "t_acme".into(),
+            "k_acme_b".into(),
+            "gpt-4o".into(),
+            Some("IN".into()),
+        ),
     )
     .await;
     // Another tenant's sovereign-routed success — must never appear.
     record_and_settle(
         &state,
         UsageEvent::success(
+            "t_other".into(),
             "k_other".into(),
             "gemini".into(),
             "gemini-pro".into(),
