@@ -773,7 +773,7 @@ struct TenantObservability {
     /// retention shares. Zero-share tenants allocate no usage lane or ring.
     usage: Option<UsageState>,
     #[cfg(any(test, feature = "bench-internals"))]
-    // `cargo bench` also compiles the gateway binary, where the Criterion-only
+    // `cargo bench` also compiles the gateway binary, where the benchmark-only
     // harness is absent. The separate benchmark target reads this field.
     #[cfg_attr(all(feature = "bench-internals", not(test)), allow(dead_code))]
     ingest_share: usize,
@@ -2507,7 +2507,7 @@ pub struct ResidencyLedgerRow {
     pub virtual_key_name: String,
 }
 
-/// Criterion-only access to the production admission seam.
+/// Benchmark-only access to the production admission seam.
 #[cfg(feature = "bench-internals")]
 // Cargo also compiles the gateway binary for integration benchmarks. That
 // duplicate module does not consume this harness; the benchmark target does.

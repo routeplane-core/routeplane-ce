@@ -1865,7 +1865,6 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
- "criterion",
  "dotenvy",
  "futures",
  "getrandom 0.2.17",
