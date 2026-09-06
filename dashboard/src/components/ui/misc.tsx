@@ -96,19 +96,28 @@ export function Pagination({
 
 export function CopyButton({ value, label, className }: { value: string; label?: string; className?: string }) {
   const [copied, setCopied] = useState(false);
+  const [failed, setFailed] = useState(false);
   return (
     <Button
       variant="outline"
       size="sm"
       className={className}
-      onClick={() => {
-        navigator.clipboard?.writeText(value);
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
+      aria-label={failed ? "Copy failed; select the displayed value to copy manually" : copied ? "Copied" : label || "Copy"}
+      onClick={async () => {
+        try {
+          if (!navigator.clipboard) throw new Error("Clipboard unavailable");
+          await navigator.clipboard.writeText(value);
+          setCopied(true);
+          setFailed(false);
+          setTimeout(() => setCopied(false), 1500);
+        } catch {
+          setCopied(false);
+          setFailed(true);
+        }
       }}
     >
       {copied ? <Check size={14} className="text-success" /> : <Copy size={14} />}
-      {label ?? (copied ? "Copied" : "Copy")}
+      {failed ? "Copy failed" : copied ? "Copied" : label ?? "Copy"}
     </Button>
   );
 }
@@ -142,7 +151,7 @@ export function KeyValueList({
   return (
     <dl className={cn("divide-y text-sm", className)}>
       {items.map((it, i) => (
-        <div key={i} className="flex items-start justify-between gap-4 py-2">
+        <div key={i} className="flex flex-wrap items-start justify-between gap-2 py-2 sm:flex-nowrap sm:gap-4">
           <dt className="shrink-0 text-muted-foreground">{it.label}</dt>
           <dd className="min-w-0 break-words text-right font-medium">{it.value}</dd>
         </div>

@@ -1,6 +1,6 @@
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
-import type { ReactNode } from "react";
+import type { ComponentProps, ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
 // A right-side sheet for detail drill-downs (logs, traces, agent runs).
@@ -12,16 +12,19 @@ export function DrawerContent({
   className,
   children,
   size = "md",
+  onCloseAutoFocus,
 }: {
   className?: string;
   children: ReactNode;
   size?: "md" | "lg" | "xl";
+  onCloseAutoFocus?: ComponentProps<typeof DialogPrimitive.Content>["onCloseAutoFocus"];
 }) {
   const widths = { md: "max-w-md", lg: "max-w-xl", xl: "max-w-3xl" };
   return (
     <DialogPrimitive.Portal>
       <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm animate-overlay-in" />
       <DialogPrimitive.Content
+        onCloseAutoFocus={onCloseAutoFocus}
         className={cn(
           "fixed inset-y-0 right-0 z-50 flex w-[calc(100vw-3rem)] flex-col border-l bg-card shadow-xl outline-none",
           "data-[state=open]:animate-fade-in",
@@ -49,14 +52,14 @@ export function DrawerHeader({
       <div className="min-w-0">
         <DialogPrimitive.Title className="truncate text-sm font-semibold tracking-tight">{title}</DialogPrimitive.Title>
         {description && (
-          <DialogPrimitive.Description className="mt-0.5 text-sm text-muted-foreground">
+          <DialogPrimitive.Description className="mt-0.5 break-all text-sm text-muted-foreground">
             {description}
           </DialogPrimitive.Description>
         )}
       </div>
       <div className="flex items-center gap-1">
         {action}
-        <DialogPrimitive.Close className="rounded-md p-1 text-muted-foreground hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+        <DialogPrimitive.Close aria-label="Close panel" className="rounded-md p-1 text-muted-foreground hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
           <X size={16} />
         </DialogPrimitive.Close>
       </div>

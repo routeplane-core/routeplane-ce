@@ -26,9 +26,9 @@ export function Overview() {
   const successRate = totalRequests > 0 ? successRequests / totalRequests : 0;
 
   const cache = status.data?.cache;
-  const providers = status.data?.providers ?? [];
-  const healthy = providers.filter((p) => p.circuit === "closed").length;
-  const openCircuits = providers.filter((p) => p.circuit === "open").length;
+  const providers = status.data?.providers;
+  const healthy = providers?.filter((p) => p.circuit === "closed").length;
+  const openCircuits = providers?.filter((p) => p.circuit === "open").length;
 
   const modelCount = models.data?.data.length ?? 0;
 
@@ -71,14 +71,14 @@ export function Overview() {
           label="Cache hit-rate"
           value={status.isLoading ? "…" : cache ? formatPercent(cache.hit_rate) : "—"}
           loading={status.isLoading}
-          sub={cache ? `${formatCompact(cache.entries)} entries` : "exact-match cache"}
+          sub={cache ? `${formatCompact(cache.entries)} entries` : "Cache diagnostics unavailable"}
         />
         <StatCard
           icon={Boxes}
           label="Models"
           value={models.isLoading ? "…" : formatNumber(modelCount)}
           loading={models.isLoading}
-          sub={`${providers.length} provider${providers.length === 1 ? "" : "s"} wired`}
+          sub={providers ? `${providers.length} provider${providers.length === 1 ? "" : "s"} in status snapshot` : "Provider inventory unavailable"}
         />
       </div>
 
@@ -130,6 +130,8 @@ export function Overview() {
               <SkeletonRows rows={3} />
             ) : status.isError ? (
               <ErrorState message="The gateway's /status didn't respond." onRetry={() => status.refetch()} />
+            ) : !providers ? (
+              <div className="py-6 text-center text-sm text-muted-foreground">Provider diagnostics unavailable. Public /status reports liveness only.</div>
             ) : providers.length === 0 ? (
               <div className="py-6 text-center text-sm text-muted-foreground">No providers reporting.</div>
             ) : (
@@ -144,7 +146,7 @@ export function Overview() {
                   <span className="flex items-center gap-2 text-muted-foreground">
                     <HeartPulse size={14} /> Open circuits
                   </span>
-                  <Badge tone={openCircuits > 0 ? "danger" : "neutral"}>{openCircuits}</Badge>
+                  <Badge tone={openCircuits && openCircuits > 0 ? "danger" : "neutral"}>{openCircuits}</Badge>
                 </div>
                 <ul className="space-y-1.5 pt-1">
                   {providers.slice(0, 6).map((p) => (

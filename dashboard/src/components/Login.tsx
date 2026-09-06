@@ -54,7 +54,7 @@ export function Login() {
         <div className="rounded-xl border bg-card p-6 shadow-sm">
           <h1 className="text-lg font-semibold">{isSignup ? "Create your account" : "Sign in"}</h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            {isSignup ? "Set up an account for this gateway's console." : "Use your email and password."}
+            {isSignup ? "Account creation is disabled by default. Ask your operator to enable signup during a controlled setup window." : "Use your email and password."}
           </p>
 
           <form onSubmit={submit} className="mt-4 space-y-3">
@@ -127,7 +127,7 @@ export function Login() {
                 <KeyRound size={15} /> Sign in with SSO <Badge tone="primary">Enterprise</Badge>
               </button>
             </a>
-            <p className="mt-2 flex items-center justify-center gap-1.5 text-xs text-muted-foreground">
+            <p className="mt-2 flex flex-wrap items-center justify-center gap-1.5 text-xs text-muted-foreground">
               <ShieldCheck size={13} /> Two-factor authentication & SSO/SCIM are available on
               <a href={CONTACT_URL} target="_blank" rel="noreferrer noopener" className="inline-flex items-center gap-0.5 font-medium text-primary hover:underline">
                 Enterprise <ArrowUpRight size={11} />

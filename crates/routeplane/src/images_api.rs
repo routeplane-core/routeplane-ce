@@ -140,7 +140,8 @@ pub async fn image_generation(
                 region.as_str(),
                 classification.entities
             );
-            state.observability_engine.record_usage(
+            state.observability_engine.record_usage_with_request_id(
+                &request_id,
                 tenant_ctx.resource_tenant_id.as_ref(),
                 UsageEvent::sovereign_block(
                     tenant_ctx.tenant_id.clone(),
@@ -164,7 +165,10 @@ pub async fn image_generation(
                     UsageTotals::default(),
                 )
             });
-            return crate::api_error::sovereign_block(region.as_str());
+            return crate::provenance::correlate_response(
+                crate::api_error::sovereign_block(region.as_str()),
+                &request_id,
+            );
         }
         tracing::info!(
             "Sovereign routing enforced (images): region={} eligible={:?}",
@@ -210,7 +214,8 @@ pub async fn image_generation(
             breach.scope_header(),
             breach.policy_id()
         );
-        state.observability_engine.record_usage(
+        state.observability_engine.record_usage_with_request_id(
+            &request_id,
             tenant_ctx.resource_tenant_id.as_ref(),
             UsageEvent::failure(
                 tenant_ctx.tenant_id.clone(),
@@ -226,7 +231,10 @@ pub async fn image_generation(
                 },
             ),
         );
-        return crate::embeddings::limit_rejection_response(&breach);
+        return crate::provenance::correlate_response(
+            crate::embeddings::limit_rejection_response(&breach),
+            &request_id,
+        );
     }
 
     // 6. Attempt loop — no streaming, no cache. First success wins.
@@ -322,7 +330,8 @@ pub async fn image_generation(
                     )
                 });
 
-                state.observability_engine.record_usage(
+                state.observability_engine.record_usage_with_request_id(
+                    &request_id,
                     tenant_ctx.resource_tenant_id.as_ref(),
                     UsageEvent::success(
                         tenant_ctx.tenant_id.clone(),
@@ -379,7 +388,8 @@ pub async fn image_generation(
                 }
                 last_not_supported = this_not_supported;
                 last_error = e.to_string();
-                state.observability_engine.record_usage(
+                state.observability_engine.record_usage_with_request_id(
+                    &request_id,
                     tenant_ctx.resource_tenant_id.as_ref(),
                     UsageEvent::failure(
                         tenant_ctx.tenant_id.clone(),
@@ -404,7 +414,10 @@ pub async fn image_generation(
     // 7. Exhausted. A pure unsupported-image outcome is an explicit 422 envelope
     //    (never a generic 500); anything else is the all-failed 500.
     if last_not_supported {
-        return image_generation_not_supported_response();
+        return crate::provenance::correlate_response(
+            image_generation_not_supported_response(),
+            &request_id,
+        );
     }
     ledger_sink::record_decision(&state.ledger, &tenant_ctx.capabilities, || {
         ledger_sink::decision_draft(
@@ -426,7 +439,7 @@ pub async fn image_generation(
         request_id,
         last_error
     );
-    crate::api_error::upstream_all_failed()
+    crate::provenance::correlate_response(crate::api_error::upstream_all_failed(), &request_id)
 }
 
 /// The explicit 422 `image_generation_not_supported` envelope — an OpenAI-shaped

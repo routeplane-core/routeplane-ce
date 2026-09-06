@@ -243,7 +243,8 @@ async fn run_audio_text(
                 op.label(),
                 region.as_str()
             );
-            state.observability_engine.record_usage(
+            state.observability_engine.record_usage_with_request_id(
+                &request_id,
                 tenant_ctx.resource_tenant_id.as_ref(),
                 UsageEvent::sovereign_block(
                     tenant_ctx.tenant_id.clone(),
@@ -267,7 +268,10 @@ async fn run_audio_text(
                     UsageTotals::default(),
                 )
             });
-            return crate::api_error::sovereign_block(region.as_str());
+            return crate::provenance::correlate_response(
+                crate::api_error::sovereign_block(region.as_str()),
+                &request_id,
+            );
         }
         tracing::info!(
             "Sovereign routing enforced ({}s): region={} eligible={:?}",
@@ -315,7 +319,8 @@ async fn run_audio_text(
             breach.scope_header(),
             breach.policy_id()
         );
-        state.observability_engine.record_usage(
+        state.observability_engine.record_usage_with_request_id(
+            &request_id,
             tenant_ctx.resource_tenant_id.as_ref(),
             UsageEvent::failure(
                 tenant_ctx.tenant_id.clone(),
@@ -331,7 +336,10 @@ async fn run_audio_text(
                 },
             ),
         );
-        return crate::embeddings::limit_rejection_response(&breach);
+        return crate::provenance::correlate_response(
+            crate::embeddings::limit_rejection_response(&breach),
+            &request_id,
+        );
     }
 
     // 5. Attempt loop — no streaming, no cache. First success wins. The audio
@@ -438,7 +446,8 @@ async fn run_audio_text(
                     )
                 });
 
-                state.observability_engine.record_usage(
+                state.observability_engine.record_usage_with_request_id(
+                    &request_id,
                     tenant_ctx.resource_tenant_id.as_ref(),
                     UsageEvent::success(
                         tenant_ctx.tenant_id.clone(),
@@ -498,7 +507,8 @@ async fn run_audio_text(
                 }
                 last_not_supported = this_not_supported;
                 last_error = e.to_string();
-                state.observability_engine.record_usage(
+                state.observability_engine.record_usage_with_request_id(
+                    &request_id,
                     tenant_ctx.resource_tenant_id.as_ref(),
                     UsageEvent::failure(
                         tenant_ctx.tenant_id.clone(),
@@ -524,7 +534,7 @@ async fn run_audio_text(
     // 6. Exhausted. A pure unsupported-capability outcome is an explicit 422
     //    envelope (never a generic 500); anything else is the all-failed 500.
     if last_not_supported {
-        return op.not_supported_response();
+        return crate::provenance::correlate_response(op.not_supported_response(), &request_id);
     }
     ledger_sink::record_decision(&state.ledger, &tenant_ctx.capabilities, || {
         ledger_sink::decision_draft(
@@ -547,7 +557,7 @@ async fn run_audio_text(
         request_id,
         last_error
     );
-    crate::api_error::upstream_all_failed()
+    crate::provenance::correlate_response(crate::api_error::upstream_all_failed(), &request_id)
 }
 
 /// `POST /v1/audio/speech` — the OpenAI-compatible text-to-speech (TTS) route.
@@ -665,7 +675,8 @@ pub async fn speech(
                 region.as_str(),
                 classification.entities
             );
-            state.observability_engine.record_usage(
+            state.observability_engine.record_usage_with_request_id(
+                &request_id,
                 tenant_ctx.resource_tenant_id.as_ref(),
                 UsageEvent::sovereign_block(
                     tenant_ctx.tenant_id.clone(),
@@ -689,7 +700,7 @@ pub async fn speech(
                     UsageTotals::default(),
                 )
             });
-            return (
+            let response = (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 format!(
                     "Sovereign routing: request contains personal data but no {}-resident provider is configured",
@@ -697,6 +708,7 @@ pub async fn speech(
                 ),
             )
                 .into_response();
+            return crate::provenance::correlate_response(response, &request_id);
         }
         tracing::info!(
             "Sovereign routing enforced (speech): region={} eligible={:?}",
@@ -761,7 +773,8 @@ pub async fn speech(
             breach.scope_header(),
             breach.policy_id()
         );
-        state.observability_engine.record_usage(
+        state.observability_engine.record_usage_with_request_id(
+            &request_id,
             tenant_ctx.resource_tenant_id.as_ref(),
             UsageEvent::failure(
                 tenant_ctx.tenant_id.clone(),
@@ -777,7 +790,10 @@ pub async fn speech(
                 },
             ),
         );
-        return crate::embeddings::limit_rejection_response(&breach);
+        return crate::provenance::correlate_response(
+            crate::embeddings::limit_rejection_response(&breach),
+            &request_id,
+        );
     }
 
     // 6. Attempt loop — no streaming, no cache. First success wins. The request is
@@ -875,7 +891,8 @@ pub async fn speech(
                     )
                 });
 
-                state.observability_engine.record_usage(
+                state.observability_engine.record_usage_with_request_id(
+                    &request_id,
                     tenant_ctx.resource_tenant_id.as_ref(),
                     UsageEvent::success(
                         tenant_ctx.tenant_id.clone(),
@@ -940,7 +957,8 @@ pub async fn speech(
                 }
                 last_not_supported = this_not_supported;
                 last_error = e.to_string();
-                state.observability_engine.record_usage(
+                state.observability_engine.record_usage_with_request_id(
+                    &request_id,
                     tenant_ctx.resource_tenant_id.as_ref(),
                     UsageEvent::failure(
                         tenant_ctx.tenant_id.clone(),
@@ -965,7 +983,7 @@ pub async fn speech(
     // 7. Exhausted. A pure unsupported-speech outcome is an explicit 422 envelope
     //    (never a generic 500); anything else is the all-failed 500.
     if last_not_supported {
-        return speech_not_supported_response();
+        return crate::provenance::correlate_response(speech_not_supported_response(), &request_id);
     }
     ledger_sink::record_decision(&state.ledger, &tenant_ctx.capabilities, || {
         ledger_sink::decision_draft(
@@ -987,7 +1005,7 @@ pub async fn speech(
         request_id,
         last_error
     );
-    crate::api_error::upstream_all_failed()
+    crate::provenance::correlate_response(crate::api_error::upstream_all_failed(), &request_id)
 }
 
 /// The explicit 422 `speech_not_supported` envelope — an OpenAI-shaped error, not

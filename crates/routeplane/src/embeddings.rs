@@ -140,7 +140,8 @@ pub async fn embeddings(
                 region.as_str(),
                 classification.entities
             );
-            state.observability_engine.record_usage(
+            state.observability_engine.record_usage_with_request_id(
+                &request_id,
                 tenant_ctx.resource_tenant_id.as_ref(),
                 UsageEvent::sovereign_block(
                     tenant_ctx.tenant_id.clone(),
@@ -165,7 +166,10 @@ pub async fn embeddings(
                     UsageTotals::default(),
                 )
             });
-            return crate::api_error::sovereign_block(region.as_str());
+            return crate::provenance::correlate_response(
+                crate::api_error::sovereign_block(region.as_str()),
+                &request_id,
+            );
         }
         tracing::info!(
             "Sovereign routing enforced (embeddings): region={} eligible={:?}",
@@ -230,7 +234,8 @@ pub async fn embeddings(
             breach.scope_header(),
             breach.policy_id()
         );
-        state.observability_engine.record_usage(
+        state.observability_engine.record_usage_with_request_id(
+            &request_id,
             tenant_ctx.resource_tenant_id.as_ref(),
             UsageEvent::failure(
                 tenant_ctx.tenant_id.clone(),
@@ -246,7 +251,10 @@ pub async fn embeddings(
                 },
             ),
         );
-        return limit_rejection_response(&breach);
+        return crate::provenance::correlate_response(
+            limit_rejection_response(&breach),
+            &request_id,
+        );
     }
 
     // 6. Attempt loop — no streaming, no cache (FR-6). First success wins.
@@ -349,7 +357,8 @@ pub async fn embeddings(
                 });
 
                 // FR-7 observability: completion_tokens = 0 for embeddings.
-                state.observability_engine.record_usage(
+                state.observability_engine.record_usage_with_request_id(
+                    &request_id,
                     tenant_ctx.resource_tenant_id.as_ref(),
                     UsageEvent::success(
                         tenant_ctx.tenant_id.clone(),
@@ -413,7 +422,8 @@ pub async fn embeddings(
                 }
                 last_not_supported = this_not_supported;
                 last_error = e.to_string();
-                state.observability_engine.record_usage(
+                state.observability_engine.record_usage_with_request_id(
+                    &request_id,
                     tenant_ctx.resource_tenant_id.as_ref(),
                     UsageEvent::failure(
                         tenant_ctx.tenant_id.clone(),
@@ -439,7 +449,10 @@ pub async fn embeddings(
     //    envelope (FR-3, never a generic 500); anything else is the all-failed
     //    500 (matching the chat path's last-error 500).
     if last_not_supported {
-        return embeddings_not_supported_response();
+        return crate::provenance::correlate_response(
+            embeddings_not_supported_response(),
+            &request_id,
+        );
     }
     // F5: mirror chat's exhausted-fallback ledger record (Outcome::AllFailed).
     ledger_sink::record_decision(&state.ledger, &tenant_ctx.capabilities, || {
@@ -462,7 +475,7 @@ pub async fn embeddings(
         request_id,
         last_error
     );
-    crate::api_error::upstream_all_failed()
+    crate::provenance::correlate_response(crate::api_error::upstream_all_failed(), &request_id)
 }
 
 /// The explicit 422 `embeddings_not_supported` envelope (PRD-011 FR-3) — an

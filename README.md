@@ -96,7 +96,7 @@ mutexes, so health bookkeeping never serializes your traffic.
 No clone, no config files — pull the published image and hand it a minimal key registry inline:
 
 ```bash
-docker run -d -p 8080:8080 \
+docker run -d -p 127.0.0.1:8080:8080 \
   -e OPENAI_API_KEY=sk-your-key \
   -e RP_KEYS_JSON='{"keys":[{"name":"default","routeplane_key":"rp_local_dev","tenant_id":"t_local","provider_keys":{"openai":"env:OPENAI_API_KEY"}}]}' \
   ghcr.io/routeplane-core/routeplane-ce:latest
@@ -255,20 +255,25 @@ Source and full docs:
 ## The Console
 
 The same single binary also serves a web console on the gateway's own origin — open
-`http://localhost:8080` in a browser. Create a local operator account, add an
-OpenAI-compatible provider **at runtime with no restart**, try models in the playground,
-and watch the traffic land in usage analytics:
+`http://localhost:8080` in a browser. Self-service signup is **disabled by default**
+(`403`); anonymous requests to logs remain unauthorized (`401`). Before creating an
+operator account, follow the [local console setup guide](dashboard/README.md).
+After signing in, choose a provider and a model that your gateway can actually serve,
+send a request in the Playground, and inspect its retained row in Logs.
 
 ![Demo: creating an operator account in the CE console, adding a local Ollama endpoint as a custom provider at runtime, streaming a haiku from it in the playground, revealing the gateway key, and the request appearing in usage analytics](https://github.com/routeplane-core/routeplane-ce/raw/main/docs/console-demo.gif)
 
-*A real browser session against the real gateway and a local Ollama model — no cloud keys,
-no mocks. Reproduce it (or re-record it) from
+*Historical browser recording against a local Ollama model. It predates default-off
+signup; use the setup guide above for current bootstrap requirements. Recording sources:
 [docs/demo-console/](https://github.com/routeplane-core/routeplane-ce/tree/main/docs/demo-console).*
 
 - **Email + password, self-contained.** Accounts live in a local file
   (`configs/console-accounts.json`, argon2id-hashed); sessions are signed tokens stored only
-  in your browser. Signup is open by design — the first (usually only) operator bootstraps
-  their own account on a box they control. Logout revokes every outstanding session.
+  in your browser. An operator can explicitly enable `RP_CONSOLE_SIGNUP=on` on a
+  trusted, loopback-bound installation to bootstrap an account, then disable it again.
+  Preserve the account file when recreating a container. All console accounts authorize
+  as the selected gateway key: signup is not tenant onboarding. Logout revokes every
+  outstanding session for that account.
 - **Custom providers at runtime.** Any OpenAI-compatible endpoint (vLLM, Ollama, LocalAI, a
   cloud service) — its models appear in `/v1/models` and the playground immediately.
   Upstream keys are write-only: stored server-side with `0600` permissions, echoed back only
@@ -681,7 +686,8 @@ cheaper targets, `latency` prefers the fastest recent EWMA.
 | `RP_CONSOLE_DIR` | Path to the built console SPA; set ⇒ the gateway serves the console (the Docker image sets it) |
 | `RP_CONSOLE_SESSION_SECRET` | Console session-signing secret (≥32 chars); unset ⇒ random per boot, sessions reset on restart |
 | `RP_CONSOLE_ACCOUNTS_FILE` | Console account store (default `configs/console-accounts.json`) |
-| `RP_CONSOLE_KEY` | Which registry key console sessions authorize as (default: the only/first key) |
+| `RP_CONSOLE_SIGNUP` | Explicit `on` enables account creation; disabled by default. Enable only for trusted operator bootstrap. |
+| `RP_CONSOLE_KEY` | Registered gateway key console sessions authorize as; defaults only when the registry has one key. Choose explicitly when multiple keys are registered and console accounts can authorize. |
 | `RP_CUSTOM_PROVIDER_ALLOW_PRIVATE` | `on` ⇒ allow custom providers on loopback/private IPs (local Ollama/vLLM); link-local/metadata always refused |
 
 ## FAQ
