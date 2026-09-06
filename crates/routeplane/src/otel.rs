@@ -583,6 +583,7 @@ mod tests {
     fn sample_event() -> UsageEvent {
         UsageEvent {
             timestamp: Utc::now(),
+            request_id: None,
             virtual_key_name: "rp_test_key".into(),
             tenant_id: String::new(),
             provider: "openai".into(),

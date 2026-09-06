@@ -45,7 +45,7 @@ export function Health() {
         const p = circuitByName.get(name);
         return {
           provider: name,
-          circuit: p?.circuit ?? "closed",
+          circuit: p?.circuit ?? "Unavailable",
           latencyEwmaMs: p?.latency_ewma_ms ?? null,
           requests: reqByName.get(name) ?? 0,
           errors: errByName.get(name) ?? 0,
@@ -100,8 +100,12 @@ export function Health() {
     <>
       <PageHeader
         title="Provider Health"
-        description="Circuit-breaker state and EWMA latency per provider from /status, joined with request and error counters from /metrics."
+        description="Request and error counters from /metrics, with circuit state and latency only when a diagnostic snapshot is available."
       />
+
+      {!status.isLoading && !status.isError && !status.data?.providers && (
+        <p className="mb-4 text-sm text-muted-foreground">Provider diagnostics unavailable. Public /status reports liveness only; traffic counters do not establish circuit health.</p>
+      )}
 
       <Card>
         <CardBody className="p-0">
@@ -114,8 +118,8 @@ export function Health() {
           ) : rows.length === 0 ? (
             <EmptyState
               icon={HeartPulse}
-              title="No providers reporting"
-              description="Once a provider is configured and receives traffic, its circuit state and latency show up here."
+              title={status.data?.providers ? "No providers reporting" : "Provider diagnostics unavailable"}
+              description="No provider rows are available from these responses. This is not proof that no providers are configured."
             />
           ) : (
             <DataTable columns={columns} rows={rows} getRowId={(r) => r.provider} defaultSort={{ key: "requests", dir: "desc" }} />

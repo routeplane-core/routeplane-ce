@@ -22,6 +22,11 @@ use tokio::time::Duration;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UsageEvent {
     pub timestamp: DateTime<Utc>,
+    /// Gateway-generated response identity.
+    /// Never an upstream completion id, caller metadata, or a W3C trace id.
+    /// Absent for historical events and non-request join records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub virtual_key_name: String,
     /// Internal resource authority stamped by [`ObservabilityEngine::record_usage`]
     /// from the validated tenant identity resolved at authentication. This is
@@ -187,6 +192,14 @@ fn safe_usage_error(raw: &str) -> &'static str {
 }
 
 impl UsageEvent {
+    /// Attach the existing gateway response id without changing event identity
+    /// or cardinality. Multiple provider attempts may share this correlation.
+    #[must_use]
+    pub fn with_request_id(mut self, request_id: &str) -> Self {
+        self.request_id = Some(request_id.to_owned());
+        self
+    }
+
     /// Mark this event as a hedged win (ADR-057). No-op-by-default builder so the
     /// non-hedged path stays byte-identical.
     pub fn with_hedged(mut self, hedged: bool) -> Self {
@@ -233,6 +246,7 @@ impl UsageEvent {
     ) -> Self {
         Self {
             timestamp: Utc::now(),
+            request_id: None,
             virtual_key_name,
             tenant_id,
             provider,
@@ -280,6 +294,7 @@ impl UsageEvent {
     ) -> Self {
         Self {
             timestamp: Utc::now(),
+            request_id: None,
             virtual_key_name,
             tenant_id,
             provider,
@@ -325,6 +340,7 @@ impl UsageEvent {
     ) -> Self {
         Self {
             timestamp: Utc::now(),
+            request_id: None,
             virtual_key_name,
             tenant_id,
             provider: "(sovereign_block)".to_string(),
@@ -376,6 +392,7 @@ impl UsageEvent {
     ) -> Self {
         Self {
             timestamp: Utc::now(),
+            request_id: None,
             virtual_key_name,
             tenant_id,
             provider: "(guardrails_denied)".to_string(),
@@ -431,6 +448,7 @@ impl UsageEvent {
     ) -> Self {
         Self {
             timestamp: Utc::now(),
+            request_id: None,
             virtual_key_name,
             tenant_id,
             provider,
@@ -485,6 +503,7 @@ impl UsageEvent {
     ) -> Self {
         Self {
             timestamp: Utc::now(),
+            request_id: None,
             virtual_key_name,
             tenant_id,
             provider: "(prompt_render)".to_string(),
@@ -540,6 +559,7 @@ impl UsageEvent {
     ) -> Self {
         Self {
             timestamp: Utc::now(),
+            request_id: None,
             virtual_key_name,
             tenant_id,
             provider: "(feedback)".to_string(),
@@ -1346,6 +1366,17 @@ impl ObservabilityEngine {
         }
     }
 
+    /// Record an existing request outcome with its gateway response identity.
+    /// Does not change admission, tenant ownership, retention, or event count.
+    pub fn record_usage_with_request_id<'a>(
+        &self,
+        request_id: &str,
+        tenant_id: impl Into<Option<&'a TenantId>>,
+        event: UsageEvent,
+    ) {
+        self.record_usage(tenant_id, event.with_request_id(request_id));
+    }
+
     /// Record a usage event. NON-BLOCKING and lock-free on the hot path: a
     /// single bounded `try_send`. If the channel is full (consumer stalled or a
     /// burst beyond capacity) the event is dropped with a rate-limited warning
@@ -2070,6 +2101,9 @@ pub struct LogRow {
     /// Synthesized stable-ish id (`log_<hex>`): a hash of timestamp + key + model +
     /// provider, so the same event maps to the same id across a snapshot read.
     pub id: String,
+    /// Existing gateway response identity, when retained; not the display id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub timestamp: DateTime<Utc>,
     pub virtual_key_name: String,
     pub provider: String,
@@ -2129,6 +2163,7 @@ impl LogRow {
         };
         LogRow {
             id: synthesize_id(ev),
+            request_id: ev.request_id.clone(),
             timestamp: ev.timestamp,
             virtual_key_name: ev.virtual_key_name.clone(),
             provider: ev.provider.clone(),

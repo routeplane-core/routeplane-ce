@@ -32,6 +32,20 @@ pub fn stamp_provenance(headers: &mut HeaderMap, provider: &str, request_id: &st
     if let Ok(v) = HeaderValue::from_str(provider) {
         headers.insert(PROVIDER_HEADER, v);
     }
+    stamp_request_id(headers, request_id);
+}
+
+/// The same two response aliases on an already-recorded failure/refusal, without
+/// claiming a serving provider. Status, body and all other headers are preserved.
+pub fn correlate_response(
+    mut response: axum::response::Response,
+    request_id: &str,
+) -> axum::response::Response {
+    stamp_request_id(response.headers_mut(), request_id);
+    response
+}
+
+fn stamp_request_id(headers: &mut HeaderMap, request_id: &str) {
     if let Ok(v) = HeaderValue::from_str(request_id) {
         headers.insert(TRACE_ID_HEADER, v.clone());
         headers.insert(REQUEST_ID_HEADER, v);
@@ -41,6 +55,30 @@ pub fn stamp_provenance(headers: &mut HeaderMap, provider: &str, request_id: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn error_correlation_preserves_body_status_headers_without_claiming_provider() {
+        use axum::response::IntoResponse;
+        let mut response =
+            (axum::http::StatusCode::UNPROCESSABLE_ENTITY, "unchanged").into_response();
+        response.headers_mut().insert(
+            "x-content-type-options",
+            HeaderValue::from_static("nosniff"),
+        );
+        let response = correlate_response(response, "req_test");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(response.headers()[TRACE_ID_HEADER], "req_test");
+        assert_eq!(response.headers()[REQUEST_ID_HEADER], "req_test");
+        assert!(!response.headers().contains_key(PROVIDER_HEADER));
+        let bytes = axum::body::to_bytes(response.into_body(), 64)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"unchanged");
+    }
 
     #[test]
     fn stamps_all_three_headers() {

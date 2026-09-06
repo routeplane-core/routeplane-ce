@@ -1,0 +1,22 @@
+name: Dashboard quality
+description: Test, typecheck and build the bundled Community Edition dashboard.
+runs:
+  using: composite
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      with:
+        node-version: '22.23.2'
+        package-manager-cache: false
+
+    - name: Install locked dashboard dependencies
+      shell: bash
+      working-directory: dashboard
+      run: npm ci --no-audit --no-fund
+
+    # The build script runs mandatory node:test contracts, TypeScript and Vite.
+    # Do not use --if-present: a missing or failing script must fail this gate.
+    - name: Test, typecheck and build
+      shell: bash
+      working-directory: dashboard
+      run: npm run build

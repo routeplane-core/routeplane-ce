@@ -134,7 +134,7 @@ export function Providers() {
     const circuitByName = new Map(providers.map((p) => [p.provider, p.circuit]));
     const names = new Set<string>([...circuitByName.keys(), ...modelsByOwner.keys()]);
     return [...names]
-      .map((name) => ({ provider: name, circuit: circuitByName.get(name) ?? "closed", models: modelsByOwner.get(name) ?? 0 }))
+      .map((name) => ({ provider: name, circuit: circuitByName.get(name) ?? "Unavailable", models: modelsByOwner.get(name) ?? 0 }))
       .sort((a, b) => b.models - a.models || a.provider.localeCompare(b.provider));
   }, [status.data, models.data]);
 
@@ -212,14 +212,14 @@ export function Providers() {
       </Card>
 
       <Card className="mt-4">
-        <CardHeader title="All providers (as the gateway sees them)" description="Circuit state from /status and model counts from the catalog — built-in and custom." />
+        <CardHeader title="Catalogue owners and diagnostic snapshots" description="Catalogue entries are suggestions, not proof of configured credentials. Circuit state is unavailable without a diagnostic snapshot; public /status reports liveness only." />
         <CardBody className="p-0">
           {status.isLoading || models.isLoading ? (
             <div className="p-5"><SkeletonRows rows={5} /></div>
           ) : status.isError && models.isError ? (
             <ErrorState message="The gateway didn't respond." onRetry={() => { status.refetch(); models.refetch(); }} />
           ) : rows.length === 0 ? (
-            <EmptyState icon={Plug} title="No providers configured" description="Add a custom provider above, or wire built-ins via .env." />
+            <EmptyState icon={Plug} title="No catalogue or diagnostic rows" description="These responses do not establish which providers are configured. You can still enter an operator-configured provider explicitly in Playground." />
           ) : (
             <DataTable columns={gatewayColumns} rows={rows} getRowId={(r) => r.provider} defaultSort={{ key: "models", dir: "desc" }} />
           )}

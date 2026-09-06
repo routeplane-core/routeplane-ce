@@ -24,6 +24,8 @@ export interface UsageEvent {
 /** One element of `GET /v1/logs` → `{ events: LogRow[] }`. */
 export interface LogRow {
   id: string;
+  /** Gateway-generated req_ response identifier, absent for older retained events. */
+  request_id?: string;
   timestamp: string;
   virtual_key_name: string;
   provider: string;
@@ -39,10 +41,14 @@ export interface LogRow {
   use_case?: string;
 }
 
-/** `GET /status` — cache stats + per-provider circuit/latency snapshot. */
+/** `GET /status` is public liveness: { status: "ok" }.
+ * Optional diagnostics are legacy snapshots, not a guaranteed inventory.
+ * Older gateways may return the snapshot without a status field.
+ */
 export interface StatusResponse {
-  cache: CacheStats;
-  providers: ProviderStatus[];
+  status?: "ok";
+  cache?: CacheStats;
+  providers?: ProviderStatus[];
 }
 
 export interface CacheStats {

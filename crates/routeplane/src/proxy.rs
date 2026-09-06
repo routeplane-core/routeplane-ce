@@ -664,6 +664,13 @@ impl AppState {
     /// (PRD-009 / ADR-024) when the tenant holds `Feature::TelemetryDurable` and a
     /// writer is configured. Off by default ⇒ byte-identical to `emit_usage`.
     fn emit_usage_with_telemetry(&self, event: UsageEvent, tel: TelemetryCtx<'_>) {
+        // Preserve the response's gateway identity even when durable telemetry
+        // is disabled. Join-only prompt/feedback rows are deliberately unchanged.
+        let event = if matches!(event.provider.as_str(), "(prompt_render)" | "(feedback)") {
+            event
+        } else {
+            event.with_request_id(tel.request_id)
+        };
         self.emit_usage_inner(tel.resource_tenant_id, event, Some(tel));
     }
 
@@ -2156,7 +2163,10 @@ fn sovereign_block_response(
         None,
         Some(region.as_str()),
     );
-    crate::api_error::sovereign_block(region.as_str())
+    crate::provenance::correlate_response(
+        crate::api_error::sovereign_block(region.as_str()),
+        request_id,
+    )
 }
 
 /// Response header carrying the `warn`-mode compliance flag ([ADR-035] §4): the
@@ -3779,7 +3789,10 @@ async fn chat_completions_pipeline(
             Some(limit),
             Some(detail),
         );
-        return limit_rejection_response(&breach);
+        return crate::provenance::correlate_response(
+            limit_rejection_response(&breach),
+            &request_id,
+        );
     }
 
     // --- Off-path injection adjudication on the INPUT (R1.1 / ADR-053). ---
@@ -3990,6 +4003,7 @@ async fn chat_completions_pipeline(
                 for (key_index, api_key) in &rt.keys {
                     match attempt_target(
                         &tenant_ctx.tenant_id,
+                        &request_id,
                         tenant_ctx.resource_tenant_id.as_ref(),
                         &state,
                         rt.target,
@@ -4042,6 +4056,7 @@ async fn chat_completions_pipeline(
         Some(hedge) => {
             run_hedged_targets(
                 &tenant_ctx.tenant_id,
+                &request_id,
                 tenant_ctx.resource_tenant_id.as_ref(),
                 &state,
                 &ready
@@ -4744,7 +4759,10 @@ async fn chat_completions_pipeline(
     );
     // Surface a terminal client-class 4xx as its real status so an OpenAI SDK
     // doesn't blind-retry a 500; infra-class exhaustion stays the generic 500.
-    crate::api_error::upstream_failed(last_client_status)
+    crate::provenance::correlate_response(
+        crate::api_error::upstream_failed(last_client_status),
+        &request_id,
+    )
 }
 
 /// The result of driving ONE target's full attempt sequence (initial try +
@@ -4805,6 +4823,7 @@ async fn attempt_target(
     // so adapter scope and health scope can never diverge (the breaker follows
     // the adapter).
     tenant_id: &str,
+    request_id: &str,
     resource_tenant_id: Option<&TenantId>,
     state: &AppState,
     target: &TargetPlan,
@@ -5036,6 +5055,7 @@ async fn attempt_target(
                         sovereign,
                         last_error.clone(),
                     )
+                    .with_request_id(request_id)
                     .with_config(config_ref_label, config_matched_label.map(str::to_string)),
                 );
                 if is_retryable(&e, &target.retry)
@@ -5102,6 +5122,7 @@ async fn run_hedged_targets(
     // so concurrent hedges score health under the same scope as the sequential
     // path (the breaker follows the adapter).
     tenant_id: &str,
+    request_id: &str,
     resource_tenant_id: Option<&TenantId>,
     state: &Arc<AppState>,
     ready: &[(usize, &TargetPlan, &ChatCompletionRequest, &str)],
@@ -5160,6 +5181,7 @@ async fn run_hedged_targets(
             in_flight.push(Box::pin(async move {
                 let outcome = attempt_target(
                     tenant_id,
+                    request_id,
                     resource_tenant_id.as_ref(),
                     &state,
                     &target,
@@ -6476,7 +6498,10 @@ async fn stream_chat_completions(
     );
     // Surface a terminal client-class 4xx as its real status so an OpenAI SDK
     // doesn't blind-retry a 500; infra-class exhaustion stays the generic 500.
-    crate::api_error::upstream_failed(last_client_status)
+    crate::provenance::correlate_response(
+        crate::api_error::upstream_failed(last_client_status),
+        &request_id,
+    )
 }
 
 #[cfg(test)]
@@ -9384,6 +9409,7 @@ mod tests {
         assert_eq!(state.health.in_flight("t_test", "err"), 0);
         let outcome = attempt_target(
             "t_test",
+            "req_test",
             None,
             &state,
             &target,
@@ -9459,6 +9485,7 @@ mod tests {
 
         let outcome = attempt_target(
             "t_test",
+            "req_test",
             None,
             &state,
             &target,

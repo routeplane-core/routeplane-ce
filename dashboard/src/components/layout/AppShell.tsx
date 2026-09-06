@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { Command, Lock, LogOut, Moon, PanelLeftClose, PanelLeft, Sun, User } from "lucide-react";
@@ -18,26 +18,35 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { CommandPalette } from "@/components/ui/command-palette";
-import { BrandLockup, LogoMark } from "@/components/ui/logo";
+import { BrandLockup } from "@/components/ui/logo";
+import { Drawer, DrawerContent, DrawerHeader, DrawerTrigger } from "@/components/ui/drawer";
 
 export function AppShell() {
   const { theme, toggle } = useTheme();
   const [collapsed, setCollapsed] = useState(false);
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const mobileTrigger = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const media = window.matchMedia("(min-width: 768px)");
+    const closeOnDesktop = () => { if (media.matches) setMobileOpen(false); };
+    media.addEventListener("change", closeOnDesktop);
+    return () => media.removeEventListener("change", closeOnDesktop);
+  }, []);
   // A cheap liveness probe that doubles as the header connection indicator.
   const status = useQuery({ queryKey: ["status"], queryFn: api.getStatus, retry: 0 });
   const connected = status.isSuccess;
   const me = useQuery({ queryKey: ["console-me"], queryFn: fetchMe, staleTime: 300_000 });
 
   return (
-    <div className={cn("grid min-h-screen", collapsed ? "grid-cols-[64px_1fr]" : "grid-cols-[248px_1fr]")}>
+    <div className={cn("grid min-h-screen grid-cols-[minmax(0,1fr)]", collapsed ? "md:grid-cols-[64px_minmax(0,1fr)]" : "md:grid-cols-[248px_minmax(0,1fr)]")}>
       <CommandPalette />
 
-      <aside className="flex flex-col border-r bg-sidebar text-sidebar-foreground">
-        <div className="flex h-14 items-center gap-2 border-b px-4">
-          {collapsed ? <LogoMark size={32} /> : <BrandLockup sublabel="CE Console" size={32} />}
+      <aside className="hidden min-w-0 flex-col border-r bg-sidebar text-sidebar-foreground md:flex">
+        <div className={cn("flex h-14 items-center border-b", collapsed ? "justify-center px-2" : "gap-2 px-4")}>
+          {!collapsed && <BrandLockup sublabel="CE Console" size={32} />}
           <button
             onClick={() => setCollapsed((c) => !c)}
-            className="ml-auto rounded-md p-1 text-muted-foreground hover:bg-muted"
+            className={cn("grid h-8 w-8 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-muted", !collapsed && "ml-auto")}
             aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
           >
             {collapsed ? <PanelLeft size={16} /> : <PanelLeftClose size={16} />}
@@ -58,6 +67,7 @@ export function AppShell() {
                     key={item.path}
                     to={item.path}
                     end={item.path === "/"}
+                    aria-label={item.label}
                     className={({ isActive }) =>
                       cn(
                         "flex items-center gap-2.5 rounded-md px-2 py-1.5 text-sm transition-colors",
@@ -89,8 +99,31 @@ export function AppShell() {
       </aside>
 
       <div className="flex min-w-0 flex-col">
-        <header className="flex h-14 items-center justify-between gap-3 border-b bg-background px-5">
-          <Badge tone="primary">Community Edition</Badge>
+        <header className="flex min-h-14 flex-wrap items-center justify-between gap-2 border-b bg-background px-3 py-2 sm:px-5">
+          <div className="flex min-w-0 items-center gap-2">
+            <Drawer open={mobileOpen} onOpenChange={setMobileOpen}>
+              <DrawerTrigger asChild>
+                <button ref={mobileTrigger} aria-label="Open navigation" className="rounded-md border p-2 md:hidden"><PanelLeft size={16} /></button>
+              </DrawerTrigger>
+              <DrawerContent className="left-0 right-auto w-[min(20rem,calc(100vw-2rem))]" onCloseAutoFocus={(event) => {
+                event.preventDefault();
+                // On resize the mobile trigger is hidden; focus the desktop navigation instead.
+                if (window.matchMedia("(min-width: 768px)").matches) document.querySelector<HTMLAnchorElement>("aside nav a")?.focus();
+                else mobileTrigger.current?.focus();
+              }}>
+                <DrawerHeader title="Navigation" description="Community Edition Console" />
+                <nav aria-label="Mobile navigation" className="min-h-0 overflow-y-auto p-3">
+                  {NAV.map((group, gi) => <div key={gi} className="mb-3">
+                    {group.title && <div className="px-2 py-2 text-xs text-muted-foreground">{group.title}</div>}
+                    {group.items.map((item) => <NavLink key={item.path} to={item.path} end={item.path === "/"} onClick={() => setMobileOpen(false)} className={({ isActive }) => cn("flex items-center gap-2 rounded-md p-2 text-sm", isActive ? "bg-primary/10 text-primary" : "hover:bg-muted")}>
+                      <item.icon size={16} />{item.label}{item.enterprise && <Lock size={12} className="ml-auto" />}
+                    </NavLink>)}
+                  </div>)}
+                </nav>
+              </DrawerContent>
+            </Drawer>
+            <Badge tone="primary">Community Edition</Badge>
+          </div>
 
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             <button
@@ -109,7 +142,7 @@ export function AppShell() {
               </button>
             </Tooltip>
             <DropdownMenu>
-              <DropdownMenuTrigger className="grid h-8 w-8 place-items-center rounded-full bg-primary/10 text-primary hover:bg-primary/20">
+              <DropdownMenuTrigger aria-label="Account menu" className="grid h-8 w-8 place-items-center rounded-full bg-primary/10 text-primary hover:bg-primary/20">
                 <User size={15} />
               </DropdownMenuTrigger>
               <DropdownMenuContent>
@@ -122,7 +155,7 @@ export function AppShell() {
             </DropdownMenu>
           </div>
         </header>
-        <main className="min-w-0 flex-1 overflow-y-auto scroll-thin p-6">
+        <main className="min-w-0 flex-1 scroll-thin p-3 sm:p-6">
           <Outlet />
         </main>
       </div>

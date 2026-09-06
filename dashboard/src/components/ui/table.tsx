@@ -63,7 +63,7 @@ export function DataTable<T>({
     a === "right" ? "text-right" : a === "center" ? "text-center" : "text-left";
 
   return (
-    <div className={cn("overflow-x-auto scroll-thin", className)}>
+    <div className={cn("max-w-full overflow-x-auto scroll-thin", className)} tabIndex={0} role="region" aria-label="Scrollable table">
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b text-xs text-muted-foreground">
@@ -78,6 +78,11 @@ export function DataTable<T>({
                   c.sortValue && "cursor-pointer select-none hover:text-foreground",
                 )}
                 onClick={c.sortValue ? () => toggleSort(c.key) : undefined}
+                tabIndex={c.sortValue ? 0 : undefined}
+                aria-sort={sort?.key === c.key ? (sort.dir === "asc" ? "ascending" : "descending") : undefined}
+                onKeyDown={c.sortValue ? (event) => {
+                  if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggleSort(c.key); }
+                } : undefined}
               >
                 <span className={cn("inline-flex items-center gap-1", c.align === "right" && "flex-row-reverse")}>
                   {c.header}
@@ -100,7 +105,12 @@ export function DataTable<T>({
             sorted.map((row) => (
               <tr
                 key={getRowId(row)}
-                onClick={onRowClick ? () => onRowClick(row) : undefined}
+                tabIndex={onRowClick ? 0 : undefined}
+                aria-label={onRowClick ? `Inspect ${getRowId(row)}` : undefined}
+                onClick={onRowClick ? (event) => { event.currentTarget.focus(); onRowClick(row); } : undefined}
+                onKeyDown={onRowClick ? (event) => {
+                  if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); onRowClick(row); }
+                } : undefined}
                 className={cn(
                   "border-b last:border-0",
                   onRowClick && "cursor-pointer hover:bg-muted/50",

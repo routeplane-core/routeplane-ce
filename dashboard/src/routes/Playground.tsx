@@ -5,32 +5,34 @@ import { api, streamChat } from "@/lib/api/client";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { PageHeader } from "@/components/layout/PageHeader";
-import { Field, Textarea } from "@/components/ui/input";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Field, Input, Textarea } from "@/components/ui/input";
+import { validChatTarget } from "@/lib/api/chat-target";
+import { ResponseRequestId } from "@/components/ui/request-id";
 
 export function Playground() {
-  const { data: models } = useQuery({ queryKey: ["models"], queryFn: api.getModels });
+  const { data: models, isError: catalogError } = useQuery({ queryKey: ["models"], queryFn: api.getModels });
+  const { data: status } = useQuery({ queryKey: ["status"], queryFn: api.getStatus });
   const modelList = models?.data ?? [];
 
   const [model, setModel] = useState("");
+  const [provider, setProvider] = useState("");
   const [system, setSystem] = useState("You are a helpful assistant.");
   const [user, setUser] = useState("Say hello in one sentence.");
   const [output, setOutput] = useState("");
+  const [requestId, setRequestId] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const controllerRef = useRef<AbortController | null>(null);
 
-  // Default the model picker to the first catalog entry once it loads.
-  useEffect(() => {
-    if (!model && modelList.length > 0) setModel(modelList[0].id);
-  }, [model, modelList]);
+  useEffect(() => () => controllerRef.current?.abort(), []);
 
   const run = async () => {
-    if (!model) return;
+    if (!validChatTarget(model, provider)) return;
     const ctrl = new AbortController();
     controllerRef.current = ctrl;
     setRunning(true);
     setOutput("");
+    setRequestId(null);
     setError(null);
 
     const messages: { role: string; content: string }[] = [];
@@ -38,7 +40,7 @@ export function Playground() {
     messages.push({ role: "user", content: user });
 
     try {
-      await streamChat({ model, messages }, (t) => setOutput((o) => o + t), ctrl.signal);
+      await streamChat({ model: model.trim(), messages }, (t) => setOutput((o) => o + t), ctrl.signal, provider.trim(), setRequestId);
     } catch (e) {
       if (e instanceof DOMException && e.name === "AbortError") {
         // Stopped by the user — leave whatever streamed so far.
@@ -61,41 +63,35 @@ export function Playground() {
       />
 
       <p className="mb-4 rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-        The gateway passes parameters through to the provider <span className="font-medium text-foreground">verbatim</span> —
-        it doesn't rewrite them. If you build requests by hand, send what the upstream expects: newer OpenAI-family models
-        require <span className="font-mono">max_completion_tokens</span> instead of <span className="font-mono">max_tokens</span>.
+        Catalogue entries are suggestions, not proof that a model is runnable with your credentials.
+        Enter the exact model and configured provider name. For a self-hosted model, use
+        <span className="font-mono"> self_hosted</span>; the operator configures its URL on the gateway, not here.
       </p>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <Card>
           <CardHeader title="Request" />
           <CardBody className="space-y-4">
-            <Field label="Model">
-              <Select value={model} onValueChange={setModel}>
-                <SelectTrigger className="w-full">
-                  <SelectValue placeholder={modelList.length ? "Select a model" : "No models available"} />
-                </SelectTrigger>
-                <SelectContent>
-                  {modelList.map((m) => (
-                    <SelectItem key={m.id} value={m.id}>
-                      {m.id}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+            <Field label="Model" htmlFor="chat-model" hint={catalogError ? "Catalogue unavailable. You can still enter a model configured by your operator." : modelList.length === 0 ? "No catalogue entries. Enter your self-hosted model explicitly." : "Choose a suggestion or enter a model explicitly."}>
+              <Input id="chat-model" list="chat-models" value={model} onChange={(e) => setModel(e.target.value)} placeholder="Exact model name" disabled={running} />
+              <datalist id="chat-models">{modelList.map((m) => <option key={m.id} value={m.id} />)}</datalist>
             </Field>
-            <Field label="System">
-              <Textarea value={system} onChange={(e) => setSystem(e.target.value)} rows={2} className="font-sans" />
+            <Field label="Provider" htmlFor="chat-provider" hint="One configured provider name, for example self_hosted. No URLs or fallback chains.">
+              <Input id="chat-provider" list="chat-providers" value={provider} onChange={(e) => setProvider(e.target.value)} placeholder="Configured provider name" disabled={running} />
+              <datalist id="chat-providers">{status?.providers?.map((p) => <option key={p.provider} value={p.provider} />)}</datalist>
             </Field>
-            <Field label="User">
-              <Textarea value={user} onChange={(e) => setUser(e.target.value)} rows={5} className="font-sans" />
+            <Field label="System" htmlFor="chat-system">
+              <Textarea id="chat-system" value={system} onChange={(e) => setSystem(e.target.value)} rows={2} className="font-sans" />
+            </Field>
+            <Field label="User" htmlFor="chat-user">
+              <Textarea id="chat-user" value={user} onChange={(e) => setUser(e.target.value)} rows={5} className="font-sans" />
             </Field>
             {running ? (
               <Button variant="danger" onClick={stop}>
                 <Square size={14} /> Stop
               </Button>
             ) : (
-              <Button onClick={run} disabled={!model}>
+              <Button onClick={run} disabled={!validChatTarget(model, provider)}>
                 <Play size={15} /> Run
               </Button>
             )}
@@ -105,7 +101,8 @@ export function Playground() {
         <Card>
           <CardHeader title="Response" description="Streamed from the selected model via the gateway." />
           <CardBody className="space-y-3">
-            <div className="min-h-40 whitespace-pre-wrap rounded-md border bg-muted/30 px-3 py-2.5 text-sm leading-relaxed">
+            <ResponseRequestId requestId={requestId} />
+            <div aria-label="Streamed response" className="min-h-40 whitespace-pre-wrap break-words [overflow-wrap:anywhere] rounded-md border bg-muted/30 px-3 py-2.5 text-sm leading-relaxed">
               {output || (
                 <span className="text-muted-foreground">Run a request to see the streamed response.</span>
               )}
@@ -114,13 +111,13 @@ export function Playground() {
               )}
             </div>
             {error && (
-              <div className="flex items-start gap-2 rounded-md border border-danger/30 bg-danger/5 px-3 py-2.5 text-xs text-danger">
+              <div role="alert" className="flex items-start gap-2 rounded-md border border-danger/30 bg-danger/5 px-3 py-2.5 text-xs text-danger">
                 <AlertTriangle size={14} className="mt-0.5 shrink-0" />
                 <div className="min-w-0">
                   <div className="font-medium">Gateway error</div>
                   <div className="mt-0.5 break-words font-mono">{error}</div>
                   <div className="mt-1 text-danger/80">
-                    A common cause is a provider key that isn't configured for the selected model.
+                    Check the model and provider names with your operator, then check that provider's credentials and upstream availability. No fallback was selected by this UI.
                   </div>
                 </div>
               </div>

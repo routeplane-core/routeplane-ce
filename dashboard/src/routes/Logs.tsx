@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ScrollText, Search } from "lucide-react";
 import { api } from "@/lib/api/client";
@@ -8,7 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { PageHeader } from "@/components/layout/PageHeader";
 import { EnterpriseHint } from "@/components/EnterpriseHint";
 import { DataTable, type Column } from "@/components/ui/table";
-import { SegmentedControl, Pagination, KeyValueList } from "@/components/ui/misc";
+import { SegmentedControl, Pagination, KeyValueList, CopyButton } from "@/components/ui/misc";
 import { Input } from "@/components/ui/input";
 import { SkeletonRows, EmptyState, ErrorState } from "@/components/ui/states";
 import { Drawer, DrawerContent, DrawerHeader, DrawerBody } from "@/components/ui/drawer";
@@ -27,13 +27,15 @@ export function Logs() {
   const [q, setQ] = useState("");
   const [page, setPage] = useState(0);
   const [selected, setSelected] = useState<LogRow | null>(null);
+  const selectedTrigger = useRef<HTMLElement | null>(null);
+  const searchInput = useRef<HTMLInputElement>(null);
 
   const filtered = useMemo(() => {
     const needle = q.trim().toLowerCase();
     return (data ?? []).filter((r) => {
       if (outcome !== "all" && r.outcome !== outcome) return false;
       if (!needle) return true;
-      return [r.model, r.provider, r.virtual_key_name, r.id, r.error, r.use_case]
+      return [r.model, r.provider, r.virtual_key_name, r.id, r.request_id, r.error, r.use_case]
         .some((v) => v?.toLowerCase().includes(needle));
     });
   }, [data, outcome, q]);
@@ -80,7 +82,7 @@ export function Logs() {
     <>
       <PageHeader
         title="Logs & Traces"
-        description="Recent requests from the gateway's in-memory log ring. Filter by outcome or search across key, provider, and model."
+        description="Search the retained in-memory rows by request ID, key, provider or model. Restarted or evicted history is not searchable."
       />
 
       <div className="mb-4">
@@ -107,13 +109,15 @@ export function Logs() {
         <div className="relative">
           <Search size={14} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
           <Input
+            ref={searchInput}
+            aria-label="Search retained logs"
             value={q}
             onChange={(e) => {
               setQ(e.target.value);
               setPage(0);
             }}
-            placeholder="Search key, provider, model…"
-            className="w-64 pl-8"
+            placeholder="Request ID, key, provider, model…"
+            className="w-full max-w-72 pl-8"
           />
         </div>
         <span className="ml-auto text-xs text-muted-foreground">{filtered.length.toLocaleString()} requests</span>
@@ -141,7 +145,10 @@ export function Logs() {
                 columns={columns}
                 rows={rows}
                 getRowId={(l) => l.id}
-                onRowClick={(l) => setSelected(l)}
+                onRowClick={(l) => {
+                  selectedTrigger.current = document.activeElement as HTMLElement;
+                  setSelected(l);
+                }}
                 defaultSort={{ key: "ts", dir: "desc" }}
               />
               <Pagination page={clampedPage} pageCount={pageCount} onPage={setPage} total={filtered.length} />
@@ -151,13 +158,18 @@ export function Logs() {
       </Card>
 
       <Drawer open={!!selected} onOpenChange={(o) => !o && setSelected(null)}>
-        <DrawerContent size="lg">
+        <DrawerContent size="lg" onCloseAutoFocus={(event) => {
+          event.preventDefault();
+          if (selectedTrigger.current?.isConnected) selectedTrigger.current.focus();
+          else searchInput.current?.focus();
+        }}>
           <DrawerHeader title="Request detail" description={selected?.id ?? ""} />
           <DrawerBody>
             {selected && (
               <div className="space-y-5">
                 <KeyValueList
                   items={[
+                    { label: "Request ID", value: selected.request_id ? <div className="space-y-2"><div className="break-all font-mono text-xs">{selected.request_id}</div><CopyButton value={selected.request_id} label="Copy request ID" /></div> : "Not recorded" },
                     { label: "Timestamp", value: formatDateTime(selected.timestamp) },
                     { label: "Outcome", value: <Badge tone={OUTCOME_TONE(selected.outcome)}>{selected.outcome}</Badge> },
                     { label: "Virtual key", value: <span className="font-mono text-xs">{selected.virtual_key_name || "—"}</span> },

@@ -2,6 +2,7 @@
 // authenticated with the operator's stored rp_ key. No control-plane endpoints.
 import { apiUrl } from "@/lib/api/config";
 import { getStoredToken, clearSession } from "@/lib/auth";
+import { validChatTarget } from "@/lib/api/chat-target";
 import type {
   CreateProviderInput,
   CustomProvider,
@@ -102,46 +103,67 @@ export const api = {
 
 /**
  * Stream a chat completion for the Playground. Calls the real CE gateway and
- * yields text deltas via `onDelta`. Returns the accumulated text. Any provider
+ * yields text deltas via `onDelta`. Requires an explicit single provider. Any provider
  * error is surfaced to the caller (the gateway needs a configured provider key).
  */
 export async function streamChat(
   body: Record<string, unknown>,
   onDelta: (text: string) => void,
   signal?: AbortSignal,
-): Promise<void> {
+  provider = "",
+  onRequestId?: (requestId: string | null) => void,
+): Promise<string | null> {
+  if (typeof body.model !== "string" || !validChatTarget(body.model, provider)) {
+    throw new Error("Enter a model and one configured provider name before sending.");
+  }
   const res = await fetch(apiUrl("/v1/chat/completions"), {
     method: "POST",
-    headers: headers({ "Content-Type": "application/json" }),
+    headers: headers({ "Content-Type": "application/json", "x-routeplane-provider": provider.trim() }),
     body: JSON.stringify({ ...body, stream: true }),
     signal,
   });
+  // Both headers identify this gateway request, not a provider completion or
+  // W3C trace. Publish as soon as headers arrive, including error responses.
+  const requestId = res.headers.get("x-routeplane-request-id") || res.headers.get("x-routeplane-trace-id");
+  onRequestId?.(requestId);
   if (!res.ok || !res.body) {
     on401(res.status);
     const detail = await res.text().catch(() => "");
     throw new Error(detail || `gateway ${res.status}`);
   }
+  if (!res.headers.get("content-type")?.toLowerCase().startsWith("text/event-stream")) {
+    await res.body.cancel();
+    throw new Error("Gateway returned a non-streaming response. Check the gateway/upstream streaming configuration.");
+  }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t.startsWith("data:")) continue;
-      const payload = t.slice(5).trim();
-      if (payload === "[DONE]") return;
-      try {
-        const json = JSON.parse(payload);
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop() ?? "";
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t.startsWith("data:")) continue;
+        const payload = t.slice(5).trim();
+        if (payload === "[DONE]") return requestId;
+        let json;
+        try {
+          json = JSON.parse(payload);
+        } catch {
+          throw new Error("Gateway returned an invalid streaming event.");
+        }
+        if (json?.error) throw new Error("Gateway reported a streaming error. Check upstream availability and retry explicitly.");
         const delta = json?.choices?.[0]?.delta?.content;
         if (typeof delta === "string") onDelta(delta);
-      } catch {
-        /* keep-alive or partial line — ignore */
       }
     }
+    throw new Error("Stream ended before [DONE]. The partial response is retained; check upstream availability before retrying.");
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
   }
 }

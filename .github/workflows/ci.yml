@@ -19,7 +19,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out
-        uses: actions/checkout@v4 # TODO(launch): SHA-pin before public flip
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      # Keep dashboard failures inside the existing required quality context.
+      # Run before Rust compilation; no image or release is published here.
+      - name: Dashboard tests, typecheck and build
+        uses: ./.github/actions/dashboard-quality
+        timeout-minutes: 10
 
       - name: Install Rust toolchain (pinned by rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable # TODO(launch): SHA-pin + pin the exact version

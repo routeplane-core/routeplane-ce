@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { EnterpriseHint } from "@/components/EnterpriseHint";
 import { PageHeader } from "@/components/layout/PageHeader";
 import { StatCard } from "@/components/ui/stat-card";
-import { SkeletonRows, ErrorState } from "@/components/ui/states";
+import { SkeletonRows, EmptyState, ErrorState } from "@/components/ui/states";
 import { useToast } from "@/components/ui/toast";
 import {
   Dialog,
@@ -109,7 +109,13 @@ export function Cache() {
             </EnterpriseHint>
           </div>
         </>
-      ) : null}
+      ) : (
+        <Card>
+          <CardBody>
+            <EmptyState icon={DatabaseZap} title="Cache diagnostics unavailable" description="Public /status reports liveness only. Missing statistics do not mean the cache is empty or disabled." />
+          </CardBody>
+        </Card>
+      )}
 
       <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
         <DialogContent size="sm">
