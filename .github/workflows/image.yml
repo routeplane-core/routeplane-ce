@@ -40,12 +40,14 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/routeplane-core/routeplane-ce
+          # Only a version release may update the public latest alias.
+          flavor: latest=false
           tags: |
-            type=semver,pattern={{version}}
-            type=ref,event=tag
-            type=sha,format=short
-            type=raw,value=latest
-            type=raw,value=ci,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=semver,pattern={{version}},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+            type=ref,event=tag,enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+            type=sha,format=short,enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+            type=raw,value=diagnostic-${{ github.run_id }}-${{ github.run_attempt }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Build and push
         id: build
@@ -54,7 +56,6 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          load: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -63,23 +64,29 @@ jobs:
           # would wrap the tag in an OCI index whose digest differs from the signed
           # manifest — making `cosign verify <tag>` fail. We attach our own syft
           # SBOM below. This keeps tag digest == steps.build.outputs.digest == the
-          # digest cosign signs, so verify-by-tag works. Also lets `load: true`
-          # import a plain image for the smoke test.
+          # digest cosign signs, so verify-by-tag works. The smoke test pulls
+          # this exact pushed digest, never a mutable alias.
           provenance: false
           sbom: false
 
       # Runtime smoke test: boot the image we just built and confirm the gateway
       # serves /healthz. Loads keys from the shipped example so it starts cleanly.
-      - name: Smoke test (boot + /healthz)
+      - name: Smoke test (emitted digest + /healthz)
         env:
-          # the :ci tag is loaded into the local daemon by `load: true` above;
-          # run by tag (a registry @digest isn't resolvable in the local daemon).
-          IMAGE_REF: ghcr.io/routeplane-core/routeplane-ce:ci
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          docker run -d --name rp-smoke -p 8080:8080 \
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::invalid build digest"; exit 1; }
+          IMAGE_REF="ghcr.io/routeplane-core/routeplane-ce@${DIGEST}"
+          docker pull "$IMAGE_REF"
+          EXPECTED_ID=$(docker image inspect --format '{{.Id}}' "$IMAGE_REF")
+          [[ "$EXPECTED_ID" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::invalid resolved image ID"; exit 1; }
+          trap 'docker rm -f rp-smoke >/dev/null 2>&1 || true' EXIT
+          docker run --pull=never -d --name rp-smoke -p 127.0.0.1:8080:8080 \
             -e RP_KEYS_FILE=./configs/keys.example.json -e RUST_LOG=info \
             "$IMAGE_REF"
+          ACTUAL_ID=$(docker inspect --format '{{.Image}}' rp-smoke)
+          [ "$ACTUAL_ID" = "$EXPECTED_ID" ] || { echo "::error::smoke container image mismatch"; exit 1; }
           ok=""
           for i in $(seq 1 20); do
             if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/healthz)" = "200" ]; then
@@ -88,8 +95,9 @@ jobs:
             sleep 3
           done
           echo "--- container logs (tail) ---"; docker logs --tail=20 rp-smoke || true
-          docker rm -f rp-smoke >/dev/null 2>&1 || true
           [ -n "$ok" ] || { echo "::error::gateway did not answer /healthz"; exit 1; }
+          printf 'Verified smoke digest: `%s`\n\nContainer image ID: `%s`\n' \
+            "$DIGEST" "$ACTUAL_ID" >> "$GITHUB_STEP_SUMMARY"
 
       # Supply-chain trust: sign the pushed image (keyless — the signature's
       # identity is this workflow, verifiable with `cosign verify`) and attach an
@@ -144,7 +152,7 @@ jobs:
       # SBOM, and the exact image digest + verify command ("verify what you run").
       # The release for the tag must already exist (created at tag time).
       - name: Attach release assets (tag builds)
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
