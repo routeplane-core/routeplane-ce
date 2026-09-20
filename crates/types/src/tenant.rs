@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn refuses_a_display_name() {
         assert!(TenantId::new("Default Development Key").is_err());
-        assert!(TenantId::new("Garth Prod").is_err());
+        assert!(TenantId::new("Customer Production").is_err());
     }
 
     #[test]
