@@ -5,6 +5,11 @@ on:
   push:
     branches: [main]
 
+# Superseded PR revisions are disposable; main and release runs are independent.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -30,15 +35,21 @@ jobs:
         timeout-minutes: 10
 
       - name: Install Rust toolchain (pinned by rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@stable # TODO(launch): SHA-pin + pin the exact version
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           components: rustfmt, clippy
 
       - name: System deps (OpenSSL headers)
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v pkg-config >/dev/null || ! pkg-config --exists openssl; then
+            sudo apt-get update
+            sudo apt-get install -y pkg-config libssl-dev
+          fi
 
       - name: Cache cargo
-        uses: actions/cache@v4 # TODO(launch): SHA-pin before public flip
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
